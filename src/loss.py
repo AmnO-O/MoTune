@@ -58,7 +58,7 @@ class CombinedLoss(nn.Module):
         centers = torch.as_tensor(
             self.centers, dtype=target.dtype, device=target.device
         ).unsqueeze(0)
-        d = (centers - target.unsqueeze(1)) / self.bin_sigma
+        d = (centers - target.unsqueeze(-1)) / self.bin_sigma
         w = torch.exp(-0.5 * d * d)
         return w / w.sum(dim=-1, keepdim=True)
 
