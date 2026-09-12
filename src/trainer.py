@@ -148,7 +148,7 @@ class Trainer:
         train_loader, val_loader = self._build_loaders(train_df, val_df, tokenizer)
 
         model = build_model(self.cfg, tokenizer, self.device)
-        scaler = GradScaler('cuda')
+        scaler = GradScaler('cuda', enabled=(self.device.type == 'cuda'))
         criterion = CombinedLoss(
             ccc_weight=self.cfg.ccc_weight,
             lambda_rank=self.cfg.lambda_rank,

@@ -97,12 +97,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 group_grads[label] = max(group_grads.get(label, 0.0), float(raw_norm))
                 torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
             last_grad_norm = total_norm_sq ** 0.5
-            optimizer.zero_grad()
 
             if step_counter is not None:
                 prev_opt_calls = step_counter[0]
                 opt_step_result = scaler.step(optimizer)
                 scaler.update()
+                optimizer.zero_grad()
                 if step_counter[0] > prev_opt_calls:
                     scheduler.step()
                     opt_steps += 1
@@ -116,6 +116,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 prev_steps = getattr(optimizer, '_step_count', None)
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer.zero_grad()
                 cur_steps = getattr(optimizer, '_step_count', None)
                 if cur_steps is not None and cur_steps != prev_steps:
                     scheduler.step()
@@ -146,12 +147,13 @@ def evaluate(model, dataloader, device):
     all_mod_preds, all_head_preds = [], []
     all_mod_labels, all_head_labels = [], []
     has_labels = False
+    device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
 
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-            with autocast('cuda'):
+            with autocast(device_type, enabled=(device_type == 'cuda')):
                 mod_pred, head_pred = model(batch)
 
             all_mod_preds.append(mod_pred.detach().cpu().numpy().reshape(-1))
@@ -176,12 +178,40 @@ def evaluate(model, dataloader, device):
 
 def unfreeze_top_layers(model, from_layer):
     """Unfreeze top layers (from_layer..last). Keeps embeddings + lower layers frozen."""
-    layers = model.bert.layers
+    # Locate the encoder stack across HF model variants:
+    #   ModernBERT:    bert.encoder.layers  (+ bert.encoder.final_norm)
+    #   BERT/RoBERTa:  bert.encoder.layer
+    #   some exports:  bert.layers
+    if hasattr(model.bert, 'layers'):
+        layers = model.bert.layers
+    elif hasattr(model.bert, 'encoder'):
+        enc = model.bert.encoder
+        if hasattr(enc, 'layers'):
+            layers = enc.layers
+        elif hasattr(enc, 'layer'):
+            layers = enc.layer
+        else:
+            raise AttributeError("Cannot locate transformer layers in model.bert.encoder")
+    else:
+        raise AttributeError("Cannot locate transformer layers in model.bert")
+
     total_layers = len(layers)
 
     for idx, layer in enumerate(layers):
         if idx >= from_layer:
             for param in layer.parameters():
                 param.requires_grad = True
+
+    # Post-encoder LayerNorm; unfreeze so the top-layer representations can
+    # adapt. ModernBERT keeps it on the encoder; BERT/RoBERTa often dot no such
+    # norm at all (their final norm lives inside the pooler or not at all).
+    final_norm = None
+    if hasattr(model.bert, 'final_norm'):
+        final_norm = model.bert.final_norm
+    elif hasattr(model.bert, 'encoder') and hasattr(model.bert.encoder, 'final_norm'):
+        final_norm = model.bert.encoder.final_norm
+    if final_norm is not None:
+        for param in final_norm.parameters():
+            param.requires_grad = True
 
     print(f'Unfroze layers {from_layer}-{total_layers-1} ({total_layers - from_layer} of {total_layers} layers)')

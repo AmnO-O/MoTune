@@ -75,14 +75,6 @@ class ModernBERTRegressor(nn.Module):
             nn.Linear(64, self.out_features),
         )
 
-    def _score(self, features: torch.Tensor, head) -> torch.Tensor:
-        """Raw scalar predictions for a head (reg) or E[Y] for ordinal bins."""
-        logits_or_pred = head(features)               # (B, out_features)
-        if self.head_mode == 'softmax':
-            probs = logits_or_pred.softmax(dim=-1)
-            return (probs * self.bin_centers).sum(-1)  # (B,)
-        return logits_or_pred.squeeze(-1)             # (B,)
-
     def forward(self, batch, with_logits: bool = False):
         outputs = self.bert(
             input_ids=batch['input_ids'],
@@ -108,14 +100,20 @@ class ModernBERTRegressor(nn.Module):
         mod_features = torch.cat([cos_feats, mod_emb, mwe_emb, context_emb], dim=1)
         head_features = torch.cat([cos_feats, head_emb, mwe_emb, context_emb], dim=1)
 
-        mod_pred = self._score(mod_features, self.mod_regressor)
-        head_pred = self._score(head_features, self.head_regressor)
+        mod_out = self.mod_regressor(mod_features)
+        head_out = self.head_regressor(head_features)
 
-        if self.head_mode == 'softmax' and with_logits:
-            mod_logits = self.mod_regressor(mod_features)
-            head_logits = self.head_regressor(head_features)
-            return mod_pred, head_pred, mod_logits, head_logits
+        if self.head_mode == 'softmax':
+            mod_probs = mod_out.softmax(dim=-1)
+            head_probs = head_out.softmax(dim=-1)
+            mod_pred = (mod_probs * self.bin_centers).sum(-1)
+            head_pred = (head_probs * self.bin_centers).sum(-1)
+            if with_logits:
+                return mod_pred, head_pred, mod_out, head_out
+            return mod_pred, head_pred
 
+        mod_pred = mod_out.squeeze(-1)
+        head_pred = head_out.squeeze(-1)
         return mod_pred, head_pred
 
 
