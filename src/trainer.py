@@ -29,6 +29,12 @@ from src.model import build_model, embedding_table
 from src.train import evaluate, train_epoch, unfreeze_top_layers
 
 
+def _safe_rho(y: np.ndarray, p: np.ndarray) -> float:
+    """Spearman rho with a 0.0 fallback for a constant input (scipy returns NaN)."""
+    r = float(spearmanr(y, p).statistic) if len(y) > 1 else 0.0
+    return 0.0 if r != r else r   # NaN check
+
+
 @dataclass
 class FoldResult:
     """Outcome of a single fit() call (one fold or the 80/20 split)."""
@@ -184,8 +190,8 @@ class Trainer:
             )
             mod_pred, head_pred, mod_label, head_label = evaluate(model, val_loader, self.device)
 
-            rho_mod = float(spearmanr(mod_label, mod_pred).statistic)
-            rho_head = float(spearmanr(head_label, head_pred).statistic)
+            rho_mod = _safe_rho(mod_label, mod_pred)
+            rho_head = _safe_rho(head_label, head_pred)
             rho_mean = (rho_mod + rho_head) / 2.0
 
             history.append({
@@ -210,7 +216,9 @@ class Trainer:
                     'mod_y': mod_label.copy(),
                     'head_y': head_label.copy(),
                 }
-                ckpt_path = self.output_dir / 'models' / ckpt_name
+                ckpt_dir = self.output_dir / 'models'
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = ckpt_dir / ckpt_name
                 torch.save(model.state_dict(), ckpt_path)
             else:
                 if epoch >= self.cfg.freeze_epochs:
@@ -230,8 +238,8 @@ class Trainer:
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()   # release last epoch's activations
 
-        best_rho_mod = float(spearmanr(best['mod_y'], best['mod']).statistic)
-        best_rho_head = float(spearmanr(best['head_y'], best['head']).statistic)
+        best_rho_mod = _safe_rho(best['mod_y'], best['mod'])
+        best_rho_head = _safe_rho(best['head_y'], best['head'])
         best_rho_mean = (best_rho_mod + best_rho_head) / 2.0
 
         self.logger.info(

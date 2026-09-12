@@ -20,8 +20,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     n_micro = len(dataloader)
     for step_idx, batch in enumerate(dataloader, 1):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-
-        with autocast('cuda'):
+        device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
+        
+        with autocast(device_type):
             if getattr(criterion, 'requires_logits', False):
                 mod_pred, head_pred, mod_logits, head_logits = model(batch, with_logits=True)
                 loss = criterion(mod_pred, batch['mod_avg'], mod_logits) \
@@ -41,11 +42,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             scaler.update()
             optimizer.zero_grad()
             # Advance the LR schedule only when the optimizer really stepped.
-            # AMP GradScaler may skip a step on gradient overflow; stepping the
-            # scheduler there would trigger "step() before optimizer.step()"
-            # and desync the schedule from the actual number of updates.
+            # _step_count stays `None` until the first completed step, so a
+            # first-batch AMP overflow (cur == None) must NOT trigger the
+            # scheduler -- that is exactly when torch would emit
+            # "lr_scheduler.step() before optimizer.step()".
             cur_steps = getattr(optimizer, '_step_count', None)
-            if prev_steps is None or prev_steps != cur_steps:
+            if cur_steps is not None and cur_steps != prev_steps:
                 scheduler.step()
 
         total_loss += loss.item() * accum_steps
