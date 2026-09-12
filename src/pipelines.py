@@ -249,6 +249,9 @@ def run_predict(cfg: Config, logger: logging.Logger, device, data_dir: Path,
             raise FileNotFoundError(f'Missing {ckpt} - run --mode train80 first')
         trial_pred_mod, trial_pred_head = _predict(str(ckpt))
 
+    trial_pred_mod = np.clip(trial_pred_mod, 1.0, 5.0)
+    trial_pred_head = np.clip(trial_pred_head, 1.0, 5.0)
+
     trial_rho_mod = float(spearmanr(df_trial['ModAvg'], trial_pred_mod).statistic)
     trial_rho_head = float(spearmanr(df_trial['HeadAvg'], trial_pred_head).statistic)
     metrics = {

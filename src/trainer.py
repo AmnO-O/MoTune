@@ -103,12 +103,12 @@ class Trainer:
             ],
             weight_decay=self.cfg.weight_decay,
         )
+        track_optimizer_steps(optimizer)
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=int(steps * self.cfg.warmup_ratio),
             num_training_steps=steps,
         )
-        track_optimizer_steps(optimizer)
         return optimizer, scheduler
 
     def _phase2(self, model, steps: int):
@@ -132,12 +132,12 @@ class Trainer:
             ],
             weight_decay=self.cfg.weight_decay,
         )
+        track_optimizer_steps(optimizer)
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=int(steps * self.cfg.warmup_ratio),
             num_training_steps=steps,
         )
-        track_optimizer_steps(optimizer)
         return optimizer, scheduler
 
     # ------------------------------------------------------------------ #
