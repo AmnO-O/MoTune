@@ -121,6 +121,23 @@ def check_config() -> None:
     check(Config.load(tmp).to_dict() == defaults.to_dict(), 'config JSON round-trip')
     tmp.unlink()
 
+    # every CLI flag must map onto an existing Config field (strict update raises otherwise)
+    import main as cli
+    args = cli._build_parser().parse_args([
+        'train5', '--epochs', '3', '--batch', '16', '--freeze-epochs', '1',
+        '--accum-steps', '2', '--patience', '4', '--ccc-weight', '0.5',
+        '--lambda-rank', '0.3', '--unfreeze-from', '21', '--predict-mode', 'single',
+        '--data-path', 'x', '--output-dir', 'y', '--seed', '7',
+    ])
+    merged = cli._merge_overrides(Config.defaults(), args)
+    check(
+        (merged.num_epochs, merged.batch_size, merged.freeze_epochs, merged.accum_steps,
+         merged.lambda_rank, merged.unfreeze_from_layer, merged.predict_mode,
+         merged.seed, merged.output_dir)
+        == (3, 16, 1, 2, 0.3, 21, 'single', 7, 'y'),
+        'all CLI flags map onto Config fields',
+    )
+
 
 def main() -> int:
     sync_parse()
