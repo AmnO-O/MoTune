@@ -207,16 +207,25 @@ class Trainer:
                 'opt_steps': diag['opt_steps'],
                 'skipped': diag['skipped'],
                 'grad_norm': round(diag['grad_norm'], 4),
+                'group_grads': {k: round(v, 4) for k, v in diag.get('group_grads', {}).items()},
                 'scale': round(diag['scale'], 1),
                 'lr': diag['lr'],
+                'pred_mod_min': round(float(mod_pred.min()), 4),
+                'pred_mod_max': round(float(mod_pred.max()), 4),
+                'pred_head_min': round(float(head_pred.min()), 4),
+                'pred_head_max': round(float(head_pred.max()), 4),
             })
+            gg = diag.get('group_grads', {})
+            gg_str = ' '.join(f'{k}={v:.1e}' for k, v in sorted(gg.items())) or '(none)'
             self.logger.info(
                 'Epoch %d/%d [%s] | Loss %.4f | Mod ρ %.4f | Head ρ %.4f | Mean ρ %.4f'
-                ' | steps %d (skip %d) | grad %.2e | scale %.1f | lr %.2e',
+                ' | steps %d (skip %d) | grads %s | scale %.1f | lr %.2e'
+                ' | pred mod[%.2f,%.2f] head[%.2f,%.2f]',
                 epoch + 1, self.cfg.num_epochs, phase, train_loss,
                 rho_mod, rho_head, rho_mean,
-                diag['opt_steps'], diag['skipped'], diag['grad_norm'],
+                diag['opt_steps'], diag['skipped'], gg_str,
                 diag['scale'], diag['lr'],
+                mod_pred.min(), mod_pred.max(), head_pred.min(), head_pred.max(),
             )
 
             if rho_mean > best_rho:

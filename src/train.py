@@ -1,4 +1,5 @@
 import math
+from typing import Dict
 
 import numpy as np
 import torch
@@ -47,6 +48,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     last_grad_norm = float('nan')
     last_scale = float('nan')
     last_lr = float('nan')
+    group_grads: Dict[str, float] = {}
     step_counter = getattr(optimizer, '_cmp_step_counter', None)
 
     n_micro = len(dataloader)
@@ -68,8 +70,33 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
         if step_idx % accum_steps == 0 or step_idx == n_micro:
             scaler.unscale_(optimizer)
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-            last_grad_norm = float(gnorm)
+            # Clip per optimizer param-group, NOT globally. The embedding table
+            # (~38M freshly-resized marker rows) has gradient norms hundreds of
+            # times larger than the small heads; a single global clip to 1.0
+            # scales everything by ~1/400 and starves head updates to ~0,
+            # freezing the predictions while "training" runs.
+            param_to_name = {id(p): n for n, p in model.named_parameters()}
+            total_norm_sq = 0.0
+            for group in optimizer.param_groups:
+                params = [p for p in group['params'] if p.grad is not None]
+                if not params:
+                    continue
+                raw_norm = torch.sqrt(sum(
+                    (p.grad.detach().float() ** 2).sum() for p in params
+                ))
+                total_norm_sq += float(raw_norm) ** 2
+                # label the group by where its first named param lives
+                label = 'enc'
+                for p in params:
+                    name = param_to_name.get(id(p), '')
+                    if 'embedding' in name:
+                        label = 'emb'
+                        break
+                    if 'regressor' in name:
+                        label = 'head'
+                group_grads[label] = max(group_grads.get(label, 0.0), float(raw_norm))
+                torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
+            last_grad_norm = total_norm_sq ** 0.5
             optimizer.zero_grad()
 
             if step_counter is not None:
@@ -106,6 +133,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             'opt_steps': opt_steps,
             'skipped': skipped,
             'grad_norm': last_grad_norm,
+            'group_grads': group_grads,
             'scale': last_scale,
             'lr': last_lr,
         })
