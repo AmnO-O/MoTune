@@ -183,10 +183,11 @@ class Trainer:
 
             phase = 'FROZEN' if epoch < self.cfg.freeze_epochs else 'UNFROZEN-TOP'
 
+            diag: Dict[str, float] = {}
             train_loss = train_epoch(
                 model, train_loader, optimizer, scheduler, criterion, scaler,
                 self.device, grad_clip=self.cfg.grad_clip,
-                accum_steps=self.cfg.accum_steps,
+                accum_steps=self.cfg.accum_steps, report=diag,
             )
             mod_pred, head_pred, mod_label, head_label = evaluate(model, val_loader, self.device)
 
@@ -201,11 +202,19 @@ class Trainer:
                 'rho_mod': round(rho_mod, 5),
                 'rho_head': round(rho_head, 5),
                 'rho_mean': round(rho_mean, 5),
+                'opt_steps': diag['opt_steps'],
+                'skipped': diag['skipped'],
+                'grad_norm': round(diag['grad_norm'], 4),
+                'scale': round(diag['scale'], 1),
+                'lr': diag['lr'],
             })
             self.logger.info(
-                'Epoch %d/%d [%s] | Loss %.4f | Mod ρ %.4f | Head ρ %.4f | Mean ρ %.4f',
+                'Epoch %d/%d [%s] | Loss %.4f | Mod ρ %.4f | Head ρ %.4f | Mean ρ %.4f'
+                ' | steps %d (skip %d) | grad %.2e | scale %.1f | lr %.2e',
                 epoch + 1, self.cfg.num_epochs, phase, train_loss,
                 rho_mod, rho_head, rho_mean,
+                diag['opt_steps'], diag['skipped'], diag['grad_norm'],
+                diag['scale'], diag['lr'],
             )
 
             if rho_mean > best_rho:

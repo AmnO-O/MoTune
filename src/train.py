@@ -6,16 +6,26 @@ from torch.amp import autocast
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
-                grad_clip=1.0, accum_steps=1):
+                grad_clip=1.0, accum_steps=1, report=None):
     """One epoch with optional gradient accumulation.
 
     `accum_steps > 1` keeps micro-batches small (large backbones on a T4) while
     the effective batch (and therefore LR schedule steps / gradient quality)
     matches `accum_steps * batch_size`. Scheduler steps once per optimizer step.
+
+    If `report` (a dict) is given, it is filled with per-epoch diagnostics that
+    distinguish a genuinely stuck model (zero grads) from AMP overflow skips
+    (gradient inf/nan on every step) from normal learning:
+    opt_steps / skipped, last grad norm (before clip), scale, current LR.
     """
     model.train()
     total_loss = 0.0
     optimizer.zero_grad()
+
+    opt_steps = skipped = 0
+    last_grad_norm = float('nan')
+    last_scale = float('nan')
+    last_lr = float('nan')
 
     n_micro = len(dataloader)
     for step_idx, batch in enumerate(dataloader, 1):
@@ -36,7 +46,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
         if step_idx % accum_steps == 0 or step_idx == n_micro:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            last_grad_norm = float(gnorm)
             prev_steps = getattr(optimizer, '_step_count', None)
             scaler.step(optimizer)
             scaler.update()
@@ -49,8 +60,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             cur_steps = getattr(optimizer, '_step_count', None)
             if cur_steps is not None and cur_steps != prev_steps:
                 scheduler.step()
+                opt_steps += 1
+            else:
+                skipped += 1
+            last_scale = float(scaler.get_scale())
+            last_lr = float(scheduler.get_last_lr()[0])
 
         total_loss += loss.item() * accum_steps
+
+    if report is not None:
+        report.update({
+            'opt_steps': opt_steps,
+            'skipped': skipped,
+            'grad_norm': last_grad_norm,
+            'scale': last_scale,
+            'lr': last_lr,
+        })
 
     return total_loss / n_micro
 
