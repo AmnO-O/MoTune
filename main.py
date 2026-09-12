@@ -7,9 +7,6 @@ Usage
     python main.py train80 --epochs 8 --batch 16
     python main.py train5 --config config.json
     python main.py predict --predict-mode single
-
-Any option can also be changed permanently by editing the `Config` dataclass
-in config.py or by providing a JSON config file.
 """
 
 from __future__ import annotations
@@ -17,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -96,6 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--data-path', type=str, help='override data_path')
     parser.add_argument('--output-dir', type=str, help='override output_dir')
     parser.add_argument('--seed', type=int, help='override seed')
+    parser.add_argument('--debug', action='store_true', help='Print full traceback on errors')
     return parser
 
 
@@ -105,11 +104,14 @@ def _merge_overrides(cfg: Config, args: argparse.Namespace) -> Config:
             raise FileNotFoundError(f'Config file not found: {args.config}')
         raw = json.loads(args.config.read_text(encoding='utf-8'))
         cfg = Config.from_dict(raw)
+
     overrides = {
         key: value
         for key, value in vars(args).items()
-        if value is not None and key not in ('mode', 'config')
+        if value is not None and key not in ('mode', 'config', 'debug')
     }
+    # Thiết lập mode từ CLIargs trước khi validate
+    overrides['mode'] = args.mode
     return cfg.update(**overrides)
 
 
@@ -129,10 +131,11 @@ def main(argv=None) -> int:
 
     try:
         cfg = _merge_overrides(Config.defaults(), args)
-        cfg.mode = args.mode
         cfg.validate()
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)
+        if args.debug:
+            traceback.print_exc()
         return 1
 
     device = get_device()
@@ -146,6 +149,8 @@ def main(argv=None) -> int:
         data_dir, output_dir = resolve_paths(cfg)
     except RuntimeError as exc:
         logger.error(str(exc))
+        if args.debug:
+            traceback.print_exc()
         return 1
 
     cfg.save(output_dir / 'config.json')
@@ -165,6 +170,8 @@ def main(argv=None) -> int:
             pipelines.run_predict(cfg, logger, device, data_dir, output_dir)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error('%s: %s', type(exc).__name__, exc)
+        if args.debug:
+            traceback.print_exc()
         return 1
 
     logger.info('Finished in %s', datetime.now() - started)
