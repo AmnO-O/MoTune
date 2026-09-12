@@ -97,6 +97,15 @@ class ModernBERTRegressor(nn.Module):
         return mod_pred, head_pred
 
 
+def embedding_table(model):
+    """Return the input-embedding module via the canonical HF API.
+
+    Attribute-agnostic across backbones: ModernBERT exposes it as
+    `token_embedding`, BERT/RoBERTa/XLM-R as `word_embeddings`.
+    """
+    return model.bert.get_input_embeddings()
+
+
 def build_model(cfg, tokenizer, device, dropout=None):
     """Single source for constructing a regressor whose embedding table matches
     the tokenizer (including the added marker tokens).

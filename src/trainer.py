@@ -25,7 +25,7 @@ from transformers import get_linear_schedule_with_warmup
 from config import Config
 from src.dataset import NNDataset
 from src.loss import CombinedLoss
-from src.model import build_model
+from src.model import build_model, embedding_table
 from src.train import evaluate, train_epoch, unfreeze_top_layers
 
 
@@ -79,13 +79,13 @@ class Trainer:
         """Only the two regression heads and the word embeddings train; the
         encoder layers stay frozen. The embeddings must be trainable so the new
         random marker tokens start learning immediately."""
-        embeddings = model.bert.embeddings.word_embeddings.weight
-        embeddings.requires_grad = True
+        emb_table = embedding_table(model).weight
+        emb_table.requires_grad = True
 
         head_params = list(model.mod_regressor.parameters()) + list(model.head_regressor.parameters())
         optimizer = AdamW(
             [
-                {'params': [embeddings], 'lr': self.cfg.embedding_lr},
+                {'params': [emb_table], 'lr': self.cfg.embedding_lr},
                 {'params': head_params, 'lr': self.cfg.head_lr},
             ],
             weight_decay=self.cfg.weight_decay,
@@ -100,19 +100,19 @@ class Trainer:
     def _phase2(self, model, steps: int):
         """Unfrozen top encoder layers at encoder_lr, embeddings at their own
         (lower) LR, heads at head_lr."""
-        embeddings = model.bert.embeddings.word_embeddings.weight
-        embeddings.requires_grad = True
+        emb_table = embedding_table(model).weight
+        emb_table.requires_grad = True
 
         encoder_params = [
             p for n, p in model.named_parameters()
-            if n != 'bert.embeddings.word_embeddings.weight'
+            if p is not emb_table
             and 'mod_regressor' not in n and 'head_regressor' not in n
             and p.requires_grad
         ]
         head_params = list(model.mod_regressor.parameters()) + list(model.head_regressor.parameters())
         optimizer = AdamW(
             [
-                {'params': [embeddings], 'lr': self.cfg.embedding_lr},
+                {'params': [emb_table], 'lr': self.cfg.embedding_lr},
                 {'params': encoder_params, 'lr': self.cfg.encoder_lr},
                 {'params': head_params, 'lr': self.cfg.head_lr},
             ],
