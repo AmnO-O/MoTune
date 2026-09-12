@@ -11,20 +11,32 @@ def track_optimizer_steps(optimizer) -> None:
 
     `_step_count` / `_optimizer_step_count` semantics vary across torch
     releases (and silently break the LR schedule, locking LR at 0 within
-    warmup). Instead we wrap `optimizer.step` and count actual calls: AMP's
+    warmup). Instead we count actual `optimizer.step()` calls: AMP's
     GradScaler skips the call entirely on gradient overflow, so a real call
     == a real parameter update.
+
+    Counting uses `register_step_post_hook`, which torch invokes after every
+    real step through its `profile_hook_step` wrapper. This deliberately does
+    NOT rewrite `optimizer.step`: torch >= 2.6 rebuilds `optimizer.step` when
+    the LR scheduler is constructed (`patch_track_step_called` -> `wrap_step`
+    reads `step_fn.__func__`) and a hand-rolled closure there raises
+    "AttributeError: 'function' object has no attribute '__func__'".
     """
+    if hasattr(optimizer, '_cmp_step_counter'):
+        return
     counter = [0]
-    real_step = optimizer.step
+    optimizer._cmp_step_counter = counter     # read by train_epoch
 
-    def step_wrapper(*args, **kwargs):
-        result = real_step(*args, **kwargs)
+    def _count_step(opt, args, kwargs):
         counter[0] += 1
-        return result
 
-    optimizer.step = step_wrapper           # scaler.step() -> optimizer.step() -> wrapper
-    optimizer._cmp_step_counter = counter    # read by train_epoch
+    try:
+        optimizer.register_step_post_hook(_count_step)
+    except AttributeError:
+        # Very old torch without step hooks: degrade to the _step_count
+        # heuristic used as a fallback inside train_epoch.
+        optimizer._cmp_step_counter = None
+        del optimizer._cmp_step_counter
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
@@ -49,6 +61,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     last_scale = float('nan')
     last_lr = float('nan')
     group_grads: Dict[str, float] = {}
+    # Ensure step counting is active. This is a no-op if _phase1/_phase2
+    # already installed tracking; in legacy notebook flows it installs the
+    # hook lazily here (post-hooks work regardless of scheduler wrapping).
+    if not hasattr(optimizer, '_cmp_step_counter'):
+        track_optimizer_steps(optimizer)
     step_counter = getattr(optimizer, '_cmp_step_counter', None)
 
     n_micro = len(dataloader)
