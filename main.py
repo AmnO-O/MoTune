@@ -45,6 +45,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help='JSON config file applied on top of defaults (before CLI flags).',
     )
     parser.add_argument('--epochs', type=int, help='override num_epochs')
+    parser.add_argument(
+        '--freeze-epochs', type=int, dest='freeze_epochs',
+        help='override freeze_epochs (epochs of Phase 1 with frozen encoder)',
+    )
     parser.add_argument('--batch', type=int, help='override batch_size')
     parser.add_argument(
         '--accum-steps', type=int, dest='accum_steps',
