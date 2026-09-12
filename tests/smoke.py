@@ -109,6 +109,24 @@ def check_config() -> None:
         check(True, 'lambda_rank=-1 rejected')
 
     try:
+        Config.defaults().update(head_mode='bogus').validate()
+        check(False, 'head_mode=bogus rejected')
+    except ValueError:
+        check(True, 'head_mode=bogus rejected')
+
+    try:
+        Config.defaults().update(num_bins=1).validate()
+        check(False, 'num_bins=1 rejected')
+    except ValueError:
+        check(True, 'num_bins=1 rejected')
+
+    try:
+        Config.defaults().update(ce_weight=-0.5).validate()
+        check(False, 'ce_weight=-0.5 rejected')
+    except ValueError:
+        check(True, 'ce_weight=-0.5 rejected')
+
+    try:
         Config.defaults().update(unknown_key=1)
         check(False, 'unknown config key rejected')
     except ValueError:
@@ -127,6 +145,8 @@ def check_config() -> None:
         'train5', '--epochs', '3', '--batch', '16', '--freeze-epochs', '1',
         '--accum-steps', '2', '--patience', '4', '--ccc-weight', '0.5',
         '--lambda-rank', '0.3', '--unfreeze-from', '21', '--predict-mode', 'single',
+        '--head-mode', 'softmax', '--num-bins', '6', '--ce-weight', '0.3',
+        '--bin-sigma', '0.5',
         '--data-path', 'x', '--output-dir', 'y', '--seed', '7',
     ])
     merged = cli._merge_overrides(Config.defaults(), args)
@@ -136,6 +156,11 @@ def check_config() -> None:
          merged.seed, merged.output_dir)
         == (3, 16, 1, 2, 0.3, 21, 'single', 7, 'y'),
         'all CLI flags map onto Config fields',
+    )
+    check(
+        (merged.head_mode, merged.num_bins, merged.ce_weight, merged.bin_sigma)
+        == ('softmax', 6, 0.3, 0.5),
+        'ordinal CLI flags map onto Config fields',
     )
 
 

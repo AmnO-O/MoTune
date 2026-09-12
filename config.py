@@ -34,6 +34,9 @@ class Config:
     max_length: int = 128
     max_context_length: int = 256
     dropout: float = 0.2
+    # output head: 'reg' = scalar regression; 'softmax' = ordinal bins -> E[Y]
+    head_mode: str = 'reg'
+    num_bins: int = 6       # ordinal bins, centers uniformly spaced over [1, 5]
 
     # === optimization ===
     batch_size: int = 32
@@ -51,6 +54,8 @@ class Config:
     ccc_weight: float = 0.7
     lambda_rank: float = 0.0     # 0 = off; >0 adds pairwise margin-ranking to the loss
     rank_margin: float = 0.5
+    ce_weight: float = 0.0     # 0 = off; >0 adds Gaussian soft-target CE on the ordinal bins
+    bin_sigma: float = 0.5     # std (in bin units) of the Gaussian soft target
     patience: int = 5
     num_workers: int = 2
 
@@ -140,6 +145,14 @@ class Config:
             errors.append(f'lambda_rank must be >= 0, got {self.lambda_rank}')
         if self.rank_margin <= 0:
             errors.append(f'rank_margin must be > 0, got {self.rank_margin}')
+        if self.head_mode not in ('reg', 'softmax'):
+            errors.append(f"head_mode must be 'reg' or 'softmax', got {self.head_mode!r}")
+        if self.num_bins < 2:
+            errors.append(f'num_bins must be >= 2, got {self.num_bins}')
+        if self.ce_weight < 0:
+            errors.append(f'ce_weight must be >= 0, got {self.ce_weight}')
+        if self.bin_sigma <= 0:
+            errors.append(f'bin_sigma must be > 0, got {self.bin_sigma}')
         if not 0 < self.test_size < 1:
             errors.append(f'test_size must be in (0, 1), got {self.test_size}')
         if self.n_splits < 2:

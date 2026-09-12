@@ -22,8 +22,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
         with autocast('cuda'):
-            mod_pred, head_pred = model(batch)
-            loss = criterion(mod_pred, batch['mod_avg']) + criterion(head_pred, batch['head_avg'])
+            if getattr(criterion, 'requires_logits', False):
+                mod_pred, head_pred, mod_logits, head_logits = model(batch, with_logits=True)
+                loss = criterion(mod_pred, batch['mod_avg'], mod_logits) \
+                    + criterion(head_pred, batch['head_avg'], head_logits)
+            else:
+                mod_pred, head_pred = model(batch)
+                loss = criterion(mod_pred, batch['mod_avg']) + criterion(head_pred, batch['head_avg'])
             loss = loss / accum_steps
 
         scaler.scale(loss).backward()

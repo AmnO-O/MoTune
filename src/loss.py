@@ -29,14 +29,36 @@ def margin_rank_loss(pred: torch.Tensor, target: torch.Tensor, margin: float = 0
 
 
 class CombinedLoss(nn.Module):
-    """MSE + CCC + Pairwise Ranking Loss (Tối ưu cho Spearman's Rho & AMP)."""
+    """MSE + CCC + Pairwise Ranking Loss + optional Gaussian soft-target CE.
 
-    def __init__(self, ccc_weight: float = 0.5, lambda_rank: float = 0.1, rank_margin: float = 0.1):
+    CE is only active when `ce_weight > 0` AND the caller passes `logits`
+    (ordinal 'softmax' head mode). Soft targets are a Gaussian centred on the
+    (continuous) target so a float label like 2.34 spreads mass over the bins.
+    """
+
+    def __init__(self, ccc_weight: float = 0.5, lambda_rank: float = 0.1, rank_margin: float = 0.1,
+                 ce_weight: float = 0.0, num_bins: int = 6, bin_sigma: float = 0.5):
         super().__init__()
         self.ccc_weight = ccc_weight
         self.lambda_rank = lambda_rank
         self.rank_margin = rank_margin
+        self.ce_weight = ce_weight
+        self.bin_sigma = bin_sigma
         self.mse = nn.MSELoss()
+        self.register_buffer('centers', torch.linspace(1.0, 5.0, max(num_bins, 2)))
+        # train_epoch uses this to decide whether to request logits from the model
+        self.requires_logits = ce_weight > 0
+
+    def _soft_target(self, target: torch.Tensor) -> torch.Tensor:
+        """Gaussian mass on each bin for a continuous target, normalised to 1."""
+        d = (self.centers[None, :] - target[:, None]) / self.bin_sigma
+        w = torch.exp(-0.5 * d * d)
+        return w / w.sum(dim=-1, keepdim=True)
+
+    def _ce(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        log_p = torch.log_softmax(logits.float(), dim=-1)
+        soft = self._soft_target(target.float())
+        return -(soft * log_p).sum(dim=-1).mean()
 
     def _compute_ccc(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Tính CCC theo từng column (dim 0)."""
@@ -52,7 +74,7 @@ class CombinedLoss(nn.Module):
         ccc = (2 * cov) / (denom + 1e-8)
         return (1.0 - ccc).mean()
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, logits: torch.Tensor = None) -> torch.Tensor:
         # 1. Ép kiểu float32 NGAY TỪ ĐẦU cho toàn bộ phép tính để ổn định AMP
         pred = pred.float()
         target = target.float()
@@ -70,5 +92,9 @@ class CombinedLoss(nn.Module):
         if self.lambda_rank > 0:
             rank_loss = margin_rank_loss(pred, target, margin=self.rank_margin)
             loss = loss + self.lambda_rank * rank_loss
+
+        # 5. Ordinal: Gaussian soft-target CE on the bin logits
+        if self.ce_weight > 0 and logits is not None:
+            loss = loss + self.ce_weight * self._ce(logits, target)
 
         return loss

@@ -70,6 +70,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help='override lambda_rank (>0 adds pairwise margin-ranking loss)',
     )
     parser.add_argument(
+        '--head-mode', choices=('reg', 'softmax'),
+        help='override head_mode ("softmax" = ordinal bins -> E[Y])',
+    )
+    parser.add_argument(
+        '--num-bins', type=int,
+        help='override num_bins (ordinal bins, centers uniform in [1, 5])',
+    )
+    parser.add_argument(
+        '--ce-weight', type=float,
+        help='override ce_weight (>0 adds Gaussian soft-target CE on the bins)',
+    )
+    parser.add_argument(
+        '--bin-sigma', type=float,
+        help='override bin_sigma (Gaussian soft-target width in bin units)',
+    )
+    parser.add_argument(
         '--unfreeze-from', type=int, dest='unfreeze_from_layer',
         help='override unfreeze_from_layer',
     )

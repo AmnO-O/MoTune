@@ -82,6 +82,13 @@ class Trainer:
         emb_table = embedding_table(model).weight
         emb_table.requires_grad = True
 
+        # build_model starts fully trainable (freeze_bert=False); freeze every
+        # bert param except the embedding table so Phase 1 is truly frozen and
+        # Phase 2's unfreeze selects the top layers only.
+        for name, param in model.named_parameters():
+            if param is not emb_table and not name.startswith(('mod_regressor', 'head_regressor')):
+                param.requires_grad = False
+
         head_params = list(model.mod_regressor.parameters()) + list(model.head_regressor.parameters())
         optimizer = AdamW(
             [
@@ -138,6 +145,9 @@ class Trainer:
             ccc_weight=self.cfg.ccc_weight,
             lambda_rank=self.cfg.lambda_rank,
             rank_margin=self.cfg.rank_margin,
+            ce_weight=self.cfg.ce_weight,
+            num_bins=self.cfg.num_bins,
+            bin_sigma=self.cfg.bin_sigma,
         )
 
         # Number of optimizer updates per epoch (fewer than micro-batches when
