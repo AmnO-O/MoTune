@@ -26,7 +26,7 @@ from config import Config
 from src.dataset import NNDataset
 from src.loss import CombinedLoss
 from src.model import build_model, embedding_table
-from src.train import evaluate, train_epoch, unfreeze_top_layers
+from src.train import evaluate, track_optimizer_steps, train_epoch, unfreeze_top_layers
 
 
 def _safe_rho(y: np.ndarray, p: np.ndarray) -> float:
@@ -108,6 +108,7 @@ class Trainer:
             num_warmup_steps=int(steps * self.cfg.warmup_ratio),
             num_training_steps=steps,
         )
+        track_optimizer_steps(optimizer)
         return optimizer, scheduler
 
     def _phase2(self, model, steps: int):
@@ -136,6 +137,7 @@ class Trainer:
             num_warmup_steps=int(steps * self.cfg.warmup_ratio),
             num_training_steps=steps,
         )
+        track_optimizer_steps(optimizer)
         return optimizer, scheduler
 
     # ------------------------------------------------------------------ #

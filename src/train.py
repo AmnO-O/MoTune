@@ -5,6 +5,27 @@ import torch
 from torch.amp import autocast
 
 
+def track_optimizer_steps(optimizer) -> None:
+    """Version-independent "did the optimizer really step" detector.
+
+    `_step_count` / `_optimizer_step_count` semantics vary across torch
+    releases (and silently break the LR schedule, locking LR at 0 within
+    warmup). Instead we wrap `optimizer.step` and count actual calls: AMP's
+    GradScaler skips the call entirely on gradient overflow, so a real call
+    == a real parameter update.
+    """
+    counter = [0]
+    real_step = optimizer.step
+
+    def step_wrapper(*args, **kwargs):
+        result = real_step(*args, **kwargs)
+        counter[0] += 1
+        return result
+
+    optimizer.step = step_wrapper           # scaler.step() -> optimizer.step() -> wrapper
+    optimizer._cmp_step_counter = counter    # read by train_epoch
+
+
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
                 grad_clip=1.0, accum_steps=1, report=None):
     """One epoch with optional gradient accumulation.
@@ -26,6 +47,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     last_grad_norm = float('nan')
     last_scale = float('nan')
     last_lr = float('nan')
+    step_counter = getattr(optimizer, '_cmp_step_counter', None)
 
     n_micro = len(dataloader)
     for step_idx, batch in enumerate(dataloader, 1):
@@ -48,21 +70,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             scaler.unscale_(optimizer)
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             last_grad_norm = float(gnorm)
-            prev_steps = getattr(optimizer, '_step_count', None)
-            scaler.step(optimizer)
-            scaler.update()
             optimizer.zero_grad()
-            # Advance the LR schedule only when the optimizer really stepped.
-            # _step_count stays `None` until the first completed step, so a
-            # first-batch AMP overflow (cur == None) must NOT trigger the
-            # scheduler -- that is exactly when torch would emit
-            # "lr_scheduler.step() before optimizer.step()".
-            cur_steps = getattr(optimizer, '_step_count', None)
-            if cur_steps is not None and cur_steps != prev_steps:
-                scheduler.step()
-                opt_steps += 1
+
+            if step_counter is not None:
+                prev_opt_calls = step_counter[0]
+                opt_step_result = scaler.step(optimizer)
+                scaler.update()
+                if step_counter[0] > prev_opt_calls:
+                    scheduler.step()
+                    opt_steps += 1
+                else:
+                    skipped += 1
             else:
-                skipped += 1
+                # No wrapper (e.g. notebook-built optimizers): fall back to the
+                # _step_count heuristic. Only step the scheduler when the count
+                # demonstrably advanced, so a first-batch AMP overflow (count
+                # still None) must not emit 'scheduler.before optimizer.step'.
+                prev_steps = getattr(optimizer, '_step_count', None)
+                scaler.step(optimizer)
+                scaler.update()
+                cur_steps = getattr(optimizer, '_step_count', None)
+                if cur_steps is not None and cur_steps != prev_steps:
+                    scheduler.step()
+                    opt_steps += 1
+                else:
+                    skipped += 1
+
             last_scale = float(scaler.get_scale())
             last_lr = float(scheduler.get_last_lr()[0])
 
