@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data (mounted separately on Kaggle via the Compartment dataset input)
+dataset/
+trial/
+
+# Run artifacts
+output/
+*.pt
+run.log
+
+# OS
+.DS_Store
+Thumbs.db
