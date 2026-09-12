@@ -31,10 +31,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         if step_idx % accum_steps == 0 or step_idx == n_micro:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            prev_steps = getattr(optimizer, '_step_count', None)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-            scheduler.step()
+            # Advance the LR schedule only when the optimizer really stepped.
+            # AMP GradScaler may skip a step on gradient overflow; stepping the
+            # scheduler there would trigger "step() before optimizer.step()"
+            # and desync the schedule from the actual number of updates.
+            cur_steps = getattr(optimizer, '_step_count', None)
+            if prev_steps is None or prev_steps != cur_steps:
+                scheduler.step()
 
         total_loss += loss.item() * accum_steps
 
