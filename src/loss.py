@@ -50,20 +50,22 @@ class CombinedLoss(nn.Module):
         self.requires_logits = ce_weight > 0
 
     def _soft_target(self, target: torch.Tensor) -> torch.Tensor:
-        """Gaussian mass on each bin for continuous target(s).
+        """Gaussian mass on each bin for continuous target(s)."""
+        # 1. Đảm bảo centers cùng device và dtype với target
+        centers = self.centers.to(device=target.device, dtype=target.dtype)
         
-        Supports target shapes: (B,) or (B, N) -> outputs (B, Bins) or (B, N, Bins)
-        """
-        centers = self.centers.to(target.device)
-        # Tự động mở rộng dim để broadcast chính xác với target 1D hoặc 2D
+        # 2. Tính khoảng cách d với broadcasting chính xác
         d = (centers - target.unsqueeze(-1)) / self.bin_sigma
         w = torch.exp(-0.5 * d * d)
         return w / w.sum(dim=-1, keepdim=True)
 
     def _ce(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # 1. Ép kiểu float32 để đảm bảo độ chính xác số học (nhất là dưới AMP)
         log_p = torch.log_softmax(logits.float(), dim=-1)
         soft = self._soft_target(target.float())
-        # Tính Cross Entropy trên toàn bộ các bins và lấy trung bình các batch/heads
+        
+        # 2. -(soft * log_p).sum(dim=-1) tính CE theo từng sample
+        # .mean() sẽ tự động lấy trung bình trên toàn bộ chiều Batch (và chiều Heads nếu có)
         return -(soft * log_p).sum(dim=-1).mean()
 
     def _compute_ccc(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
