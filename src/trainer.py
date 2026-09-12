@@ -148,7 +148,7 @@ class Trainer:
             ce_weight=self.cfg.ce_weight,
             num_bins=self.cfg.num_bins,
             bin_sigma=self.cfg.bin_sigma,
-        )
+        ).to(self.device)
 
         # Number of optimizer updates per epoch (fewer than micro-batches when
         # gradient accumulation is on) -- drives the LR schedule length.

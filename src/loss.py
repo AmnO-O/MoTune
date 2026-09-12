@@ -51,7 +51,8 @@ class CombinedLoss(nn.Module):
 
     def _soft_target(self, target: torch.Tensor) -> torch.Tensor:
         """Gaussian mass on each bin for a continuous target, normalised to 1."""
-        d = (self.centers[None, :] - target[:, None]) / self.bin_sigma
+        centers = self.centers.to(target.device)
+        d = (centers[None, :] - target[:, None]) / self.bin_sigma
         w = torch.exp(-0.5 * d * d)
         return w / w.sum(dim=-1, keepdim=True)
 
