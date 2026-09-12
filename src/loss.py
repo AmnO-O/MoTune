@@ -45,17 +45,20 @@ class CombinedLoss(nn.Module):
         self.ce_weight = ce_weight
         self.bin_sigma = bin_sigma
         self.mse = nn.MSELoss()
-        self.register_buffer('centers', torch.linspace(1.0, 5.0, max(num_bins, 2)))
+        # Plain Python list -- NOT a module buffer. The criterion may be built on
+        # CPU while targets live on cuda (notebook constructs by hand); building
+        # the center tensor directly on target.device/dtype each call is
+        # immune to any device mismatch (a buffer would stay on CPU until .to()).
+        self.centers = torch.linspace(1.0, 5.0, max(num_bins, 2)).tolist()
         # train_epoch uses this to decide whether to request logits from the model
         self.requires_logits = ce_weight > 0
 
     def _soft_target(self, target: torch.Tensor) -> torch.Tensor:
         """Gaussian mass on each bin for continuous target(s)."""
-        # 1. Đảm bảo centers cùng device và dtype với target
-        centers = self.centers.to(device=target.device, dtype=target.dtype)
-        
-        # 2. Tính khoảng cách d với broadcasting chính xác
-        d = (centers - target.unsqueeze(-1)) / self.bin_sigma
+        centers = torch.as_tensor(
+            self.centers, dtype=target.dtype, device=target.device
+        ).unsqueeze(0)
+        d = (centers - target.unsqueeze(1)) / self.bin_sigma
         w = torch.exp(-0.5 * d * d)
         return w / w.sum(dim=-1, keepdim=True)
 
