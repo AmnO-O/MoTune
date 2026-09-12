@@ -61,6 +61,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     last_scale = float('nan')
     last_lr = float('nan')
     group_grads: Dict[str, float] = {}
+    overflow: Dict[str, int] = {}
     # Ensure step counting is active. This is a no-op if _phase1/_phase2
     # already installed tracking; in legacy notebook flows it installs the
     # hook lazily here (post-hooks work regardless of scheduler wrapping).
@@ -101,7 +102,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 raw_norm = torch.sqrt(sum(
                     (p.grad.detach().float() ** 2).sum() for p in params
                 ))
-                total_norm_sq += float(raw_norm) ** 2
+                raw_norm = raw_norm.item() if torch.isfinite(raw_norm) else float('nan')
                 # label the group by where its first named param lives
                 label = 'enc'
                 for p in params:
@@ -111,7 +112,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                         break
                     if 'regressor' in name:
                         label = 'head'
-                group_grads[label] = max(group_grads.get(label, 0.0), float(raw_norm))
+                if math.isnan(raw_norm):
+                    # AMP overflow / inf or nan grad in this group: scaler.step
+                    # will skip the update, so do not clip (clipping would zero
+                    # other groups' grads) and only record the event.
+                    overflow[label] = overflow.get(label, 0) + 1
+                    continue
+                if group_grads.get(label, -1.0) < 0 or raw_norm > group_grads.get(label, 0.0):
+                    group_grads[label] = raw_norm
+                total_norm_sq += raw_norm ** 2
                 torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
             last_grad_norm = total_norm_sq ** 0.5
 
@@ -152,6 +161,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             'skipped': skipped,
             'grad_norm': last_grad_norm,
             'group_grads': group_grads,
+            'overflow': overflow,
             'scale': last_scale,
             'lr': last_lr,
         })

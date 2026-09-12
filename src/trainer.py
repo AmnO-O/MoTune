@@ -217,6 +217,10 @@ class Trainer:
             })
             gg = diag.get('group_grads', {})
             gg_str = ' '.join(f'{k}={v:.1e}' for k, v in sorted(gg.items())) or '(none)'
+            ovf = diag.get('overflow', {})
+            ovf_str = ' '.join(f'ovf-{k}={v}' for k, v in sorted(ovf.items()))
+            if ovf_str:
+                gg_str = f'{gg_str} [{ovf_str}]'
             self.logger.info(
                 'Epoch %d/%d [%s] | Loss %.4f | Mod ρ %.4f | Head ρ %.4f | Mean ρ %.4f'
                 ' | steps %d (skip %d) | grads %s | scale %.1f | lr %.2e'
