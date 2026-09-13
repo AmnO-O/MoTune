@@ -218,6 +218,14 @@ class Trainer:
                 self.device, grad_clip=self.cfg.grad_clip,
                 accum_steps=self.cfg.accum_steps, report=diag,
             )
+            # Train-set performance (fit quality on the exact training data).
+            tr_mod_pred, tr_head_pred, tr_mod_label, tr_head_label = evaluate(
+                model, train_loader, self.device
+            )
+            tr_rho_mod = _safe_rho(tr_mod_label, tr_mod_pred)
+            tr_rho_head = _safe_rho(tr_head_label, tr_head_pred)
+            tr_rho_mean = (tr_rho_mod + tr_rho_head) / 2.0
+
             mod_pred, head_pred, mod_label, head_label = evaluate(model, val_loader, self.device)
 
             rho_mod = _safe_rho(mod_label, mod_pred)
@@ -228,6 +236,9 @@ class Trainer:
                 'epoch': epoch + 1,
                 'phase': phase,
                 'loss': round(float(train_loss), 5),
+                'train_rho_mod': round(tr_rho_mod, 5),
+                'train_rho_head': round(tr_rho_head, 5),
+                'train_rho_mean': round(tr_rho_mean, 5),
                 'rho_mod': round(rho_mod, 5),
                 'rho_head': round(rho_head, 5),
                 'rho_mean': round(rho_mean, 5),
@@ -249,11 +260,11 @@ class Trainer:
             if ovf_str:
                 gg_str = f'{gg_str} [{ovf_str}]'
             self.logger.info(
-                'Epoch %d/%d [%s] | Loss %.4f | Mod ρ %.4f | Head ρ %.4f | Mean ρ %.4f'
+                'Epoch %d/%d [%s] | Loss %.4f | Train ρ %.4f | Val Mod ρ %.4f | Val Head ρ %.4f | Val Mean ρ %.4f'
                 ' | steps %d (skip %d) | grads %s | scale %.1f | lr %.2e'
                 ' | pred mod[%.2f,%.2f] head[%.2f,%.2f]',
                 epoch + 1, self.cfg.num_epochs, phase, train_loss,
-                rho_mod, rho_head, rho_mean,
+                tr_rho_mean, rho_mod, rho_head, rho_mean,
                 diag['opt_steps'], diag['skipped'], gg_str,
                 diag['scale'], diag['lr'],
                 mod_pred.min(), mod_pred.max(), head_pred.min(), head_pred.max(),
