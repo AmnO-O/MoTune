@@ -73,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--num-bins', type=int,
-        help='override num_bins (ordinal bins, centers uniform in [1, 5])',
+        help='override num_bins (ordinal bins, centers uniform in [SCORE_MIN, SCORE_MAX])',
     )
     parser.add_argument(
         '--ce-weight', type=float,

@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel
 
+from src.constants import SCORE_MAX, SCORE_MIN
+
 
 def _masked_mean(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean-pool hidden states over the (boolean) span mask.
@@ -30,7 +32,7 @@ class ModernBERTRegressor(nn.Module):
     Two head modes:
       - 'reg': two MLPs predict scalars directly.
       - 'softmax': two MLPs predict logits over `num_bins` ordinal bins whose centers
-        are uniformly spaced over [1, 5]; the output is the expected value E[Y].
+        are uniformly spaced over [SCORE_MIN, SCORE_MAX]; the output is the expected value E[Y].
         Both paths return scalar predictions, so evaluation / prediction / submission
         code is identical. CE training uses `forward(batch, with_logits=True)`.
     """
@@ -52,7 +54,7 @@ class ModernBERTRegressor(nn.Module):
 
         if head_mode == 'softmax':
             self.register_buffer(
-                'bin_centers', torch.linspace(1.0, 5.0, num_bins)   # uniform centers
+                'bin_centers', torch.linspace(SCORE_MIN, SCORE_MAX, num_bins)   # uniform centers
             )
             self.out_features = num_bins
         else:

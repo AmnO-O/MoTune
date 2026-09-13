@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from src.constants import SCORE_MAX, SCORE_MIN
+
 
 def margin_rank_loss(pred: torch.Tensor, target: torch.Tensor, margin: float = 0.1) -> torch.Tensor:
     """Pairwise hinge loss scaled by target difference to penalize order violations."""
@@ -51,7 +53,7 @@ class CombinedLoss(nn.Module):
         # CPU while targets live on cuda (notebook constructs by hand); building
         # the center tensor directly on target.device/dtype each call is
         # immune to any device mismatch (a buffer would stay on CPU until .to()).
-        self.centers = torch.linspace(1.0, 5.0, max(num_bins, 2)).tolist()
+        self.centers = torch.linspace(SCORE_MIN, SCORE_MAX, max(num_bins, 2)).tolist()
         # train_epoch uses this to decide whether to request logits from the model
         self.requires_logits = ce_weight > 0
 

@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from config import Config
-from src.constants import MARKER_TOKENS
+from src.constants import MARKER_TOKENS, SCORE_MAX, SCORE_MIN
 from src.dataset import NNDataset
 from src.folds import prepare_stratified_folds
 from src.model import build_model
@@ -249,8 +249,8 @@ def run_predict(cfg: Config, logger: logging.Logger, device, data_dir: Path,
             raise FileNotFoundError(f'Missing {ckpt} - run --mode train80 first')
         trial_pred_mod, trial_pred_head = _predict(str(ckpt))
 
-    trial_pred_mod = np.clip(trial_pred_mod, 1.0, 5.0)
-    trial_pred_head = np.clip(trial_pred_head, 1.0, 5.0)
+    trial_pred_mod = np.clip(trial_pred_mod, SCORE_MIN, SCORE_MAX)
+    trial_pred_head = np.clip(trial_pred_head, SCORE_MIN, SCORE_MAX)
 
     trial_rho_mod = float(spearmanr(df_trial['ModAvg'], trial_pred_mod).statistic)
     trial_rho_head = float(spearmanr(df_trial['HeadAvg'], trial_pred_head).statistic)

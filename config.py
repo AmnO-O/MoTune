@@ -36,7 +36,7 @@ class Config:
     dropout: float = 0.2
     # output head: 'reg' = scalar regression; 'softmax' = ordinal bins -> E[Y]
     head_mode: str = 'reg'
-    num_bins: int = 6       # ordinal bins, centers uniformly spaced over [1, 5]
+    num_bins: int = 6       # ordinal bins, centers uniformly spaced over [SCORE_MIN, SCORE_MAX]
 
     # === optimization ===
     batch_size: int = 32
