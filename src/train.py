@@ -107,17 +107,25 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             else:
                 mod_pred, head_pred = model(batch)
 
-            loss = _supervised_term(
-                criterion, mod_pred, batch['mod_avg'],
-                mod_logits if requires_logits else None,
-                batch.get('mod_std'), batch.get('compound_id'),
-                batch.get('has_label'),
-            ) + _supervised_term(
-                criterion, head_pred, batch['head_avg'],
-                head_logits if requires_logits else None,
-                batch.get('head_std'), batch.get('compound_id'),
-                batch.get('has_label'),
-            )
+            # Auxiliary label-free rows (NCTTI set) carry no mod_avg/head_avg
+            # keys at all when an ENTIRE batch is aux-only (GroupBatchSampler
+            # groups by compound, and many aux compounds are unseen in the
+            # labeled data). Fall back to a zero supervised term there; the
+            # consistency term still provides a signal.
+            if 'mod_avg' in batch and 'head_avg' in batch:
+                loss = _supervised_term(
+                    criterion, mod_pred, batch['mod_avg'],
+                    mod_logits if requires_logits else None,
+                    batch.get('mod_std'), batch.get('compound_id'),
+                    batch.get('has_label'),
+                ) + _supervised_term(
+                    criterion, head_pred, batch['head_avg'],
+                    head_logits if requires_logits else None,
+                    batch.get('head_std'), batch.get('compound_id'),
+                    batch.get('has_label'),
+                )
+            else:
+                loss = torch.zeros((), device=mod_pred.device, dtype=torch.float)
 
             # Compound-consistency self-supervised term (data enrichment).
             # Rows of the same compound in different contexts are pulled together
@@ -246,13 +254,13 @@ def evaluate(model, dataloader, device):
             all_head_preds.append(head_pred.detach().cpu().numpy().reshape(-1))
 
             # Aux rows (NCTTI consistency set) carry NaN labels; has_label masks
-            # them out so metrics see only truly-labeled rows.
+            # them out so metrics see only truly-labeled rows. Labels are now
+            # always attached (NaN for aux rows), so mask.choice governs.
             lab = batch.get('has_label')
             if lab is not None:
                 has_mask = True
                 masks.append(lab.cpu().numpy().reshape(-1))
 
-            # Safe for both validation (labeled) and test (unlabeled) sets
             if 'mod_avg' in batch and 'head_avg' in batch:
                 has_labels = True
                 all_mod_labels.append(batch['mod_avg'].cpu().numpy().reshape(-1))
@@ -261,14 +269,23 @@ def evaluate(model, dataloader, device):
     mod_preds = np.concatenate(all_mod_preds)
     head_preds = np.concatenate(all_head_preds)
 
+    # Masks are authoritative: if ANY row is labeled, metrics run on the masked
+    # subset; zero labeled rows (test/trial) falls through to 2-tuple preds.
+    if has_mask:
+        mask = np.concatenate(masks)
+        if mask.any():
+            return (
+                mod_preds[mask], head_preds[mask],
+                np.concatenate(all_mod_labels)[mask],
+                np.concatenate(all_head_labels)[mask],
+            )
+        return mod_preds, head_preds
+
     if has_labels:
-        mod_labels = np.concatenate(all_mod_labels)
-        head_labels = np.concatenate(all_head_labels)
-        if has_mask:
-            mask = np.concatenate(masks)
-            if not mask.all():
-                return mod_preds[mask], head_preds[mask], mod_labels[mask], head_labels[mask]
-        return mod_preds, head_preds, mod_labels, head_labels
+        return (
+            mod_preds, head_preds,
+            np.concatenate(all_mod_labels), np.concatenate(all_head_labels),
+        )
 
     return mod_preds, head_preds
 

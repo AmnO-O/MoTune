@@ -174,6 +174,23 @@ class NNDataset(Dataset):
         head_ok = not self.is_test and 'HeadAvg' in row and pd.notna(row['HeadAvg'])
         has_label = bool(mod_ok and head_ok)
 
+        # Always attach MOD/HEAD label tensors: aux rows (has_label=False) get
+        # NaN. This keeps default_collate uniform across mixed batches -- if a
+        # key were missing on SOME samples, collate would read keys off the
+        # FIRST sample only and either crash or silently drop the labels of
+        # the rest. has_label is the authoritative mask everywhere downstream.
+        nan = float('nan')
+        if mod_ok and 'ModAvg' in row:
+            mod_avg = float(row['ModAvg'])
+        else:
+            mod_avg = nan
+        if head_ok and 'HeadAvg' in row:
+            head_avg = float(row['HeadAvg'])
+        else:
+            head_avg = nan
+        mod_std = float(row['ModStd']) if not self.is_test and 'ModStd' in row and pd.notna(row['ModStd']) else nan
+        head_std = float(row['HeadStd']) if not self.is_test and 'HeadStd' in row and pd.notna(row['HeadStd']) else nan
+
         item = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
@@ -182,15 +199,11 @@ class NNDataset(Dataset):
             'mwe_span_mask': mwe_span_mask,
             'compound_id': torch.tensor(self.compound_ids[idx], dtype=torch.long),
             'has_label': torch.tensor(has_label, dtype=torch.bool),
+            'mod_avg': torch.tensor(mod_avg, dtype=torch.float),
+            'head_avg': torch.tensor(head_avg, dtype=torch.float),
+            'mod_std': torch.tensor(mod_std, dtype=torch.float),
+            'head_std': torch.tensor(head_std, dtype=torch.float),
         }
-
-        if has_label:
-            item['mod_avg'] = torch.tensor(float(row['ModAvg']), dtype=torch.float)
-            item['head_avg'] = torch.tensor(float(row['HeadAvg']), dtype=torch.float)
-            if 'ModStd' in row and pd.notna(row['ModStd']):
-                item['mod_std'] = torch.tensor(float(row['ModStd']), dtype=torch.float)
-            if 'HeadStd' in row and pd.notna(row['HeadStd']):
-                item['head_std'] = torch.tensor(float(row['HeadStd']), dtype=torch.float)
 
         if self._cache_enabled:
             self._cache[idx] = item
