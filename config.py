@@ -15,9 +15,11 @@ from typing import Any, Dict, List, Literal, Optional
 
 Mode = Literal['train80', 'train5', 'predict']
 PredictMode = Literal['single', '5fold']
+ContextPool = Literal['mean', 'cls', 'mean+cls']
 
 _MODES = ('train80', 'train5', 'predict')
 _PREDICT_MODES = ('single', '5fold')
+_CONTEXT_POOLS = ('mean', 'cls', 'mean+cls')
 
 
 @dataclass
@@ -37,6 +39,11 @@ class Config:
     # output head: 'reg' = scalar regression; 'softmax' = ordinal bins -> E[Y]
     head_mode: str = 'reg'
     num_bins: int = 6       # ordinal bins, centers uniformly spaced over [SCORE_MIN, SCORE_MAX]
+    # sentence-level context representation fed to each head:
+    #   'mean'      = mean-pool over all tokens (original)
+    #   'cls'       = ModernBERT [CLS] embedding (attention-condensed summary)
+    #   'mean+cls'  = concatenation of both (richest; default)
+    context_pool: str = 'mean+cls'
 
     # === optimization ===
     batch_size: int = 32
@@ -150,6 +157,10 @@ class Config:
             errors.append(f'rank_margin must be > 0, got {self.rank_margin}')
         if self.head_mode not in ('reg', 'softmax'):
             errors.append(f"head_mode must be 'reg' or 'softmax', got {self.head_mode!r}")
+        if self.context_pool not in _CONTEXT_POOLS:
+            errors.append(
+                f"context_pool must be one of {_CONTEXT_POOLS}, got {self.context_pool!r}"
+            )
         if self.num_bins < 2:
             errors.append(f'num_bins must be >= 2, got {self.num_bins}')
         if self.ce_weight < 0:

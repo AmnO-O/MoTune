@@ -76,6 +76,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help='override num_bins (ordinal bins, centers uniform in [SCORE_MIN, SCORE_MAX])',
     )
     parser.add_argument(
+        '--context-pool', choices=('mean', 'cls', 'mean+cls'),
+        help='override context_pool (sentence-level repr fed to each head)',
+    )
+    parser.add_argument(
         '--ce-weight', type=float,
         help='override ce_weight (>0 adds Gaussian soft-target CE on the bins)',
     )

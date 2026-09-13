@@ -121,6 +121,12 @@ def check_config() -> None:
         check(True, 'num_bins=1 rejected')
 
     try:
+        Config.defaults().update(context_pool='bogus').validate()
+        check(False, 'context_pool=bogus rejected')
+    except ValueError:
+        check(True, 'context_pool=bogus rejected')
+
+    try:
         Config.defaults().update(ce_weight=-0.5).validate()
         check(False, 'ce_weight=-0.5 rejected')
     except ValueError:
@@ -146,7 +152,7 @@ def check_config() -> None:
         '--accum-steps', '2', '--patience', '4', '--ccc-weight', '0.5',
         '--lambda-rank', '0.3', '--unfreeze-from', '21', '--predict-mode', 'single',
         '--head-mode', 'softmax', '--num-bins', '6', '--ce-weight', '0.3',
-        '--bin-sigma', '0.5',
+        '--bin-sigma', '0.5', '--context-pool', 'cls',
         '--data-path', 'x', '--output-dir', 'y', '--seed', '7',
     ])
     merged = cli._merge_overrides(Config.defaults(), args)
@@ -158,8 +164,9 @@ def check_config() -> None:
         'all CLI flags map onto Config fields',
     )
     check(
-        (merged.head_mode, merged.num_bins, merged.ce_weight, merged.bin_sigma)
-        == ('softmax', 6, 0.3, 0.5),
+        (merged.head_mode, merged.num_bins, merged.ce_weight, merged.bin_sigma,
+         merged.context_pool)
+        == ('softmax', 6, 0.3, 0.5, 'cls'),
         'ordinal CLI flags map onto Config fields',
     )
     check(

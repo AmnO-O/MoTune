@@ -38,19 +38,23 @@ class ModernBERTRegressor(nn.Module):
     """
 
     def __init__(self, model_name: str, hidden_size: int = 768, dropout: float = 0.2,
-                 freeze_bert: bool = False, head_mode: str = 'reg', num_bins: int = 6):
+                 freeze_bert: bool = False, head_mode: str = 'reg', num_bins: int = 6,
+                 context_pool: str = 'mean+cls'):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
         self.hidden_size = hidden_size
         self.head_mode = head_mode
         self.num_bins = num_bins
+        self.context_pool = context_pool
 
         if freeze_bert:
             for param in self.bert.parameters():
                 param.requires_grad = False
 
-        # 4 cosine features + 3 pooled embeddings (hidden_size * 3)
-        self.head_in = hidden_size * 3 + 4
+        # 4 cosine features + role-span emb + MWE emb + context representation.
+        context_dim = hidden_size if context_pool in ('mean', 'cls') else 2 * hidden_size
+        self.context_dim = context_dim
+        self.head_in = hidden_size * 2 + context_dim + 4
 
         if head_mode == 'softmax':
             self.register_buffer(
@@ -87,13 +91,23 @@ class ModernBERTRegressor(nn.Module):
         mod_emb = _masked_mean(hidden, batch['mod_span_mask'])      # (B, H)
         head_emb = _masked_mean(hidden, batch['head_span_mask'])    # (B, H)
         mwe_emb = _masked_mean(hidden, batch['mwe_span_mask'])      # (B, H)
-        context_emb = _masked_mean(hidden, batch['attention_mask'])  # (B, H)
+        mean_emb = _masked_mean(hidden, batch['attention_mask'])    # (B, H)
+
+        # Sentence-level context representation per context_pool. CLS is an
+        # attention-condensed summary (hidden[:, 0]); mean_emb is the word-level
+        # average. 'mean+cls' concatenates both for the richest signal.
+        if self.context_pool == 'cls':
+            context_emb = hidden[:, 0]
+        elif self.context_pool == 'mean':
+            context_emb = mean_emb
+        else:
+            context_emb = torch.cat([mean_emb, hidden[:, 0]], dim=1)
 
         # Tránh NaN bằng Safe Cosine Similarity
         cos_sim_mod = _safe_cosine_similarity(mod_emb, mwe_emb)
         cos_sim_head = _safe_cosine_similarity(head_emb, mwe_emb)
         cos_sim_mod_head = _safe_cosine_similarity(mod_emb, head_emb)
-        cos_sim_mwe_cont = _safe_cosine_similarity(mwe_emb, context_emb)
+        cos_sim_mwe_cont = _safe_cosine_similarity(mwe_emb, mean_emb)
 
         cos_feats = torch.cat(
             [cos_sim_mod, cos_sim_head, cos_sim_mod_head, cos_sim_mwe_cont], dim=1
@@ -140,6 +154,7 @@ def build_model(cfg, tokenizer, device, dropout=None) -> ModernBERTRegressor:
         freeze_bert=False,  # Để Trainer làm nhiệm vụ freeze/unfreeze linh hoạt
         head_mode=cfg.head_mode,
         num_bins=cfg.num_bins,
+        context_pool=cfg.context_pool,
     )
     
     # Resize embedding khi thêm special marker tokens
