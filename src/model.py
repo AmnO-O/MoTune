@@ -14,11 +14,11 @@ def _masked_mean(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return summed / counts
 
 
-def _safe_cosine_similarity(x1: torch.Tensor, x2: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Cosine similarity ổn định số học, tránh lỗi NaN under FP16/AMP."""
-    w1 = x1.norm(p=2, dim=1, keepdim=True).clamp(min=eps)
-    w2 = x2.norm(p=2, dim=1, keepdim=True).clamp(min=eps)
-    return (x1 * x2).sum(dim=1, keepdim=True) / (w1 * w2)
+def _safe_cosine_similarity(x1: torch.Tensor, x2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Cosine similarity ổn định số học, tránh lỗi NaN under FP16/AMP cả chiều forward lẫn backward."""
+    norm1 = torch.sqrt((x1 ** 2).sum(dim=1, keepdim=True) + eps)
+    norm2 = torch.sqrt((x2 ** 2).sum(dim=1, keepdim=True) + eps)
+    return (x1 * x2).sum(dim=1, keepdim=True) / (norm1 * norm2)
 
 
 class ModernBERTRegressor(nn.Module):

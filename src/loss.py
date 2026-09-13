@@ -70,12 +70,25 @@ class CombinedLoss(nn.Module):
             sigma = torch.nan_to_num(
                 std.float(), nan=self.bin_sigma, posinf=self.bin_sigma, neginf=self.bin_sigma
             ).unsqueeze(-1)
-            sigma = torch.clamp(sigma, min=1e-2, max=5.0)
+            # Annotator std=0.0 means full agreement, NOT a zero-width delta function.
+            # Floor to a safe minimum width so the Gaussian always has mass over nearest bins.
+            min_sigma = max(float(self.bin_sigma) * 0.5, 0.25)
+            sigma = torch.clamp(sigma, min=min_sigma, max=5.0)
         else:
             sigma = self.bin_sigma
+
         d = (centers - target.unsqueeze(-1)) / sigma
         w = torch.exp(-0.5 * d * d)
-        return w / w.sum(dim=-1, keepdim=True)
+        denom = w.sum(dim=-1, keepdim=True)
+
+        # Fallback guarantee: if denom underflows for any reason, place one-hot on closest bin
+        zero_mask = (denom < 1e-7)
+        if zero_mask.any():
+            closest = (centers - target.unsqueeze(-1)).abs().argmin(dim=-1, keepdim=True)
+            w = torch.where(zero_mask, torch.zeros_like(w).scatter_(-1, closest, 1.0), w)
+            denom = w.sum(dim=-1, keepdim=True)
+
+        return w / denom
 
     def _ce(self, logits: torch.Tensor, target: torch.Tensor,
             std: torch.Tensor = None) -> torch.Tensor:
