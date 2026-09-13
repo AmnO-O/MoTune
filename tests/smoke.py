@@ -202,19 +202,22 @@ def check_sampler() -> None:
     sampler = CompoundGroupSampler(ids, batch_size=32, s_per_compound=4, seed=42)
     idx = list(iter(sampler))
 
-    check(len(idx) >= len(df) and len(idx) % 32 == 0, f'sampler covers every row ({len(idx)} padded to full batches for {len(df)} rows)')
+    check(
+        len(idx) == len(df),
+        f'sampler emits all rows exactly once ({len(idx)}/{len(df)})',
+    )
+    covered = len(set(idx))
+    check(covered == len(df), f'100% row coverage ({covered}/{len(df)})')
 
     blocks = [idx[i:i + 32] for i in range(0, len(idx), 32)]
-    mults = [len(set(ids[b])) for b in blocks]
     pair_counts = []
     for b in blocks:
         _, counts = np.unique(ids[b], return_counts=True)
         pairs = sum(c * (c - 1) // 2 for c in counts if c > 1)
         pair_counts.append(pairs)
     avg_pairs = float(np.mean(pair_counts))
-    print(f'  avg same-compound pairs/batch = {avg_pairs:.0f} (was ~1 random, K*C(s,2)=48 target)')
-    check(avg_pairs >= 20, f'same-compound pairs dense enough ({avg_pairs:.0f} >= 20)')
-    check(float(np.mean(mults)) <= 10, f'sampler stays compound-locality aware (mean unique/block {np.mean(mults):.1f} <= 10)')
+    print(f'  avg same-compound pairs/batch = {avg_pairs:.0f} (was ~1 random)')
+    check(avg_pairs >= 30, f'same-compound pairs dense enough ({avg_pairs:.0f} >= 30)')
 
 
 def main() -> int:

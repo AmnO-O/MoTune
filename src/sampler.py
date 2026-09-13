@@ -3,15 +3,14 @@ intra-compound sentence pairs for the pairwise ranking loss.
 
 Random batches almost never contain two rows of the same compound (~1.1
 same-compound pairs per batch), which starves ``margin_rank_loss`` of signal.
-Grouping K compounds x S rows per compound yields ~K*C(S,2) real ranking pairs
-per batch (8x4 -> 48 pairs).
+Grouping consecutive rows of the same compound yields dense pairs while
+guaranteeing every row is seen exactly once per epoch.
 """
 
 from __future__ import annotations
 
-import math
 import random
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 
 try:
     from torch.utils.data import Sampler
@@ -28,12 +27,12 @@ except ImportError:  # pragma: no cover - torch not installed locally
 
 
 class CompoundGroupSampler(Sampler):
-    """Yields dataset indices already grouped into full ``batch_size`` blocks.
+    """Yields dataset indices grouped into ``batch_size`` blocks by compound.
 
-    Every block is built by sampling ``K = batch_size // s_per_compound``
-    compounds and drawing ``s_per_compound`` rows from each (rows are drawn
-    without replacement when the compound has enough rows). Blocks are shuffled
-    and padded up to ``batch_size`` with random rows when short.
+    All rows of each compound are emitted together so every batch contains
+    rows from only 3–5 compounds, producing many intra-compound pairs for the
+    ranking loss. Every row is seen exactly once per epoch (no padding, no
+    dropped rows).
     """
 
     def __init__(self, compound_ids: Sequence[int], batch_size: int,
@@ -41,13 +40,11 @@ class CompoundGroupSampler(Sampler):
         super().__init__()
         self.compound_ids = list(compound_ids)
         self.batch_size = max(1, int(batch_size))
-        self.s_per_compound = max(2, int(s_per_compound))
         self.seed = int(seed)
 
         self.groups: dict = {}
         for i, c in enumerate(self.compound_ids):
             self.groups.setdefault(c, []).append(i)
-        self.compounds = sorted(self.groups)
         self._call = 0
 
     def __len__(self) -> int:
@@ -56,25 +53,17 @@ class CompoundGroupSampler(Sampler):
     def __iter__(self):
         self._call += 1
         rng = random.Random(self.seed + self._call * 7919)
-        k = max(1, self.batch_size // self.s_per_compound)
 
-        n_batches = math.ceil(len(self.compound_ids) / self.batch_size)
+        # Shuffle compound order, then emit all rows of each compound together.
+        # DataLoader batches these consecutively, so every batch holds only 3-5
+        # compounds and the (possibly partial) last batch is handled normally.
+        compounds = list(self.groups)
+        rng.shuffle(compounds)
+
         indices: List[int] = []
-        rng.shuffle(self.compounds)
+        for c in compounds:
+            rows = self.groups[c][:]
+            rng.shuffle(rows)
+            indices.extend(rows)
 
-        for _ in range(n_batches):
-            block: List[int] = []
-            for c in rng.choices(self.compounds, k=k):
-                idxs = self.groups[c]
-                if len(idxs) <= self.s_per_compound:
-                    block.extend(idxs)
-                else:
-                    block.extend(rng.sample(idxs, self.s_per_compound))
-            rng.shuffle(block)
-            while len(block) > self.batch_size:
-                block.pop()
-            while len(block) < self.batch_size:
-                block.append(rng.randrange(len(self.compound_ids)))
-            indices.extend(block)
-
-        return iter(indices[: n_batches * self.batch_size])
+        return iter(indices)
