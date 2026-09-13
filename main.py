@@ -80,6 +80,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help='override context_pool (sentence-level repr fed to each head)',
     )
     parser.add_argument(
+        '--head-features', choices=('legacy', 'compact'),
+        help='override head_features (compact = de-redundant head input)',
+    )
+    parser.add_argument(
+        '--head-hidden', type=int,
+        help='override head_hidden (MLP width inside each head)',
+    )
+    parser.add_argument(
+        '--phase1-schedule', choices=('linear', 'constant'),
+        help='override phase1_schedule (constant = warmup then hold, no decay-to-0)',
+    )
+    parser.add_argument(
+        '--rank-margin-mode', choices=('clamp', 'dynamic'),
+        help='override rank_margin_mode (dynamic = unbounded target-gap margin)',
+    )
+    parser.add_argument(
+        '--ccc-var-floor', type=float,
+        help='override ccc_var_floor (variance floor in the 1-CCC denominator)',
+    )
+    parser.add_argument(
+        '--std-alpha', type=float, dest='loss_std_alpha',
+        help='override loss_std_alpha (0 = off; weights MSE/CCC by 1/(1+alpha*std))',
+    )
+    parser.add_argument(
+        '--lambda-consist', type=float,
+        help='override lambda_consist (0 = off; self-supervised compound consistency)',
+    )
+    parser.add_argument(
+        '--consist-mode', choices=('pull', 'infonce'),
+        help='override consist_mode (pull = centroid-variance, infonce = contrastive)',
+    )
+    parser.add_argument(
+        '--augment-prob', type=float,
+        help='override augment_prob (0..1; probability of context word-drop that keeps spans)',
+    )
+    parser.add_argument(
         '--ce-weight', type=float,
         help='override ce_weight (>0 adds Gaussian soft-target CE on the bins)',
     )

@@ -1,5 +1,5 @@
 """Locate a compound inside its real context sentence and wrap the spans in
-``<mod>`` / ``<head>`` / ``<mwe>`` markers.
+``<mod>`` / ``<head>`` markers.
 
 Stays dependency-free (regex only) so matching can be unit-tested and
 debugged without a model or tokenizer.
@@ -10,7 +10,6 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-_MWE_OPEN, _MWE_CLOSE = '<mwe>', '</mwe>'
 _MOD_OPEN, _MOD_CLOSE = '<mod>', '</mod>'
 _HEAD_OPEN, _HEAD_CLOSE = '<head>', '</head>'
 
@@ -28,7 +27,7 @@ def mark_compound(context: str, mod: str, head: str,
 
     The compound is matched as a word sequence: ``mod`` followed by ``head``
     (head may carry a plural/possessive suffix, e.g. "night watch" matches
-    "night watches"). ``mwe`` defaults to ``mod + head`` when not given.
+    "night watches").
 
     Returns None when no match is found (caller decides the fallback).
     """
@@ -51,8 +50,8 @@ def mark_compound(context: str, mod: str, head: str,
     mwe_start, mwe_end = match.start(), match.end()
 
     marked_compound = (
-        f'{_MWE_OPEN}{_MOD_OPEN}{mod_txt}{_MOD_CLOSE}'
-        f'{_HEAD_OPEN}{head_txt}{_HEAD_CLOSE}{_MWE_CLOSE}'
+        f'{_MOD_OPEN}{mod_txt}{_MOD_CLOSE}'
+        f'{_HEAD_OPEN}{head_txt}{_HEAD_CLOSE}'
     )
     return context[:mwe_start] + marked_compound + context[mwe_end:]
 
@@ -62,8 +61,8 @@ def fallback_marked_text(mod: str, head: str, context: str,
     """Deterministic marked input when the compound is not found in context."""
     mwe = (mwe or f'{mod} {head}').strip()
     marked = (
-        f'{_MWE_OPEN}{_MOD_OPEN}{mod}{_MOD_CLOSE}'
-        f'{_HEAD_OPEN}{head}{_HEAD_CLOSE}{_MWE_CLOSE}'
+        f'{_MOD_OPEN}{mod}{_MOD_CLOSE}'
+        f'{_HEAD_OPEN}{head}{_HEAD_CLOSE}'
     )
     context = ' '.join(context.strip().split())
     return f'{marked} {context}'.strip()
@@ -72,7 +71,7 @@ def fallback_marked_text(mod: str, head: str, context: str,
 def span_text_offsets(marked: str, tag: str) -> Optional[tuple[int, int]]:
     """Character offsets of the text between an opening and closing marker.
 
-    ``tag`` is one of 'mod', 'head', 'mwe'. Returns None if either boundary
+    ``tag`` is one of 'mod', 'head'. Returns None if either boundary
     of that tag pair is missing (i.e. the marked text could not carry it).
     """
     try:
@@ -94,5 +93,4 @@ def span_text_offsets(marked: str, tag: str) -> Optional[tuple[int, int]]:
 TAG_LOOKUP = {
     'mod': ('<mod>', '</mod>'),
     'head': ('<head>', '</head>'),
-    'mwe': ('<mwe>', '</mwe>'),
 }

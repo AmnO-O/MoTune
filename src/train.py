@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from torch.amp import autocast
 
+from src.loss import compound_consistency_loss
+
 
 def track_optimizer_steps(optimizer) -> None:
     """Version-independent "did the optimizer really step" detector.
@@ -40,7 +42,8 @@ def track_optimizer_steps(optimizer) -> None:
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
-                grad_clip=1.0, accum_steps=1, report=None):
+                grad_clip=1.0, accum_steps=1, report=None,
+                consist_weight=0.0, consist_mode='pull', consist_temp=0.1):
     """One epoch with optional gradient accumulation.
 
     `accum_steps > 1` keeps micro-batches small (large backbones on a T4) while
@@ -54,6 +57,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     """
     model.train()
     total_loss = 0.0
+    consist_sum = 0.0
+    n_consist = 0
     optimizer.zero_grad()
 
     opt_steps = skipped = 0
@@ -75,22 +80,43 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
         
         with autocast(device_type):
-            if getattr(criterion, 'requires_logits', False):
+            requires_logits = getattr(criterion, 'requires_logits', False)
+            use_reps = consist_weight > 0
+            if requires_logits and use_reps:
+                (mod_pred, head_pred, mod_emb, head_emb,
+                 mod_logits, head_logits) = model(batch, with_logits=True, with_reps=True)
+            elif requires_logits:
                 mod_pred, head_pred, mod_logits, head_logits = model(batch, with_logits=True)
-                loss = criterion(
-                    mod_pred, batch['mod_avg'], mod_logits, batch.get('mod_std'),
-                    compound_ids=batch.get('compound_id'),
-                ) + criterion(
-                    head_pred, batch['head_avg'], head_logits, batch.get('head_std'),
-                    compound_ids=batch.get('compound_id'),
-                )
+            elif use_reps:
+                mod_pred, head_pred, mod_emb, head_emb = model(batch, with_reps=True)
             else:
                 mod_pred, head_pred = model(batch)
-                loss = criterion(
-                    mod_pred, batch['mod_avg'], compound_ids=batch.get('compound_id'),
-                ) + criterion(
-                    head_pred, batch['head_avg'], compound_ids=batch.get('compound_id'),
-                )
+
+            loss = criterion(
+                mod_pred, batch['mod_avg'],
+                mod_logits if requires_logits else None,
+                batch.get('mod_std'),
+                compound_ids=batch.get('compound_id'),
+            ) + criterion(
+                head_pred, batch['head_avg'],
+                head_logits if requires_logits else None,
+                batch.get('head_std'),
+                compound_ids=batch.get('compound_id'),
+            )
+
+            # Compound-consistency self-supervised term (data enrichment).
+            # Rows of the same compound in different contexts are pulled together
+            # in span-rep space -- label-free, additive, no target tricks.
+            consist_val = None
+            if use_reps:
+                group = batch.get('compound_id')
+                if group is not None:
+                    consist = compound_consistency_loss(
+                        mod_emb, head_emb, group, mode=consist_mode, temp=consist_temp
+                    )
+                    loss = loss + consist_weight * consist
+                    consist_val = consist.item() if torch.isfinite(consist) else float('nan')
+
             loss = loss / accum_steps
 
         scaler.scale(loss).backward()
@@ -162,6 +188,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             last_scale = float(scaler.get_scale())
             last_lr = float(scheduler.get_last_lr()[0])
 
+        if consist_val is not None:
+            consist_sum += consist_val
+            n_consist += 1
+
         v = loss.item() * accum_steps
         total_loss += v if math.isfinite(v) else 0.0
 
@@ -175,6 +205,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             'scale': last_scale,
             'lr': last_lr,
         })
+        if n_consist:
+            report['consist'] = consist_sum / n_consist
 
     return total_loss / n_micro
 

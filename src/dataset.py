@@ -1,4 +1,7 @@
 import logging
+import random
+import re
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -43,24 +46,72 @@ def _is_finite(v) -> bool:
         return False
 
 
+_MARKER_SPLIT = re.compile(r'(<mod>|</mod>|<head>|</head>)')
+
+
+def _augment_marked_text(marked: str, rng: random.Random) -> str:
+    """Label-preserving context augmentation.
+
+    Random token-dropout of ~15% of NON-marker words ONLY. No tail-cropping:
+    trimming removes the words nearest to the MWE (the most context a
+    compositionality judgment depends on) and breaks grammar harder, so it is
+    dropped. Token-dropout is the perturbation BERT-style encoders tolerate
+    best and teaches span invariance to distant context. The marked spans are
+    always kept intact. Returns the input unchanged if the protected spans
+    could not be preserved.
+    """
+    out = []
+    for part in _MARKER_SPLIT.split(marked):
+        if not part:
+            continue
+        if part.startswith('<'):
+            out.append(part)
+            continue
+        words = part.split()
+        if not words:
+            continue
+        keep = [w for w in words if rng.random() > 0.15]
+        if keep:
+            out.append(' '.join(keep))
+    augmented = ' '.join(out)
+    if '<mod>' not in augmented or '<head>' not in augmented:
+        return marked
+    return augmented
+
+
 class NNDataset(Dataset):
     """Tokenizer wrapper producing ONE marked sentence per row.
 
     The compound's modifier / head spans are wrapped in ``<mod>`` / ``<head>``
-    markers (whole MWE in ``<mwe>``) inside the real context sentence. Each
-    item carries ``input_ids``, ``attention_mask`` and one boolean span mask
-    per role, so the model pools hidden states over the marked words only.
+    markers inside the real context sentence. Each item carries ``input_ids``,
+    ``attention_mask`` and one boolean span mask per role, so the model pools
+    hidden states over the marked words only.
 
     ``max_context_length`` caps the marked sentence (the context sentences are
     longer than the old standalone Mod/Head/Compound items).
+
+    Tokenization is cached per row (``augment_prob == 0``), so epoch switches
+    are cheap. With ``augment_prob > 0`` caching is disabled and each draw
+    rounds up to 256 tokens anyway.
     """
 
-    def __init__(self, df, tokenizer, max_length=128, max_context_length=256,
-                 is_test=False):
+    def __init__(
+        self,
+        df,
+        tokenizer,
+        max_context_length: int = 256,
+        is_test: bool = False,
+        augment_prob: float = 0.0,
+        seed: int = 0,
+    ):
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
-        self.max_length = max_context_length
+        self.max_context_length = max_context_length
         self.is_test = is_test
+        self.augment_prob = augment_prob
+        self.rng = random.Random(seed)
+        self._cache: dict[int, dict[str, torch.Tensor]] = {}
+        self._cache_enabled = augment_prob == 0.0
         if not is_test:
             _report_nonfinite(self.df, 'train split', ('ModStd', 'HeadStd'))
 
@@ -78,6 +129,9 @@ class NNDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
+        if self._cache_enabled and idx in self._cache:
+            return self._cache[idx]
+
         row = self.df.iloc[idx]
 
         marked = mark_compound(
@@ -90,9 +144,12 @@ class NNDataset(Dataset):
                 str(row['Mod']), str(row['Head']), str(row['Context'])
             )
 
+        if self.augment_prob > 0 and self.rng.random() < self.augment_prob:
+            marked = _augment_marked_text(marked, self.rng)
+
         encoded = self.tokenizer(
             marked,
-            max_length=self.max_length,
+            max_length=self.max_context_length,
             padding='max_length',
             truncation=True,
             return_tensors='pt',
@@ -105,10 +162,9 @@ class NNDataset(Dataset):
 
         mod_span_mask = self._span_mask(marked, 'mod', offsets)
         head_span_mask = self._span_mask(marked, 'head', offsets)
-        # Clean compound span: pool only over constituent words, excluding marker tags
+        # Compound span is ALWAYS the contiguous mod+head pair (markers
+        # guarantee adjacency), so no separate <mwe> fallback is needed.
         mwe_span_mask = mod_span_mask | head_span_mask
-        if not mwe_span_mask.any():
-            mwe_span_mask = self._span_mask(marked, 'mwe', offsets)
 
         item = {
             'input_ids': input_ids,
@@ -127,6 +183,8 @@ class NNDataset(Dataset):
             if 'HeadStd' in row:
                 item['head_std'] = torch.tensor(float(row['HeadStd']), dtype=torch.float)
 
+        if self._cache_enabled:
+            self._cache[idx] = item
         return item
 
     def _span_mask(self, marked, tag, offsets):

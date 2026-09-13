@@ -8,7 +8,8 @@ MAX_CONTEXT_LENGTH = 256
 SCORE_MIN = 0.0
 SCORE_MAX = 5.0
 
-# Span markers injected around the modifier / head / MWE spans. The model is
+# Span markers injected around the modifier / head spans. The model is
 # resized to include these tokens; they teach the encoder which words are being
-# scored ("<mod> account </mod> <head> book </head>").
-MARKER_TOKENS = ['<mod>', '</mod>', '<head>', '</head>', '<mwe>', '</mwe>']
+# scored ("<mod> account </mod> <head> book </head>"). The whole MWE is always
+# the contiguous mod+head pair, so no separate <mwe> markers are needed.
+MARKER_TOKENS = ['<mod>', '</mod>', '<head>', '</head>']

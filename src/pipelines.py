@@ -215,8 +215,10 @@ def run_predict(cfg: Config, logger: logging.Logger, device, data_dir: Path,
     df_trial = load_trial_frame(data_dir)
     tokenizer = load_tokenizer(cfg)
 
-    trial_dataset = NNDataset(df_trial, tokenizer, cfg.max_length,
-                              cfg.max_context_length, is_test=True)
+    trial_dataset = NNDataset(
+        df_trial, tokenizer,
+        max_context_length=cfg.max_context_length, is_test=True
+    )
     trial_loader = DataLoader(trial_dataset, batch_size=cfg.batch_size * 2,
                               shuffle=False, num_workers=cfg.num_workers,
                               pin_memory=True)

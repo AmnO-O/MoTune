@@ -16,10 +16,18 @@ from typing import Any, Dict, List, Literal, Optional
 Mode = Literal['train80', 'train5', 'predict']
 PredictMode = Literal['single', '5fold']
 ContextPool = Literal['mean', 'cls', 'mean+cls']
+HeadFeatures = Literal['legacy', 'compact']
+Phase1Schedule = Literal['linear', 'constant']
+RankMarginMode = Literal['clamp', 'dynamic']
+ConsistMode = Literal['pull', 'infonce']
 
 _MODES = ('train80', 'train5', 'predict')
 _PREDICT_MODES = ('single', '5fold')
 _CONTEXT_POOLS = ('mean', 'cls', 'mean+cls')
+_HEAD_FEATURES = ('legacy', 'compact')
+_PHASE1_SCHEDULES = ('linear', 'constant')
+_RANK_MARGIN_MODES = ('clamp', 'dynamic')
+_CONSIST_MODES = ('pull', 'infonce')
 
 
 @dataclass
@@ -44,11 +52,13 @@ class Config:
     #   'cls'       = ModernBERT [CLS] embedding (attention-condensed summary)
     #   'mean+cls'  = concatenation of both (richest; default)
     context_pool: str = 'mean+cls'
+    head_features: str = 'compact'
+    head_hidden: int = 128
 
     # === optimization ===
     batch_size: int = 32
     accum_steps: int = 1       # gradient accumulation (effective batch = batch_size * accum_steps)
-    head_lr: float = 5e-4
+    head_lr: float = 1e-4      # was 5e-4: heads were overfitting frozen features within ~5 epochs
     encoder_lr: float = 3e-6
     embedding_lr: float = 1e-5     # only the (new, random) marker embeddings
     weight_decay: float = 0.05
@@ -57,10 +67,35 @@ class Config:
     freeze_epochs: int = 4
     unfreeze_from_layer: int = 18
     warmup_ratio: float = 0.15
+    # Phase-1 (frozen encoder) LR schedule:
+    #   'constant' = warmup then HOLD (markers keep learning; no wasted near-zero tail)
+    #   'linear'   = old behaviour: warmup then decay to 0 at the end of phase 1
+    phase1_schedule: Phase1Schedule = 'constant'
     loss_type: str = 'mse_ccc'
     ccc_weight: float = 0.7
+    # Small-variance batches make 1-CCC saturate at ~1 (denominator explodes);
+    # a variance floor keeps the gradient informative on tiny batches.
+    ccc_var_floor: float = 0.05
     lambda_rank: float = 0.5     # 0 = off; >0 adds pairwise margin-ranking to the loss
     rank_margin: float = 0.5
+    #   'dynamic' = hinge margin = target gap (ClampTérmino pushes extreme pairs hardest)
+    #   'clamp'   = hinge margin capped at rank_margin (old behaviour)
+    rank_margin_mode: RankMarginMode = 'dynamic'
+    # 0 = off; >0 reweights MSE/CCC by 1/(1+alpha*ModStd/HeadStd) so
+    # high-disagreement (ambiguous) rows count for less.
+    loss_std_alpha: float = 0.0
+    # Compound-consistency self-supervised loss (data enrichment, label-free):
+    # pulls together the span representations of the SAME compound across its
+    # contexts so the model learns "same MWE = same concept". 0 = off.
+    lambda_consist: float = 0.0
+    #   'pull'     = centroid-variance (recommended; no negatives in tiny batches)
+    #   'infonce'  = contrastive with same-compound positive views
+    consist_mode: ConsistMode = 'pull'
+    consist_temp: float = 0.1        # temperature for consist_mode='infonce'
+    # data augmentation that PRESERVES labels (masked spans kept intact):
+    # random word-drop / tail-crop of non-marker context words as a fraction
+    # of training draws. Tokenize cache is disabled while augment_prob > 0.
+    augment_prob: float = 0.0
     ce_weight: float = 0.0     # 0 = off; >0 adds Gaussian soft-target CE on the ordinal bins
     bin_sigma: float = 0.5     # std (in bin units) of the Gaussian soft target
     use_label_std: bool = True # per-sample Gaussian width from ModStd/HeadStd when available; falls back to bin_sigma
@@ -161,6 +196,34 @@ class Config:
             errors.append(
                 f"context_pool must be one of {_CONTEXT_POOLS}, got {self.context_pool!r}"
             )
+        if self.head_features not in _HEAD_FEATURES:
+            errors.append(
+                f"head_features must be one of {_HEAD_FEATURES}, got {self.head_features!r}"
+            )
+        if self.head_hidden < 1:
+            errors.append(f'head_hidden must be >= 1, got {self.head_hidden}')
+        if self.phase1_schedule not in _PHASE1_SCHEDULES:
+            errors.append(
+                f"phase1_schedule must be one of {_PHASE1_SCHEDULES}, got {self.phase1_schedule!r}"
+            )
+        if self.rank_margin_mode not in _RANK_MARGIN_MODES:
+            errors.append(
+                f"rank_margin_mode must be one of {_RANK_MARGIN_MODES}, got {self.rank_margin_mode!r}"
+            )
+        if self.consist_mode not in _CONSIST_MODES:
+            errors.append(
+                f"consist_mode must be one of {_CONSIST_MODES}, got {self.consist_mode!r}"
+            )
+        if self.consist_temp <= 0:
+            errors.append(f'consist_temp must be > 0, got {self.consist_temp}')
+        if self.lambda_consist < 0:
+            errors.append(f'lambda_consist must be >= 0, got {self.lambda_consist}')
+        if self.loss_std_alpha < 0:
+            errors.append(f'loss_std_alpha must be >= 0, got {self.loss_std_alpha}')
+        if self.ccc_var_floor < 0:
+            errors.append(f'ccc_var_floor must be >= 0, got {self.ccc_var_floor}')
+        if not 0 <= self.augment_prob < 1:
+            errors.append(f'augment_prob must be in [0, 1), got {self.augment_prob}')
         if self.num_bins < 2:
             errors.append(f'num_bins must be >= 2, got {self.num_bins}')
         if self.ce_weight < 0:

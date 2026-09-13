@@ -20,7 +20,7 @@ from scipy.stats import spearmanr
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
 
 from config import Config
 from src.dataset import NNDataset
@@ -67,10 +67,13 @@ class Trainer:
     # ------------------------------------------------------------------ #
     def _build_loaders(self, train_df: pd.DataFrame, val_df: pd.DataFrame, tokenizer):
         train_ds = NNDataset(
-            train_df, tokenizer, self.cfg.max_length, self.cfg.max_context_length
+            train_df, tokenizer,
+            max_context_length=self.cfg.max_context_length,
+            augment_prob=self.cfg.augment_prob,
+            seed=self.cfg.seed,
         )
         val_ds = NNDataset(
-            val_df, tokenizer, self.cfg.max_length, self.cfg.max_context_length
+            val_df, tokenizer, max_context_length=self.cfg.max_context_length
         )
         if self.cfg.lambda_rank > 0:
             # Group rows by compound so every batch holds 3-5 compounds and
@@ -119,11 +122,19 @@ class Trainer:
             ],
         )
         track_optimizer_steps(optimizer)
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=int(steps * self.cfg.warmup_ratio),
-            num_training_steps=steps,
-        )
+        if self.cfg.phase1_schedule == 'constant':
+            # Linear decay to 0 in Phase 1 wastes most of its tail (LR ~0 while
+            # the markers/heads still need to learn). Warmup then HOLD.
+            scheduler = get_constant_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=int(steps * self.cfg.warmup_ratio),
+            )
+        else:
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=int(steps * self.cfg.warmup_ratio),
+                num_training_steps=steps,
+            )
         return optimizer, scheduler
 
     def _phase2(self, model, steps: int):
@@ -180,6 +191,9 @@ class Trainer:
             ccc_weight=self.cfg.ccc_weight,
             lambda_rank=self.cfg.lambda_rank,
             rank_margin=self.cfg.rank_margin,
+            rank_margin_mode=self.cfg.rank_margin_mode,
+            ccc_var_floor=self.cfg.ccc_var_floor,
+            std_alpha=self.cfg.loss_std_alpha,
             ce_weight=self.cfg.ce_weight,
             num_bins=self.cfg.num_bins,
             bin_sigma=self.cfg.bin_sigma,
@@ -220,6 +234,9 @@ class Trainer:
                 model, train_loader, optimizer, scheduler, criterion, scaler,
                 self.device, grad_clip=self.cfg.grad_clip,
                 accum_steps=self.cfg.accum_steps, report=diag,
+                consist_weight=self.cfg.lambda_consist,
+                consist_mode=self.cfg.consist_mode,
+                consist_temp=self.cfg.consist_temp,
             )
             # Train-set performance (fit quality on the exact training data).
             tr_mod_pred, tr_head_pred, tr_mod_label, tr_head_label = evaluate(
@@ -251,6 +268,7 @@ class Trainer:
                 'group_grads': {k: round(v, 4) for k, v in diag.get('group_grads', {}).items()},
                 'scale': round(diag['scale'], 1),
                 'lr': diag['lr'],
+                'consist': round(diag['consist'], 5) if 'consist' in diag else None,
                 'pred_mod_min': round(float(mod_pred.min()), 4),
                 'pred_mod_max': round(float(mod_pred.max()), 4),
                 'pred_head_min': round(float(head_pred.min()), 4),
@@ -272,6 +290,11 @@ class Trainer:
                 diag['scale'], diag['lr'],
                 mod_pred.min(), mod_pred.max(), head_pred.min(), head_pred.max(),
             )
+            if 'consist' in diag:
+                self.logger.info(
+                    '  consistency loss: %.5f (lambda=%.2f, mode=%s)',
+                    diag['consist'], self.cfg.lambda_consist, self.cfg.consist_mode,
+                )
 
             if rho_mean > best_rho:
                 best_rho, best_epoch, no_improve_epochs = rho_mean, epoch + 1, 0
