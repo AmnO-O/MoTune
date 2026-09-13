@@ -67,7 +67,10 @@ class CombinedLoss(nn.Module):
             self.centers, dtype=target.dtype, device=target.device
         ).unsqueeze(0)
         if self.use_label_std and std is not None:
-            sigma = torch.clamp(std.float().unsqueeze(-1), min=1e-2)
+            sigma = torch.nan_to_num(
+                std.float(), nan=self.bin_sigma, posinf=self.bin_sigma, neginf=self.bin_sigma
+            ).unsqueeze(-1)
+            sigma = torch.clamp(sigma, min=1e-2, max=5.0)
         else:
             sigma = self.bin_sigma
         d = (centers - target.unsqueeze(-1)) / sigma
