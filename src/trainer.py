@@ -26,6 +26,7 @@ from config import Config
 from src.dataset import NNDataset
 from src.loss import CombinedLoss
 from src.model import build_model, embedding_table
+from src.sampler import CompoundGroupSampler
 from src.train import evaluate, track_optimizer_steps, train_epoch, unfreeze_top_layers
 
 
@@ -71,10 +72,24 @@ class Trainer:
         val_ds = NNDataset(
             val_df, tokenizer, self.cfg.max_length, self.cfg.max_context_length
         )
-        train_loader = DataLoader(
-            train_ds, batch_size=self.cfg.batch_size, shuffle=True,
-            num_workers=self.cfg.num_workers, pin_memory=True,
-        )
+        if self.cfg.lambda_rank > 0:
+            # Group rows by compound so every batch holds K*C(s_per,2)
+            # intra-compound pairs for the ranking loss (~48 pairs for 8x4).
+            train_loader = DataLoader(
+                train_ds, batch_size=self.cfg.batch_size, shuffle=False,
+                sampler=CompoundGroupSampler(
+                    train_ds.compound_ids,
+                    batch_size=self.cfg.batch_size,
+                    s_per_compound=self.cfg.group_s_per_compound,
+                    seed=self.cfg.seed,
+                ),
+                num_workers=self.cfg.num_workers, pin_memory=True,
+            )
+        else:
+            train_loader = DataLoader(
+                train_ds, batch_size=self.cfg.batch_size, shuffle=True,
+                num_workers=self.cfg.num_workers, pin_memory=True,
+            )
         val_loader = DataLoader(
             val_ds, batch_size=self.cfg.batch_size * 2, shuffle=False,
             num_workers=self.cfg.num_workers, pin_memory=True,

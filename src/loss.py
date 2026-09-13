@@ -1,31 +1,47 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.constants import SCORE_MAX, SCORE_MIN
 
-
-def margin_rank_loss(pred: torch.Tensor, target: torch.Tensor, margin: float = 0.1) -> torch.Tensor:
-    """Pairwise hinge loss scaled by target difference to penalize order violations."""
+def margin_rank_loss(
+    pred: torch.Tensor, 
+    target: torch.Tensor, 
+    margin: float = 0.5, 
+    compound_ids: torch.Tensor = None
+) -> torch.Tensor:
+    """Pairwise hinge loss scaled by target difference, computed WITHIN same compound."""
+    
+    # Xử lý đa đầu ra (Mod & Head heads)
     if pred.ndim > 1:
-        # Xử lý cho từng output head riêng biệt nếu input là 2D
-        losses = [margin_rank_loss(pred[:, i], target[:, i], margin) for i in range(pred.shape[1])]
+        losses = [
+            margin_rank_loss(pred[:, i], target[:, i], margin, compound_ids) 
+            for i in range(pred.shape[1])
+        ]
         return torch.stack(losses).mean()
 
     n = pred.shape[0]
     if n < 2:
-        return pred.sum() * 0.0
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
 
+    # 1. Ma trận chênh lệch
     target_diff = target[:, None] - target[None, :]   # y_i - y_j
     pred_diff = pred[:, None] - pred[None, :]         # p_i - p_j
     
-    # Chỉ xét các cặp y_i > y_j
+    # 2. Lọc các cặp y_i > y_j
     mask = target_diff > 0
-    if not mask.any():
-        return pred.sum() * 0.0
+    
+    # CRITICAL FIX: Chỉ giữ lại các cặp thuộc CÙNG một từ ghép (Compound)
+    if compound_ids is not None:
+        same_compound = (compound_ids[:, None] == compound_ids[None, :])
+        mask = mask & same_compound
 
-    # Margin linh hoạt dựa trên khoảng cách target thực tế, tránh phạt vô lý các cặp gần nhau
+    if not mask.any():
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+    # 3. Dynamic Margin & Hinge Loss
     dynamic_margin = torch.clamp(target_diff[mask], max=margin)
-    hinge = torch.relu(dynamic_margin - pred_diff[mask])
+    hinge = F.relu(dynamic_margin - pred_diff[mask])
     
     return hinge.mean()
 
@@ -118,7 +134,7 @@ class CombinedLoss(nn.Module):
         return (1.0 - ccc).mean()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor, logits: torch.Tensor = None,
-                std: torch.Tensor = None) -> torch.Tensor:
+                std: torch.Tensor = None, compound_ids: torch.Tensor = None) -> torch.Tensor:
         # 1. Ép kiểu float32 NGAY TỪ ĐẦU cho toàn bộ phép tính để ổn định AMP
         pred = pred.float()
         target = target.float()
@@ -132,9 +148,11 @@ class CombinedLoss(nn.Module):
             ccc_loss = self._compute_ccc(pred, target)
             loss = loss + self.ccc_weight * ccc_loss
 
-        # 4. Pairwise Ranking Loss
+        # 4. Pairwise Ranking Loss (chỉ giữ cặp cùng compound khi compound_ids được cấp)
         if self.lambda_rank > 0:
-            rank_loss = margin_rank_loss(pred, target, margin=self.rank_margin)
+            rank_loss = margin_rank_loss(
+                pred, target, margin=self.rank_margin, compound_ids=compound_ids
+            )
             loss = loss + self.lambda_rank * rank_loss
 
         # 5. Ordinal: Gaussian soft-target CE on the bin logits

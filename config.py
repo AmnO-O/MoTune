@@ -61,6 +61,7 @@ class Config:
     ccc_weight: float = 0.7
     lambda_rank: float = 0.5     # 0 = off; >0 adds pairwise margin-ranking to the loss
     rank_margin: float = 0.5
+    group_s_per_compound: int = 4   # rows per compound per batch (grouped sampler, ranking pairs)
     ce_weight: float = 0.0     # 0 = off; >0 adds Gaussian soft-target CE on the ordinal bins
     bin_sigma: float = 0.5     # std (in bin units) of the Gaussian soft target
     use_label_std: bool = True # per-sample Gaussian width from ModStd/HeadStd when available; falls back to bin_sigma
@@ -155,6 +156,10 @@ class Config:
             errors.append(f'lambda_rank must be >= 0, got {self.lambda_rank}')
         if self.rank_margin <= 0:
             errors.append(f'rank_margin must be > 0, got {self.rank_margin}')
+        if self.group_s_per_compound < 2:
+            errors.append(
+                f'group_s_per_compound must be >= 2, got {self.group_s_per_compound}'
+            )
         if self.head_mode not in ('reg', 'softmax'):
             errors.append(f"head_mode must be 'reg' or 'softmax', got {self.head_mode!r}")
         if self.context_pool not in _CONTEXT_POOLS:

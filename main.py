@@ -68,6 +68,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help='override lambda_rank (>0 adds pairwise margin-ranking loss)',
     )
     parser.add_argument(
+        '--group-s', type=int, dest='group_s_per_compound', metavar='S',
+        help='override group_s_per_compound (rows per compound per batch)',
+    )
+    parser.add_argument(
         '--head-mode', choices=('reg', 'softmax'),
         help='override head_mode ("softmax" = ordinal bins -> E[Y])',
     )

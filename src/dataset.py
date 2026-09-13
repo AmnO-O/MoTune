@@ -64,6 +64,15 @@ class NNDataset(Dataset):
         if not is_test:
             _report_nonfinite(self.df, 'train split', ('ModStd', 'HeadStd'))
 
+        # Numeric compound id (per row, stable) for the within-compound
+        # pairwise ranking loss. Test/unlabeled frames without a Compound
+        # column fall back to all-zeros (no ranking loss is computed there).
+        if 'Compound' in self.df.columns:
+            self.compound_ids = pd.factorize(self.df['Compound'])[0]
+        else:
+            self.compound_ids = np.zeros(len(self.df), dtype=np.int64)
+        self.compound_ids = self.compound_ids.astype(np.int64)
+
     # ------------------------------------------------------------------ #
     def __len__(self):
         return len(self.df)
@@ -100,6 +109,7 @@ class NNDataset(Dataset):
             'mod_span_mask': self._span_mask(marked, 'mod', offsets),
             'head_span_mask': self._span_mask(marked, 'head', offsets),
             'mwe_span_mask': self._span_mask(marked, 'mwe', offsets),
+            'compound_id': torch.tensor(self.compound_ids[idx], dtype=torch.long),
         }
 
         if not self.is_test and 'ModAvg' in row and 'HeadAvg' in row:

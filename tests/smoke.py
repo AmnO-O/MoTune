@@ -109,6 +109,12 @@ def check_config() -> None:
         check(True, 'lambda_rank=-1 rejected')
 
     try:
+        Config.defaults().update(group_s_per_compound=1).validate()
+        check(False, 'group_s_per_compound=1 rejected')
+    except ValueError:
+        check(True, 'group_s_per_compound=1 rejected')
+
+    try:
         Config.defaults().update(head_mode='bogus').validate()
         check(False, 'head_mode=bogus rejected')
     except ValueError:
@@ -152,7 +158,7 @@ def check_config() -> None:
         '--accum-steps', '2', '--patience', '4', '--ccc-weight', '0.5',
         '--lambda-rank', '0.3', '--unfreeze-from', '21', '--predict-mode', 'single',
         '--head-mode', 'softmax', '--num-bins', '6', '--ce-weight', '0.3',
-        '--bin-sigma', '0.5', '--context-pool', 'cls',
+        '--bin-sigma', '0.5', '--context-pool', 'cls', '--group-s', '5',
         '--data-path', 'x', '--output-dir', 'y', '--seed', '7',
     ])
     merged = cli._merge_overrides(Config.defaults(), args)
@@ -180,11 +186,43 @@ def check_config() -> None:
     check(merged_off.use_label_std is False, '--no-label-std maps to use_label_std=False')
 
 
+def check_sampler() -> None:
+    print('=== 5. GROUP SAMPLER (rank-pair density) ===')
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        print('  [SKIP] torch not installed locally')
+        return
+    sys.path.insert(0, str(ROOT))
+    from src.sampler import CompoundGroupSampler
+
+    import numpy as np
+    df = pd.read_csv(ROOT / 'dataset/en-nn-train.tsv', sep='\t')
+    ids = pd.factorize(df['Compound'])[0]
+    sampler = CompoundGroupSampler(ids, batch_size=32, s_per_compound=4, seed=42)
+    idx = list(iter(sampler))
+
+    check(len(idx) == len(df), f'sampler covers every row ({len(idx)}/{len(df)})')
+
+    blocks = [idx[i:i + 32] for i in range(0, len(idx), 32)]
+    mults = [len(set(ids[b])) for b in blocks]
+    pair_counts = []
+    for b in blocks:
+        _, counts = np.unique(ids[b], return_counts=True)
+        pairs = sum(c * (c - 1) // 2 for c in counts if c > 1)
+        pair_counts.append(pairs)
+    avg_pairs = float(np.mean(pair_counts))
+    print(f'  avg same-compound pairs/batch = {avg_pairs:.0f} (was ~1 random, K*C(s,2)=48 target)')
+    check(avg_pairs >= 20, f'same-compound pairs dense enough ({avg_pairs:.0f} >= 20)')
+    check(max(mults) <= 8, f'sampler stays compound-locality aware (min unique/block {min(mults)})')
+
+
 def main() -> int:
     sync_parse()
     check_matching()
     check_folds()
     check_config()
+    check_sampler()
 
     print('=' * 50)
     if FAILURES:

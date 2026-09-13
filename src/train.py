@@ -77,11 +77,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         with autocast(device_type):
             if getattr(criterion, 'requires_logits', False):
                 mod_pred, head_pred, mod_logits, head_logits = model(batch, with_logits=True)
-                loss = criterion(mod_pred, batch['mod_avg'], mod_logits, batch.get('mod_std')) \
-                    + criterion(head_pred, batch['head_avg'], head_logits, batch.get('head_std'))
+                loss = criterion(
+                    mod_pred, batch['mod_avg'], mod_logits, batch.get('mod_std'),
+                    compound_ids=batch.get('compound_id'),
+                ) + criterion(
+                    head_pred, batch['head_avg'], head_logits, batch.get('head_std'),
+                    compound_ids=batch.get('compound_id'),
+                )
             else:
                 mod_pred, head_pred = model(batch)
-                loss = criterion(mod_pred, batch['mod_avg']) + criterion(head_pred, batch['head_avg'])
+                loss = criterion(
+                    mod_pred, batch['mod_avg'], compound_ids=batch.get('compound_id'),
+                ) + criterion(
+                    head_pred, batch['head_avg'], compound_ids=batch.get('compound_id'),
+                )
             loss = loss / accum_steps
 
         scaler.scale(loss).backward()
