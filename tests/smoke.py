@@ -109,12 +109,6 @@ def check_config() -> None:
         check(True, 'lambda_rank=-1 rejected')
 
     try:
-        Config.defaults().update(group_s_per_compound=1).validate()
-        check(False, 'group_s_per_compound=1 rejected')
-    except ValueError:
-        check(True, 'group_s_per_compound=1 rejected')
-
-    try:
         Config.defaults().update(head_mode='bogus').validate()
         check(False, 'head_mode=bogus rejected')
     except ValueError:
@@ -158,7 +152,7 @@ def check_config() -> None:
         '--accum-steps', '2', '--patience', '4', '--ccc-weight', '0.5',
         '--lambda-rank', '0.3', '--unfreeze-from', '21', '--predict-mode', 'single',
         '--head-mode', 'softmax', '--num-bins', '6', '--ce-weight', '0.3',
-        '--bin-sigma', '0.5', '--context-pool', 'cls', '--group-s', '5',
+        '--bin-sigma', '0.5', '--context-pool', 'cls',
         '--data-path', 'x', '--output-dir', 'y', '--seed', '7',
     ])
     merged = cli._merge_overrides(Config.defaults(), args)
@@ -199,7 +193,8 @@ def check_sampler() -> None:
     import numpy as np
     df = pd.read_csv(ROOT / 'dataset/en-nn-train.tsv', sep='\t')
     ids = pd.factorize(df['Compound'])[0]
-    sampler = CompoundGroupSampler(ids, batch_size=32, s_per_compound=4, seed=42)
+    from src.sampler import CompoundGroupSampler as CGS
+    sampler = CGS(ids, batch_size=32, seed=42)
     idx = list(iter(sampler))
 
     check(
@@ -218,6 +213,22 @@ def check_sampler() -> None:
     avg_pairs = float(np.mean(pair_counts))
     print(f'  avg same-compound pairs/batch = {avg_pairs:.0f} (was ~1 random)')
     check(avg_pairs >= 30, f'same-compound pairs dense enough ({avg_pairs:.0f} >= 30)')
+
+    # set_epoch must be reproducible AND differ across epochs.
+    sampler.set_epoch(0)
+    ep0a = list(iter(sampler))
+    sampler.set_epoch(0)
+    ep0b = list(iter(sampler))
+    sampler.set_epoch(1)
+    ep1 = list(iter(sampler))
+    check(
+        ep0a == ep0b,
+        'set_epoch(0) reproducible within the same dataset',
+    )
+    check(
+        ep0a != ep1,
+        'set_epoch(1) shuffles differently from epoch 0',
+    )
 
 
 def main() -> int:

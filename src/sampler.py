@@ -3,8 +3,11 @@ intra-compound sentence pairs for the pairwise ranking loss.
 
 Random batches almost never contain two rows of the same compound (~1.1
 same-compound pairs per batch), which starves ``margin_rank_loss`` of signal.
-Grouping consecutive rows of the same compound yields dense pairs while
+Emitting all rows of each compound consecutively yields dense pairs while
 guaranteeing every row is seen exactly once per epoch.
+
+Uses the ``set_epoch`` pattern (like ``DistributedSampler``) so each epoch
+gets a reproducible but different shuffle without hidden auto-increment.
 """
 
 from __future__ import annotations
@@ -27,32 +30,37 @@ except ImportError:  # pragma: no cover - torch not installed locally
 
 
 class CompoundGroupSampler(Sampler):
-    """Yields dataset indices grouped into ``batch_size`` blocks by compound.
+    """Yields dataset indices grouped by compound for dense intra-compound pairs.
 
-    All rows of each compound are emitted together so every batch contains
-    rows from only 3–5 compounds, producing many intra-compound pairs for the
-    ranking loss. Every row is seen exactly once per epoch (no padding, no
-    dropped rows).
+    All rows of each compound are emitted together so every batch (as formed by
+    DataLoader) holds only 3–5 compounds, producing many intra-compound pairs
+    for the ranking loss.  Every row is seen exactly once per epoch.
+
+    Call ``sampler.set_epoch(epoch)`` before each epoch so that shuffling is
+    both reproducible and different across epochs.
     """
 
     def __init__(self, compound_ids: Sequence[int], batch_size: int,
-                 s_per_compound: int = 4, seed: int = 42):
+                 seed: int = 42):
         super().__init__()
         self.compound_ids = list(compound_ids)
         self.batch_size = max(1, int(batch_size))
         self.seed = int(seed)
+        self.epoch = 0
 
         self.groups: dict = {}
         for i, c in enumerate(self.compound_ids):
             self.groups.setdefault(c, []).append(i)
-        self._call = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the current epoch index for reproducible per-epoch shuffling."""
+        self.epoch = int(epoch)
 
     def __len__(self) -> int:
         return len(self.compound_ids)
 
     def __iter__(self):
-        self._call += 1
-        rng = random.Random(self.seed + self._call * 7919)
+        rng = random.Random(self.seed + self.epoch * 7919)
 
         # Shuffle compound order, then emit all rows of each compound together.
         # DataLoader batches these consecutively, so every batch holds only 3-5

@@ -73,19 +73,20 @@ class Trainer:
             val_df, tokenizer, self.cfg.max_length, self.cfg.max_context_length
         )
         if self.cfg.lambda_rank > 0:
-            # Group rows by compound so every batch holds K*C(s_per,2)
-            # intra-compound pairs for the ranking loss (~48 pairs for 8x4).
+            # Group rows by compound so every batch holds 3-5 compounds and
+            # dense intra-compound pairs for the ranking loss.
+            self._train_sampler = CompoundGroupSampler(
+                train_ds.compound_ids,
+                batch_size=self.cfg.batch_size,
+                seed=self.cfg.seed,
+            )
             train_loader = DataLoader(
                 train_ds, batch_size=self.cfg.batch_size, shuffle=False,
-                sampler=CompoundGroupSampler(
-                    train_ds.compound_ids,
-                    batch_size=self.cfg.batch_size,
-                    s_per_compound=self.cfg.group_s_per_compound,
-                    seed=self.cfg.seed,
-                ),
+                sampler=self._train_sampler,
                 num_workers=self.cfg.num_workers, pin_memory=True,
             )
         else:
+            self._train_sampler = None
             train_loader = DataLoader(
                 train_ds, batch_size=self.cfg.batch_size, shuffle=True,
                 num_workers=self.cfg.num_workers, pin_memory=True,
@@ -198,6 +199,8 @@ class Trainer:
         history: List[Dict] = []
 
         for epoch in range(self.cfg.num_epochs):
+            if self._train_sampler is not None:
+                self._train_sampler.set_epoch(epoch)   # reproducible per-epoch shuffle
             if epoch == self.cfg.freeze_epochs:
                 if self.device.type == 'cuda':
                     torch.cuda.empty_cache()   # release Phase-1 graph buffers before rebuild
