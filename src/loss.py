@@ -80,7 +80,8 @@ class CombinedLoss(nn.Module):
     def _ce(self, logits: torch.Tensor, target: torch.Tensor,
             std: torch.Tensor = None) -> torch.Tensor:
         # 1. Ép kiểu float32 để đảm bảo độ chính xác số học (nhất là dưới AMP)
-        log_p = torch.log_softmax(logits.float(), dim=-1)
+        # Clamp chống inf từ fp16 head: log_softmax([.., inf, ..]) = NaN.
+        log_p = torch.log_softmax(torch.clamp(logits.float(), -50.0, 50.0), dim=-1)
         soft = self._soft_target(target.float(), std)
         
         # 2. -(soft * log_p).sum(dim=-1) tính CE theo từng sample

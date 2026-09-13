@@ -104,8 +104,12 @@ class ModernBERTRegressor(nn.Module):
         head_out = self.head_regressor(head_features)
 
         if self.head_mode == 'softmax':
-            mod_probs = mod_out.softmax(dim=-1)
-            head_probs = head_out.softmax(dim=-1)
+            # Chống inf fp16: logits tràn → softmax nan → E[Y] nan → toàn bộ
+            # loss nan. Clamp rồi mới softmax (tính ở fp32 cho ổn định).
+            mod_out = torch.clamp(mod_out, -50.0, 50.0)
+            head_out = torch.clamp(head_out, -50.0, 50.0)
+            mod_probs = mod_out.float().softmax(dim=-1)
+            head_probs = head_out.float().softmax(dim=-1)
             mod_pred = (mod_probs * self.bin_centers).sum(-1)
             head_pred = (head_probs * self.bin_centers).sum(-1)
             if with_logits:

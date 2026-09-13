@@ -153,7 +153,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             last_scale = float(scaler.get_scale())
             last_lr = float(scheduler.get_last_lr()[0])
 
-        total_loss += loss.item() * accum_steps
+        v = loss.item() * accum_steps
+        total_loss += v if math.isfinite(v) else 0.0
 
     if report is not None:
         report.update({
