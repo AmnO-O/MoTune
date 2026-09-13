@@ -57,8 +57,8 @@ class Config:
     ce_weight: float = 0.0     # 0 = off; >0 adds Gaussian soft-target CE on the ordinal bins
     bin_sigma: float = 0.5     # std (in bin units) of the Gaussian soft target
     use_label_std: bool = True # per-sample Gaussian width from ModStd/HeadStd when available; falls back to bin_sigma
-    amp_init_scale: float = 128.0    # GradScaler starting scale (loss ~ O(4); 65536 init overflows fp16 early)
-    amp_growth_interval: int = 3     # clean steps before scale recovers (default 2000 > whole run, freezes scale low)
+    amp_init_scale: float = 1024.0   # GradScaler starting scale (safe operating point for FP16 embeddings)
+    amp_growth_interval: int = 128   # clean steps before attempting scale growth (prevents rapid overflow oscillation)
     patience: int = 5
     num_workers: int = 2
 

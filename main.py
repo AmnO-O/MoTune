@@ -88,6 +88,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help='ignore ModStd/HeadStd and use fixed bin_sigma for soft targets',
     )
     parser.add_argument(
+        '--amp-init-scale', type=float, dest='amp_init_scale',
+        help='override amp_init_scale (GradScaler starting scale)',
+    )
+    parser.add_argument(
+        '--amp-growth-interval', type=int, dest='amp_growth_interval',
+        help='override amp_growth_interval (clean steps before scale growth)',
+    )
+    parser.add_argument(
         '--unfreeze-from', type=int, dest='unfreeze_from_layer',
         help='override unfreeze_from_layer',
     )
