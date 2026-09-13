@@ -116,6 +116,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help='override augment_prob (0..1; probability of context word-drop that keeps spans)',
     )
     parser.add_argument(
+        '--aux-data-path', type=str, dest='aux_data_path',
+        help='label-free aux rows (ContextID/Compound/Mod/Head/Context) appended to the train loader '
+             '(tokenized; ignored by supervised terms, used by compound-consistency)',
+    )
+    parser.add_argument(
         '--ce-weight', type=float,
         help='override ce_weight (>0 adds Gaussian soft-target CE on the bins)',
     )

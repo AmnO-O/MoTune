@@ -41,6 +41,21 @@ def track_optimizer_steps(optimizer) -> None:
         del optimizer._cmp_step_counter
 
 
+def _supervised_term(criterion, pred, target, logits, std, cid, lab):
+    if lab is not None:
+        pred = pred[lab]
+        target = target[lab]
+        if logits is not None:
+            logits = logits[lab]
+        if std is not None:
+            std = std[lab]
+        if cid is not None:
+            cid = cid[lab]
+        if pred.numel() == 0:
+            return torch.zeros((), device=pred.device, dtype=torch.float)
+    return criterion(pred, target, logits, std, compound_ids=cid)
+
+
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
                 grad_clip=1.0, accum_steps=1, report=None,
                 consist_weight=0.0, consist_mode='pull', consist_temp=0.1):
@@ -92,16 +107,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             else:
                 mod_pred, head_pred = model(batch)
 
-            loss = criterion(
-                mod_pred, batch['mod_avg'],
+            loss = _supervised_term(
+                criterion, mod_pred, batch['mod_avg'],
                 mod_logits if requires_logits else None,
-                batch.get('mod_std'),
-                compound_ids=batch.get('compound_id'),
-            ) + criterion(
-                head_pred, batch['head_avg'],
+                batch.get('mod_std'), batch.get('compound_id'),
+                batch.get('has_label'),
+            ) + _supervised_term(
+                criterion, head_pred, batch['head_avg'],
                 head_logits if requires_logits else None,
-                batch.get('head_std'),
-                compound_ids=batch.get('compound_id'),
+                batch.get('head_std'), batch.get('compound_id'),
+                batch.get('has_label'),
             )
 
             # Compound-consistency self-supervised term (data enrichment).
@@ -215,7 +230,9 @@ def evaluate(model, dataloader, device):
     model.eval()
     all_mod_preds, all_head_preds = [], []
     all_mod_labels, all_head_labels = [], []
+    masks = []
     has_labels = False
+    has_mask = False
     device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
 
     with torch.no_grad():
@@ -227,6 +244,13 @@ def evaluate(model, dataloader, device):
 
             all_mod_preds.append(mod_pred.detach().cpu().numpy().reshape(-1))
             all_head_preds.append(head_pred.detach().cpu().numpy().reshape(-1))
+
+            # Aux rows (NCTTI consistency set) carry NaN labels; has_label masks
+            # them out so metrics see only truly-labeled rows.
+            lab = batch.get('has_label')
+            if lab is not None:
+                has_mask = True
+                masks.append(lab.cpu().numpy().reshape(-1))
 
             # Safe for both validation (labeled) and test (unlabeled) sets
             if 'mod_avg' in batch and 'head_avg' in batch:
@@ -240,6 +264,10 @@ def evaluate(model, dataloader, device):
     if has_labels:
         mod_labels = np.concatenate(all_mod_labels)
         head_labels = np.concatenate(all_head_labels)
+        if has_mask:
+            mask = np.concatenate(masks)
+            if not mask.all():
+                return mod_preds[mask], head_preds[mask], mod_labels[mask], head_labels[mask]
         return mod_preds, head_preds, mod_labels, head_labels
 
     return mod_preds, head_preds

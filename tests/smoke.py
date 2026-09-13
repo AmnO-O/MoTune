@@ -75,6 +75,29 @@ def check_matching() -> None:
     check(mwe_leak == 0, f'4-token scheme: no <mwe> markers leaked ({mwe_leak})')
 
 
+def check_aux() -> None:
+    print('=== 2b. NCTTI AUX CONSISTENCY FILE ===')
+    aux = ROOT / 'dataset' / 'nctti_en.tsv'
+    if not aux.is_file():
+        check(False, 'dataset/nctti_en.tsv present')
+        return
+    df = pd.read_csv(aux, sep='\t')
+    need = {'ContextID', 'Compound', 'Mod', 'Head', 'Context'}
+    check(need <= set(df.columns), f'aux columns {sorted(need)} <= {sorted(df.columns)}')
+    check(not df['ContextID'].duplicated().any(), 'aux ContextID unique')
+    check(df['Compound'].nunique() >= 200, f'aux compounds ({df["Compound"].nunique()}) >= 200')
+
+    sys.path.insert(0, str(ROOT))
+    from src.matching import mark_compound
+    miss = 0
+    for _, r in df.iterrows():
+        if mark_compound(str(r['Context']), str(r['Mod']), str(r['Head'])) is None:
+            miss += 1
+    covered = len(df) - miss
+    check(covered / len(df) >= 0.99,
+          f'aux rows markable in-context ({covered}/{len(df)})')
+
+
 def check_folds() -> None:
     print('=== 3. FOLD STRATIFICATION (compound leak check) ===')
     sys.path.insert(0, str(ROOT))
@@ -221,6 +244,7 @@ def check_config() -> None:
         '--phase1-schedule', 'linear', '--rank-margin-mode', 'clamp',
         '--ccc-var-floor', '0.2', '--std-alpha', '0.5', '--lambda-consist', '0.1',
         '--consist-mode', 'infonce', '--augment-prob', '0.2',
+        '--aux-data-path', 'dataset/nctti_en.tsv',
         '--data-path', 'x', '--output-dir', 'y', '--seed', '7',
     ])
     merged = cli._merge_overrides(Config.defaults(), args)
@@ -240,8 +264,10 @@ def check_config() -> None:
     check(
         (merged.head_features, merged.head_hidden, merged.phase1_schedule,
          merged.rank_margin_mode, merged.ccc_var_floor, merged.loss_std_alpha,
-         merged.lambda_consist, merged.consist_mode, merged.augment_prob)
-        == ('legacy', 64, 'linear', 'clamp', 0.2, 0.5, 0.1, 'infonce', 0.2),
+         merged.lambda_consist, merged.consist_mode, merged.augment_prob,
+         merged.aux_data_path)
+        == ('legacy', 64, 'linear', 'clamp', 0.2, 0.5, 0.1, 'infonce', 0.2,
+            'dataset/nctti_en.tsv'),
         'new experiment CLI flags map onto Config fields',
     )
     check(
@@ -309,6 +335,7 @@ def check_sampler() -> None:
 def main() -> int:
     sync_parse()
     check_matching()
+    check_aux()
     check_folds()
     check_config()
     check_sampler()

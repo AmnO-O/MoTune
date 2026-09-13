@@ -96,6 +96,11 @@ class Config:
     # random word-drop / tail-crop of non-marker context words as a fraction
     # of training draws. Tokenize cache is disabled while augment_prob > 0.
     augment_prob: float = 0.0
+    # Label-free auxiliary rows (ContextID/Compound/Mod/Head/Context, no
+    # ModAvg/HeadAvg), e.g. the NCTTI consistency set. Appended to the train
+    # loader: supervised terms ignore them (has_label=False), the compound-
+    # consistency term uses them for more cross-context pull. '' = off.
+    aux_data_path: str = ''
     ce_weight: float = 0.0     # 0 = off; >0 adds Gaussian soft-target CE on the ordinal bins
     bin_sigma: float = 0.5     # std (in bin units) of the Gaussian soft target
     use_label_std: bool = True # per-sample Gaussian width from ModStd/HeadStd when available; falls back to bin_sigma

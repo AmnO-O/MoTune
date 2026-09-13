@@ -9,8 +9,14 @@ venv/
 .ipynb_checkpoints/
 
 # Data (mounted separately on Kaggle via the Compartment dataset input)
-dataset/
+dataset/*
+!dataset/nctti_en.tsv   # built NCTTI aux-consistency rows (committed on purpose)
 trial/
+
+# Upstream NCTTI repo clone (ukWaC-derived sentences; do not redistribute).
+# Only the BUILT aux file dataset/nctti_en.tsv is committed; regenerate with
+# tools/build_nctti_aux.py.
+nctti/
 
 # Run artifacts
 output/

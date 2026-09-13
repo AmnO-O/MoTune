@@ -66,6 +66,29 @@ class Trainer:
     # setup
     # ------------------------------------------------------------------ #
     def _build_loaders(self, train_df: pd.DataFrame, val_df: pd.DataFrame, tokenizer):
+        # Optional label-free auxiliary rows (e.g. dataset/nctti_en.tsv) are
+        # appended to the TRAIN side only: they feed the supervised terms
+        # nothing (NaN labels -> has_label=False) but give the compound-
+        # consistency term more cross-context pairs per compound.
+        if self.cfg.aux_data_path:
+            aux_path = Path(self.cfg.aux_data_path)
+            if not aux_path.is_file():
+                raise FileNotFoundError(
+                    f'aux_data_path not found: {self.cfg.aux_data_path}'
+                )
+            aux_df = pd.read_csv(aux_path, sep='\t', keep_default_na=False)
+            need = {'ContextID', 'Compound', 'Mod', 'Head', 'Context'}
+            missing = need - set(aux_df.columns)
+            if missing:
+                raise ValueError(
+                    f'aux datafile {aux_path} missing columns: {sorted(missing)}'
+                )
+            self.logger.info(
+                'Auxing %d label-free rows (%d compounds) from %s',
+                len(aux_df), aux_df['Compound'].nunique(), aux_path,
+            )
+            train_df = pd.concat([train_df, aux_df[list(need)]], ignore_index=True)
+
         train_ds = NNDataset(
             train_df, tokenizer,
             max_context_length=self.cfg.max_context_length,

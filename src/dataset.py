@@ -166,6 +166,14 @@ class NNDataset(Dataset):
         # guarantee adjacency), so no separate <mwe> fallback is needed.
         mwe_span_mask = mod_span_mask | head_span_mask
 
+        # Auxiliary (label-free) rows -- e.g. the NCTTI consistency set -- are
+        # rows WITHOUT ModAvg/HeadAvg. They still get fracIds: trains the
+        # supervised terms only on labeled rows and the compound-consistency
+        # term on everything (see train_epoch).
+        mod_ok = not self.is_test and 'ModAvg' in row and pd.notna(row['ModAvg'])
+        head_ok = not self.is_test and 'HeadAvg' in row and pd.notna(row['HeadAvg'])
+        has_label = bool(mod_ok and head_ok)
+
         item = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
@@ -173,14 +181,15 @@ class NNDataset(Dataset):
             'head_span_mask': head_span_mask,
             'mwe_span_mask': mwe_span_mask,
             'compound_id': torch.tensor(self.compound_ids[idx], dtype=torch.long),
+            'has_label': torch.tensor(has_label, dtype=torch.bool),
         }
 
-        if not self.is_test and 'ModAvg' in row and 'HeadAvg' in row:
+        if has_label:
             item['mod_avg'] = torch.tensor(float(row['ModAvg']), dtype=torch.float)
             item['head_avg'] = torch.tensor(float(row['HeadAvg']), dtype=torch.float)
-            if 'ModStd' in row:
+            if 'ModStd' in row and pd.notna(row['ModStd']):
                 item['mod_std'] = torch.tensor(float(row['ModStd']), dtype=torch.float)
-            if 'HeadStd' in row:
+            if 'HeadStd' in row and pd.notna(row['HeadStd']):
                 item['head_std'] = torch.tensor(float(row['HeadStd']), dtype=torch.float)
 
         if self._cache_enabled:
