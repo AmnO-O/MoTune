@@ -70,11 +70,7 @@ class ModernBERTRegressor(nn.Module):
             nn.GELU(),
             nn.LayerNorm(256),
             nn.Dropout(dropout),
-            nn.Linear(256, 64),
-            nn.GELU(),
-            nn.LayerNorm(64),
-            nn.Dropout(dropout),
-            nn.Linear(64, self.out_features),
+            nn.Linear(256, self.out_features),
         )
 
     def forward(self, batch, with_logits: bool = False):
