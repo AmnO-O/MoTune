@@ -66,12 +66,12 @@ class ModernBERTRegressor(nn.Module):
 
     def _build_head(self, dropout: float) -> nn.Sequential:
         return nn.Sequential(
-            nn.Linear(self.head_in, 256),
-            nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Dropout(dropout),
-            nn.Linear(256, self.out_features),
-        )
+                nn.Linear(self.head_in, 128),  # Thu gọn xuống 128 thay vì 256
+                nn.GELU(),
+                nn.LayerNorm(128),
+                nn.Dropout(0.1),               # Giữ dropout thấp để gradient mượt
+                nn.Linear(128, self.out_features)
+            )
 
     def forward(self, batch, with_logits: bool = False):
         outputs = self.bert(
