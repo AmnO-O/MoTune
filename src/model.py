@@ -51,10 +51,10 @@ class ModernBERTRegressor(nn.Module):
             for param in self.bert.parameters():
                 param.requires_grad = False
 
-        # 4 cosine features + role-span emb + MWE emb + context representation.
+        # 4 cosine features + role-span emb + MWE emb + diff + prod + context representation.
         context_dim = hidden_size if context_pool in ('mean', 'cls') else 2 * hidden_size
         self.context_dim = context_dim
-        self.head_in = hidden_size * 2 + context_dim + 4
+        self.head_in = hidden_size * 4 + context_dim + 4
 
         if head_mode == 'softmax':
             self.register_buffer(
@@ -70,6 +70,7 @@ class ModernBERTRegressor(nn.Module):
 
     def _build_head(self, dropout: float) -> nn.Sequential:
         return nn.Sequential(
+            nn.LayerNorm(self.head_in),
             nn.Linear(self.head_in, 256),
             nn.GELU(),
             nn.LayerNorm(256),
@@ -113,8 +114,20 @@ class ModernBERTRegressor(nn.Module):
             [cos_sim_mod, cos_sim_head, cos_sim_mod_head, cos_sim_mwe_cont], dim=1
         )
 
-        mod_features = torch.cat([cos_feats, mod_emb, mwe_emb, context_emb], dim=1)
-        head_features = torch.cat([cos_feats, head_emb, mwe_emb, context_emb], dim=1)
+        # Relational interaction features (Sentence-BERT / NLI formulation)
+        # Absolute difference cancels base word identity to expose semantic shift;
+        # element-wise product captures dimensional alignment.
+        diff_mod = torch.abs(mwe_emb - mod_emb)
+        prod_mod = mwe_emb * mod_emb
+        diff_head = torch.abs(mwe_emb - head_emb)
+        prod_head = mwe_emb * head_emb
+
+        mod_features = torch.cat(
+            [cos_feats, mod_emb, mwe_emb, diff_mod, prod_mod, context_emb], dim=1
+        )
+        head_features = torch.cat(
+            [cos_feats, head_emb, mwe_emb, diff_head, prod_head, context_emb], dim=1
+        )
 
         mod_out = self.mod_regressor(mod_features)
         head_out = self.head_regressor(head_features)

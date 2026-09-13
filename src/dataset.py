@@ -103,12 +103,19 @@ class NNDataset(Dataset):
         attention_mask = encoded['attention_mask'].squeeze(0)
         offsets = encoded['offset_mapping'].squeeze(0).tolist()
 
+        mod_span_mask = self._span_mask(marked, 'mod', offsets)
+        head_span_mask = self._span_mask(marked, 'head', offsets)
+        # Clean compound span: pool only over constituent words, excluding marker tags
+        mwe_span_mask = mod_span_mask | head_span_mask
+        if not mwe_span_mask.any():
+            mwe_span_mask = self._span_mask(marked, 'mwe', offsets)
+
         item = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'mod_span_mask': self._span_mask(marked, 'mod', offsets),
-            'head_span_mask': self._span_mask(marked, 'head', offsets),
-            'mwe_span_mask': self._span_mask(marked, 'mwe', offsets),
+            'mod_span_mask': mod_span_mask,
+            'head_span_mask': head_span_mask,
+            'mwe_span_mask': mwe_span_mask,
             'compound_id': torch.tensor(self.compound_ids[idx], dtype=torch.long),
         }
 
