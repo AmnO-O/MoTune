@@ -67,12 +67,12 @@ class ModernBERTRegressor(nn.Module):
     def _build_head(self, dropout: float) -> nn.Sequential:
         return nn.Sequential(
             nn.Linear(self.head_in, 256),
-            nn.LayerNorm(256),
             nn.GELU(),
+            nn.LayerNorm(256),
             nn.Dropout(dropout),
             nn.Linear(256, 64),
-            nn.LayerNorm(64),
             nn.GELU(),
+            nn.LayerNorm(64),
             nn.Dropout(dropout),
             nn.Linear(64, self.out_features),
         )
