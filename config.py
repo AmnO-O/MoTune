@@ -57,6 +57,8 @@ class Config:
     ce_weight: float = 0.0     # 0 = off; >0 adds Gaussian soft-target CE on the ordinal bins
     bin_sigma: float = 0.5     # std (in bin units) of the Gaussian soft target
     use_label_std: bool = True # per-sample Gaussian width from ModStd/HeadStd when available; falls back to bin_sigma
+    amp_init_scale: float = 128.0    # GradScaler starting scale (loss ~ O(4); 65536 init overflows fp16 early)
+    amp_growth_interval: int = 3     # clean steps before scale recovers (default 2000 > whole run, freezes scale low)
     patience: int = 5
     num_workers: int = 2
 
@@ -154,6 +156,10 @@ class Config:
             errors.append(f'ce_weight must be >= 0, got {self.ce_weight}')
         if self.bin_sigma <= 0:
             errors.append(f'bin_sigma must be > 0, got {self.bin_sigma}')
+        if self.amp_init_scale <= 0:
+            errors.append(f'amp_init_scale must be > 0, got {self.amp_init_scale}')
+        if self.amp_growth_interval < 1:
+            errors.append(f'amp_growth_interval must be >= 1, got {self.amp_growth_interval}')
         if not 0 < self.test_size < 1:
             errors.append(f'test_size must be in (0, 1), got {self.test_size}')
         if self.n_splits < 2:
