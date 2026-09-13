@@ -46,20 +46,20 @@ class Config:
     embedding_lr: float = 1e-5     # only the (new, random) marker embeddings
     weight_decay: float = 0.05
     grad_clip: float = 1.0
-    num_epochs: int = 10
-    freeze_epochs: int = 5
-    unfreeze_from_layer: int = 19
+    num_epochs: int = 12
+    freeze_epochs: int = 4
+    unfreeze_from_layer: int = 18
     warmup_ratio: float = 0.15
     loss_type: str = 'mse_ccc'
     ccc_weight: float = 0.7
-    lambda_rank: float = 0.0     # 0 = off; >0 adds pairwise margin-ranking to the loss
+    lambda_rank: float = 0.5     # 0 = off; >0 adds pairwise margin-ranking to the loss
     rank_margin: float = 0.5
     ce_weight: float = 0.0     # 0 = off; >0 adds Gaussian soft-target CE on the ordinal bins
     bin_sigma: float = 0.5     # std (in bin units) of the Gaussian soft target
     use_label_std: bool = True # per-sample Gaussian width from ModStd/HeadStd when available; falls back to bin_sigma
     amp_init_scale: float = 1024.0   # GradScaler starting scale (safe operating point for FP16 embeddings)
-    amp_growth_interval: int = 128   # clean steps before attempting scale growth (prevents rapid overflow oscillation)
-    patience: int = 5
+    amp_growth_interval: int = 256   # clean steps before attempting scale growth (prevents rapid overflow oscillation)
+    patience: int = 4
     num_workers: int = 2
 
     # === split ===

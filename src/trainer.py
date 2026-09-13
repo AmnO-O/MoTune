@@ -98,10 +98,9 @@ class Trainer:
         head_params = list(model.mod_regressor.parameters()) + list(model.head_regressor.parameters())
         optimizer = AdamW(
             [
-                {'params': [emb_table], 'lr': self.cfg.embedding_lr},
-                {'params': head_params, 'lr': self.cfg.head_lr},
+                {'params': [emb_table], 'lr': self.cfg.embedding_lr, 'weight_decay': 0.0},
+                {'params': head_params, 'lr': self.cfg.head_lr, 'weight_decay': self.cfg.weight_decay},
             ],
-            weight_decay=self.cfg.weight_decay,
         )
         track_optimizer_steps(optimizer)
         scheduler = get_linear_schedule_with_warmup(
@@ -126,11 +125,10 @@ class Trainer:
         head_params = list(model.mod_regressor.parameters()) + list(model.head_regressor.parameters())
         optimizer = AdamW(
             [
-                {'params': [emb_table], 'lr': self.cfg.embedding_lr},
-                {'params': encoder_params, 'lr': self.cfg.encoder_lr},
-                {'params': head_params, 'lr': self.cfg.head_lr},
+                {'params': [emb_table], 'lr': self.cfg.embedding_lr, 'weight_decay': 0.0},
+                {'params': encoder_params, 'lr': self.cfg.encoder_lr, 'weight_decay': self.cfg.weight_decay},
+                {'params': head_params, 'lr': self.cfg.head_lr, 'weight_decay': self.cfg.weight_decay},
             ],
-            weight_decay=self.cfg.weight_decay,
         )
         track_optimizer_steps(optimizer)
         scheduler = get_linear_schedule_with_warmup(
@@ -148,6 +146,14 @@ class Trainer:
         train_loader, val_loader = self._build_loaders(train_df, val_df, tokenizer)
 
         model = build_model(self.cfg, tokenizer, self.device)
+        from src.constants import MARKER_TOKENS
+        marker_ids = tokenizer.convert_tokens_to_ids(MARKER_TOKENS)
+        emb_weight = embedding_table(model).weight
+        def _marker_grad_hook(grad):
+            mask = torch.zeros(grad.shape[0], 1, dtype=grad.dtype, device=grad.device)
+            mask[marker_ids] = 1.0
+            return grad * mask
+        emb_weight.register_hook(_marker_grad_hook)
         scaler = GradScaler(
             'cuda',
             enabled=(self.device.type == 'cuda'),
