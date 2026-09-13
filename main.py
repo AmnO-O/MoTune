@@ -84,6 +84,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help='override bin_sigma (Gaussian soft-target width in bin units)',
     )
     parser.add_argument(
+        '--no-label-std', action='store_true',
+        help='ignore ModStd/HeadStd and use fixed bin_sigma for soft targets',
+    )
+    parser.add_argument(
         '--unfreeze-from', type=int, dest='unfreeze_from_layer',
         help='override unfreeze_from_layer',
     )
@@ -108,8 +112,11 @@ def _merge_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     overrides = {
         key: value
         for key, value in vars(args).items()
-        if value is not None and key not in ('mode', 'config', 'debug')
+        if value is not None and key not in ('mode', 'config', 'debug', 'no_label_std')
     }
+    # --no-label-std is a store_true flag; map it onto the Config field.
+    if args.no_label_std:
+        overrides['use_label_std'] = False
     # Thiết lập mode từ CLIargs trước khi validate
     overrides['mode'] = args.mode
     return cfg.update(**overrides)

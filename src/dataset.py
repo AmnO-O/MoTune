@@ -64,6 +64,10 @@ class NNDataset(Dataset):
         if not self.is_test and 'ModAvg' in row and 'HeadAvg' in row:
             item['mod_avg'] = torch.tensor(float(row['ModAvg']), dtype=torch.float)
             item['head_avg'] = torch.tensor(float(row['HeadAvg']), dtype=torch.float)
+            if 'ModStd' in row:
+                item['mod_std'] = torch.tensor(float(row['ModStd']), dtype=torch.float)
+            if 'HeadStd' in row:
+                item['head_std'] = torch.tensor(float(row['HeadStd']), dtype=torch.float)
 
         return item
 

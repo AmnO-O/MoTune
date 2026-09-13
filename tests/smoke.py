@@ -162,6 +162,15 @@ def check_config() -> None:
         == ('softmax', 6, 0.3, 0.5),
         'ordinal CLI flags map onto Config fields',
     )
+    check(
+        (merged.use_label_std, Config.defaults().use_label_std)
+        == (True, True),
+        'use_label_std defaults on',
+    )
+
+    args_off = cli._build_parser().parse_args(['train5', '--no-label-std'])
+    merged_off = cli._merge_overrides(Config.defaults(), args_off)
+    check(merged_off.use_label_std is False, '--no-label-std maps to use_label_std=False')
 
 
 def main() -> int:

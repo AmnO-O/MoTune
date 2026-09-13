@@ -156,6 +156,7 @@ class Trainer:
             ce_weight=self.cfg.ce_weight,
             num_bins=self.cfg.num_bins,
             bin_sigma=self.cfg.bin_sigma,
+            use_label_std=self.cfg.use_label_std,
         ).to(self.device)
 
         # Number of optimizer updates per epoch (fewer than micro-batches when

@@ -56,6 +56,7 @@ class Config:
     rank_margin: float = 0.5
     ce_weight: float = 0.0     # 0 = off; >0 adds Gaussian soft-target CE on the ordinal bins
     bin_sigma: float = 0.5     # std (in bin units) of the Gaussian soft target
+    use_label_std: bool = True # per-sample Gaussian width from ModStd/HeadStd when available; falls back to bin_sigma
     patience: int = 5
     num_workers: int = 2
 
