@@ -1,7 +1,46 @@
+import logging
+
+import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
 from src.matching import fallback_marked_text, mark_compound, span_text_offsets
+
+logger = logging.getLogger('compartment')
+
+
+def _report_nonfinite(df: pd.DataFrame, tag: str, columns) -> None:
+    """Warn when a label column carries NaN/inf, listing the offending rows.
+
+    DataFrame columns that should never be non-finite (human-judgment
+    stats) occasionally leak in from hand-made TSVs; a NaN ModStd becomes an
+    all-NaN Gaussian soft target and silently NaN-poisons the CE loss.
+    """
+    present = [c for c in columns if c in df.columns]
+    if not present:
+        return
+    finite = pd.DataFrame(index=df.index)
+    for c in present:
+        finite[c] = df[c].apply(lambda v: _is_finite(v))
+    bad_rows = ~finite[present].all(axis=1)
+    n = int(bad_rows.sum())
+    if n == 0:
+        return
+    show = ['Context', 'Mod', 'Head', 'Compound'] + present
+    show = [c for c in show if c in df.columns]
+    logger.warning(
+        '%s: %d row(s) have non-finite %s; these fall back to fixed bin_sigma. Examples:\n%s',
+        tag, n, '/'.join(present),
+        df.loc[bad_rows, show].head(5).to_string(index=True),
+    )
+
+
+def _is_finite(v) -> bool:
+    try:
+        return bool(np.isfinite(float(v)))
+    except (TypeError, ValueError):
+        return False
 
 
 class NNDataset(Dataset):
@@ -22,6 +61,8 @@ class NNDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_context_length
         self.is_test = is_test
+        if not is_test:
+            _report_nonfinite(self.df, 'train split', ('ModStd', 'HeadStd'))
 
     # ------------------------------------------------------------------ #
     def __len__(self):
