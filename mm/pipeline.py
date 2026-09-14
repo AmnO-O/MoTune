@@ -77,7 +77,7 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
     from torch.utils.data import DataLoader
     from transformers import get_linear_schedule_with_warmup as _linearsched
 
-    from mm.data import MlmDataset, collate_mlm, load_mlm_rows
+    from mm.data import MlmDataset, _mlm_worker_init_fn, collate_mlm, load_mlm_rows
     from mm.model import _backbone, apply_lora, build_model, lora_parameters, merge_lora
 
     logger.info('=== warmup: compound-aware MLM (epochs=%d, mask_span=%s) ===',
@@ -91,7 +91,8 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
         seed=cfg.seed, vocab_size=getattr(tokenizer, 'vocab_size', None),
     )
     loader = DataLoader(mds, batch_size=cfg.warmup_batch_size, shuffle=True,
-                        num_workers=cfg.num_workers, collate_fn=collate_mlm)
+                        num_workers=cfg.num_workers, collate_fn=collate_mlm,
+                        worker_init_fn=_mlm_worker_init_fn)
     logger.info('warmup rows: %d (%d batches/epoch)', len(rows), len(loader))
 
     model = build_model(cfg, device)

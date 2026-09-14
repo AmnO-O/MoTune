@@ -280,7 +280,9 @@ class MlmDataset(_DatasetBase):
         self.mask_prob = mask_prob          # P([MASK]) over span tokens
         self.random_prob = random_prob      # P(random token) over span tokens
         self.seed = seed
-        self.vocab_size = vocab_size
+        # random-replacement tokens must sample the FULL vocabulary, not some
+        # hard-coded 32k default: fall back to the tokenizer's own vocab_size.
+        self.vocab_size = int(vocab_size or getattr(tokenizer, 'vocab_size', None) or 32000)
         self.rng = np.random.RandomState(seed)
 
         # pre-tokenize once; store (ids, mask, label) templates
@@ -368,6 +370,27 @@ class MlmDataset(_DatasetBase):
 
     def __len__(self) -> int:
         return len(self._base)
+
+
+def _mlm_worker_init_fn(_worker_id: int) -> None:
+    """Re-seed MlmDataset's RNG per worker so multi-worker DataLoaders do not
+    replicate the same mask positions across processes.
+
+    ``get_worker_info()`` hands each worker a unique seed (derived from the
+    torch seed + epoch + worker id), reproduced per epoch, so masking stays
+    evidence-free and reproducible given a fixed global seed.
+    """
+    try:
+        import numpy as np
+        import torch
+    except ImportError:
+        return
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return
+    ds = getattr(info, 'dataset', None)
+    if ds is not None and hasattr(ds, 'rng'):
+        ds.rng = np.random.RandomState(info.seed)
 
 
 # --------------------------------------------------------------------------- #
