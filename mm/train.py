@@ -20,6 +20,7 @@ from torch.amp import autocast
 
 from .losses import compound_center_loss, compound_consistency_loss
 from .utils import get_logger
+import torch.nn.functional as F
 
 logger = get_logger('mm.train')
 
@@ -246,7 +247,7 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
                             f"MLM head '{head_name}' outputs {logits.size(-1)} "
                             f"classes and no {vocab}-output decoder was found "
                             "in the LM module tree")
-                    logits = FUNC.linear(logits, decoder[1].weight, decoder[1].bias)
+                    logits = F.linear(logits, decoder[1].weight, decoder[1].bias)
                 targets = labels[mask]
                 if logits.size(-1) <= int(targets.max()):
                     raise ValueError(
