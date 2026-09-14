@@ -47,14 +47,54 @@ def _backbone_embeddings(model: nn.Module) -> nn.Module:
     raise AttributeError("Cannot locate the embedding module")
 
 
-def _prediction_head(model: nn.Module) -> nn.Module:
-    """The MLM prediction head (predicts shared vocab logits from hidden)."""
-    lm = model.lm
-    for attr in ('cls', 'lm_head', 'head', 'classifier', 'decoder'):
-        h = getattr(lm, attr, None)
+def _last_linear_out(module: nn.Module) -> Optional[int]:
+    """Out-features of the LAST nn.Linear in structural order (the head's head)."""
+    found = None
+
+    def _walk(m: nn.Module) -> None:
+        nonlocal found
+        for child in m.children():
+            if isinstance(child, nn.Linear):
+                found = child.out_features
+            elif len(list(child.children())) > 0:
+                _walk(child)
+
+    _walk(module)
+    return found
+
+
+def _embedding_vocab(model: nn.Module) -> int:
+    """Tokenizer/index size implied by the base embedding table."""
+    emb = _backbone_embeddings(model)
+    w = emb.weight
+    return int(w.size(0))
+
+
+def _prediction_head(model: nn.Module):
+    """The MLM prediction head whose final Linear maps hidden -> model vocab.
+
+    Returns ``(module, name)``. Candidates are checked by their last Linear's
+    ``out_features`` against the base embedding table's width, so an unrelated
+    small classifier (e.g. a classification head also exposed as ``cls``) is
+    skipped instead of silently producing an index-out-of-range CUDA assert.
+    """
+    vocab = _embedding_vocab(model)
+    attrs = ('cls', 'lm_head', 'head', 'classifier', 'decoder',
+             'prediction_head')
+    for attr in attrs:
+        h = getattr(model.lm, attr, None)
+        if h is None:
+            continue
+        last = _last_linear_out(h)
+        if last is not None and last == vocab:
+            return h, attr
+    for attr in attrs:
+        h = getattr(model.lm, attr, None)
         if h is not None:
-            return h
-    raise AttributeError("Cannot locate the MLM prediction head")
+            return h, attr
+    raise AttributeError(
+        f"Cannot locate the MLM prediction head among {attrs} "
+        f"(embedding vocab={vocab})")
 
 
 # --------------------------------------------------------------------------- #

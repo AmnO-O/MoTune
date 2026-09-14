@@ -203,7 +203,7 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
     ``[batch, seq, vocab]``, which alone (~1.2 GiB fp16 + 2.4 GiB fp32 copy)
     would OOM a 15 GiB T4 on top of the frozen encoder.
     """
-    from .model import _backbone, _prediction_head
+    from .model import _backbone, _embedding_vocab, _prediction_head
 
     if not hasattr(optimizer, '_cmp_step_counter'):
         track_optimizer_steps(optimizer)
@@ -214,7 +214,12 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
     device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
 
     encoder = getattr(model, 'base_model', None) or _backbone(model)
-    head = _prediction_head(model)
+    head, head_name = _prediction_head(model)
+    if not getattr(model, '_warmup_head_logged', False):
+        model._warmup_head_logged = True
+        from .utils import logger
+        logger.info('MLM head chosen: %s (%s), vocab=%s',
+                    type(head).__name__, head_name, _embedding_vocab(model))
 
     for step_idx, batch in enumerate(dataloader, 1):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -228,7 +233,13 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
             if mask.any():
                 # hidden [B,T,H] -> hidden[mask] [M,H] -> [M, vocab] -> [M, vocab]
                 logits = head(hidden[mask])
-                loss = criterion(logits.float(), labels[mask]) / accum_steps
+                targets = labels[mask]
+                if logits.size(-1) <= int(targets.max()):
+                    raise ValueError(
+                        f"MLM head '{head_name}' outputs {logits.size(-1)} classes "
+                        f"but labels reach {int(targets.max())} — wrong head picked "
+                        "or tokenizer/model vocab mismatch")
+                loss = criterion(logits.float(), targets) / accum_steps
             else:
                 loss = torch.zeros((), device=hidden.device, dtype=hidden.dtype)
         scaler.scale(loss).backward()
