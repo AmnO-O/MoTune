@@ -67,6 +67,8 @@ class Trainer:
                                max_len=self.cfg.max_context_length)
         val_ds = CompDataset(val_rows, tokenizer,
                              max_len=self.cfg.max_context_length)
+        use_workers = self.cfg.num_workers > 0
+        is_cuda = (getattr(self.device, 'type', '') == 'cuda')
         if self.cfg.lambda_rank > 0:
             cids = [r['compound_id'] for r in train_rows]
             self._train_sampler = CompoundGroupSampler(
@@ -74,17 +76,18 @@ class Trainer:
             train_loader = DataLoader(
                 train_ds, batch_size=self.cfg.batch_size, shuffle=False,
                 sampler=self._train_sampler, num_workers=self.cfg.num_workers,
-                pin_memory=True, collate_fn=collate_comp)
+                pin_memory=is_cuda, persistent_workers=use_workers,
+                collate_fn=collate_comp)
         else:
             self._train_sampler = None
             train_loader = DataLoader(
                 train_ds, batch_size=self.cfg.batch_size, shuffle=True,
-                num_workers=self.cfg.num_workers, pin_memory=True,
-                collate_fn=collate_comp)
+                num_workers=self.cfg.num_workers, pin_memory=is_cuda,
+                persistent_workers=use_workers, collate_fn=collate_comp)
         val_loader = DataLoader(
             val_ds, batch_size=self.cfg.batch_size * 2, shuffle=False,
-            num_workers=self.cfg.num_workers, pin_memory=True,
-            collate_fn=collate_comp)
+            num_workers=self.cfg.num_workers, pin_memory=is_cuda,
+            persistent_workers=use_workers, collate_fn=collate_comp)
         return train_loader, val_loader
 
     def _apply_lora(self, model):
@@ -122,8 +125,8 @@ class Trainer:
                          phase, [len(g['params']) for g in groups])
         return groups
 
-    def _freeze_with_lora(self, model, adapters):
-        """All frozen except heads, the LoRA adapters and (optionally) embeddings."""
+    def _freeze_phase1(self, model, adapters):
+        """Phase 1: freeze backbone and LoRA, train only prediction heads."""
         for p in model.parameters():
             p.requires_grad = False
         for p in model.mod_regressor.parameters():
@@ -134,7 +137,14 @@ class Trainer:
             for p in _backbone_embeddings(model).parameters():
                 p.requires_grad = True
         for p in lora_parameters(adapters):
+            p.requires_grad = False
+
+    def _unfreeze_phase2(self, model, adapters):
+        """Phase 2: unfreeze LoRA adapters and optionally top encoder layers."""
+        for p in lora_parameters(adapters):
             p.requires_grad = True
+        if self.cfg.unfreeze_from_layer > 0:
+            unfreeze_top_layers(model, self.cfg.unfreeze_from_layer)
 
     def _optimizer(self, model, adapters, phase, steps):
         groups = self._param_groups(model, adapters, phase)
@@ -156,7 +166,20 @@ class Trainer:
 
         model = build_model(self.cfg, self.device, load_from=load_from)
         adapters = self._apply_lora(model)
-        self._freeze_with_lora(model, adapters)
+
+        steps_per_epoch = math.ceil(len(train_loader) / self.cfg.accum_steps)
+        if self.cfg.freeze_epochs > 0:
+            self._freeze_phase1(model, adapters)
+            phase_init = 1
+            steps_init = steps_per_epoch * self.cfg.freeze_epochs
+        else:
+            self._freeze_phase1(model, adapters)
+            self._unfreeze_phase2(model, adapters)
+            phase_init = 2
+            steps_init = steps_per_epoch * self.cfg.total_epochs
+
+        optimizer, scheduler = self._optimizer(
+            model, adapters, phase=phase_init, steps=steps_init)
 
         scaler = GradScaler(
             'cuda',
@@ -174,28 +197,27 @@ class Trainer:
             bin_sigma=self.cfg.bin_sigma, use_label_std=self.cfg.use_label_std,
         ).to(self.device)
 
-        steps_per_epoch = math.ceil(len(train_loader) / self.cfg.accum_steps)
-        optimizer, scheduler = self._optimizer(
-            model, adapters, phase=1, steps=steps_per_epoch * self.cfg.freeze_epochs)
-
-        best_rho, best_epoch, no_improve_epochs = -1.0, -1, 0
+        best_rho, best_epoch, no_improve_epochs = -float('inf'), -1, 0
         best: Optional[Dict[str, np.ndarray]] = None
         history: List[Dict] = []
+        ckpt_dir = self.output_dir / 'models'
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / ckpt_name
 
         for epoch in range(self.cfg.total_epochs):
             if self._train_sampler is not None:
                 self._train_sampler.set_epoch(epoch)
-            if epoch == self.cfg.freeze_epochs:
-                if self.cfg.unfreeze_from_layer > 0:
-                    if self.device.type == 'cuda':
-                        torch.cuda.empty_cache()
-                    self.logger.info(
-                        '>>> Unfreezing top layers (from layer %d) at epoch %d <<<',
-                        self.cfg.unfreeze_from_layer, epoch + 1)
-                    unfreeze_top_layers(model, self.cfg.unfreeze_from_layer)
+            if epoch == self.cfg.freeze_epochs and self.cfg.freeze_epochs > 0:
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                self.logger.info(
+                    '>>> Entering Phase 2 (unfreezing LoRA%s) at epoch %d <<<',
+                    f', top layers from {self.cfg.unfreeze_from_layer}' if self.cfg.unfreeze_from_layer > 0 else '',
+                    epoch + 1)
+                self._unfreeze_phase2(model, adapters)
                 optimizer, scheduler = self._optimizer(
                     model, adapters, phase=2,
-                    steps=steps_per_epoch * (self.cfg.total_epochs - self.cfg.freeze_epochs))
+                    steps=steps_per_epoch * self.cfg.lora_epochs)
 
             phase = 'FROZEN' if epoch < self.cfg.freeze_epochs else 'UNFROZEN-TOP'
             diag: Dict[str, float] = {}
@@ -208,26 +230,29 @@ class Trainer:
                 consist_temp=self.cfg.consist_temp,
                 compound_weight=self.cfg.lambda_compound,
             )
-            tr_mod_p, tr_head_p, tr_mod_y, tr_head_y = evaluate(model, train_loader, self.device)
-            tr_rho_m = _safe_rho(tr_mod_y, tr_mod_p)
-            tr_rho_h = _safe_rho(tr_head_y, tr_head_p)
 
-            mod_pred, head_pred, mod_label, head_label = evaluate(model, val_loader, self.device)
-            rho_mod = _safe_rho(mod_label, mod_pred)
-            rho_head = _safe_rho(head_label, head_pred)
+            # Compute train rho directly from in-epoch predictions (saves full duplicate pass)
+            if 'train_preds' in diag:
+                tr_m, tr_h, tr_my, tr_hy, tr_al = diag['train_preds']
+                tr_rho_m = _safe_rho(tr_my[tr_al], tr_m[tr_al]) if tr_al.any() else 0.0
+                tr_rho_h = _safe_rho(tr_hy[tr_al], tr_h[tr_al]) if tr_al.any() else 0.0
+            else:
+                tr_rho_m = tr_rho_h = 0.0
+
+            val_mod, val_head, val_mod_y, val_head_y, val_mask = evaluate(
+                model, val_loader, self.device, return_all=True)
+            rho_mod = _safe_rho(val_mod_y[val_mask], val_mod[val_mask]) if val_mask.any() else 0.0
+            rho_head = _safe_rho(val_head_y[val_mask], val_head[val_mask]) if val_mask.any() else 0.0
             rho_mean = (rho_mod + rho_head) / 2.0
 
-            gg = diag.get('group_grads', {})
             ovf = diag.get('overflow', {})
-            gg_str = ' '.join(f'{k}={v:.1e}' for k, v in sorted(gg.items())) or '(none)'
-            if ovf:
-                gg_str += ' [' + ' '.join(f'ovf-{k}={v}' for k, v in sorted(ovf.items())) + ']'
+            ovf_str = (' [' + ' '.join(f'ovf-{k}={v}' for k, v in sorted(ovf.items())) + ']') if ovf else ''
             self.logger.info(
                 'Epoch %d/%d [%s] | Loss %.4f | Train ρ %.4f | Val Mod ρ %.4f | Val Head ρ %.4f'
-                ' | Val Mean ρ %.4f | steps %d (skip %d) | grads %s | scale %.1f | lr %.2e',
+                ' | Val Mean ρ %.4f | steps %d (skip %d)%s | scale %.1f | lr %.2e',
                 epoch + 1, self.cfg.total_epochs, phase, train_loss,
                 (tr_rho_m + tr_rho_h) / 2, rho_mod, rho_head, rho_mean,
-                diag['opt_steps'], diag['skipped'], gg_str, diag['scale'], diag['lr'])
+                diag['opt_steps'], diag['skipped'], ovf_str, diag['scale'], diag['lr'])
 
             history.append({
                 'epoch': epoch + 1, 'phase': phase,
@@ -237,19 +262,17 @@ class Trainer:
                 'rho_mean': round(rho_mean, 5),
                 'opt_steps': diag['opt_steps'], 'skipped': diag['skipped'],
                 'grad_norm': round(diag['grad_norm'], 4),
-                'group_grads': {k: round(v, 4) for k, v in gg.items()},
                 'scale': round(diag['scale'], 1), 'lr': diag['lr'],
             })
 
             if rho_mean > best_rho:
                 best_rho, best_epoch, no_improve_epochs = rho_mean, epoch + 1, 0
                 best = {
-                    'mod': mod_pred.copy(), 'head': head_pred.copy(),
-                    'mod_y': mod_label.copy(), 'head_y': head_label.copy(),
+                    'mod': val_mod.copy(), 'head': val_head.copy(),
+                    'mod_y': val_mod_y[val_mask].copy() if val_mask.any() else np.array([]),
+                    'head_y': val_head_y[val_mask].copy() if val_mask.any() else np.array([]),
+                    'rho_mod': rho_mod, 'rho_head': rho_head,
                 }
-                ckpt_dir = self.output_dir / 'models'
-                ckpt_dir.mkdir(parents=True, exist_ok=True)
-                ckpt_path = ckpt_dir / ckpt_name
                 torch.save(model.state_dict(), ckpt_path)
             else:
                 if epoch >= self.cfg.freeze_epochs:
@@ -265,8 +288,8 @@ class Trainer:
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
-        best_rho_mod = _safe_rho(best['mod_y'], best['mod'])
-        best_rho_head = _safe_rho(best['head_y'], best['head'])
+        best_rho_mod = best['rho_mod']
+        best_rho_head = best['rho_head']
         best_rho_mean = (best_rho_mod + best_rho_head) / 2.0
         self.logger.info('Split %s finished | best Mean ρ %.4f at epoch %d',
                          'n/a' if fold is None else fold, best_rho_mean, best_epoch)

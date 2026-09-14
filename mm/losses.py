@@ -48,7 +48,7 @@ def margin_rank_loss(
 
     mask = target_diff > 0
     if compound_ids is not None:
-        mask = mask & (compound_ids[:, None] == compound_ids[None, :])
+        mask = mask & (compound_ids[:, None] == compound_ids[None, :]) & (compound_ids[:, None] >= 0)
 
     if not mask.any():
         return torch.zeros((), device=pred.device, dtype=pred.dtype)
@@ -74,7 +74,7 @@ def compound_consistency_loss(
     loss cannot cheat by shrinking norms). 'infonce': InfoNCE positives within
     the batch. Rows with compound_id == -1 are excluded.
     """
-    rep = torch.cat([mod_emb, head_emb], dim=-1)
+    rep = torch.cat([mod_emb, head_emb], dim=-1).float()
     ids = compound_ids.to(rep.device)
     keep = ids >= 0
     if not keep.any():
@@ -97,9 +97,13 @@ def compound_consistency_loss(
     logits = rep @ rep.t() / temp
     same = (ids[:, None] == ids[None, :]).float()
     pos = same - torch.eye(n, device=rep.device, dtype=rep.dtype)
+    has_pos = pos.sum(-1) > 0
+    if not has_pos.any():
+        return torch.zeros((), device=rep.device, dtype=rep.dtype)
     num_pos = pos.sum(-1).clamp(min=1.0)
     log_p = F.log_softmax(logits, dim=-1)
-    return -((pos * log_p).sum(-1) / num_pos).mean()
+    loss_per_row = (pos * log_p).sum(-1) / num_pos
+    return -loss_per_row[has_pos].mean()
 
 
 # --------------------------------------------------------------------------- #

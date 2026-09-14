@@ -189,13 +189,19 @@ def run_train80(cfg: Config, logger: logging.Logger, device,
     result = trainer.fit(train_rows, val_rows, tokenizer, fold=None,
                          ckpt_name='best.pt', load_from=_warmup_snapshot(output_dir))
 
+    labeled_val = [i for i, r in enumerate(val_rows) if r['has_label']]
+    val_my = result.best_mod_label
+    val_hy = result.best_head_label
+    val_mp = result.best_mod_pred[labeled_val] if len(result.best_mod_pred) == len(val_rows) else result.best_mod_pred
+    val_hp = result.best_head_pred[labeled_val] if len(result.best_head_pred) == len(val_rows) else result.best_head_pred
+
     metrics = {
         'mode': cfg.mode,
         'val_rho_mod': round(result.rho_mod, 5),
         'val_rho_head': round(result.rho_head, 5),
         'val_rho_mean': round(result.rho_mean, 5),
-        'val_rmse_mod': round(_rmse(result.best_mod_label, result.best_mod_pred), 5),
-        'val_rmse_head': round(_rmse(result.best_head_label, result.best_head_pred), 5),
+        'val_rmse_mod': round(_rmse(val_my, val_mp), 5) if len(val_my) > 0 else float('nan'),
+        'val_rmse_head': round(_rmse(val_hy, val_hp), 5) if len(val_hy) > 0 else float('nan'),
         'best_epoch': result.best_epoch,
         'checkpoint': result.ckpt_path,
     }
@@ -307,7 +313,8 @@ def run_predict(cfg: Config, logger: logging.Logger, device,
                            max_len=cfg.max_context_length, is_test=True)
     trial_loader = DataLoader(trial_ds, batch_size=cfg.batch_size * 2,
                               shuffle=False, num_workers=cfg.num_workers,
-                              pin_memory=True, collate_fn=collate_comp)
+                              pin_memory=(getattr(device, 'type', '') == 'cuda'),
+                              collate_fn=collate_comp)
 
     load_from = _warmup_snapshot(output_dir)
 
@@ -318,7 +325,8 @@ def run_predict(cfg: Config, logger: logging.Logger, device,
         state = torch.load(ckpt, map_location=device, weights_only=True)
         model.load_state_dict(state)
         model.eval()
-        mod_pred, head_pred = evaluate(model, trial_loader, device)
+        res = evaluate(model, trial_loader, device)
+        mod_pred, head_pred = res[0], res[1]
         return mod_pred, head_pred
 
     if cfg.predict_mode == '5fold':
@@ -361,14 +369,20 @@ def run_predict(cfg: Config, logger: logging.Logger, device,
     _write_json(metrics, output_dir / 'trial_metrics.json')
 
     tids = [r['context_id'] for r in trial_rows]
-    submission = {
-        'tID': tids, 'Modifier': trial_pred_mod, 'Head': trial_pred_head,
-    }
+    is_pv = 'pv' in cfg.trial_file.lower() or 'pv' in cfg.train_file.lower()
+    if is_pv:
+        submission = {'tID': tids, 'Score': trial_pred_mod}
+    else:
+        submission = {'tID': tids, 'Modifier': trial_pred_mod, 'Head': trial_pred_head}
+
     import pandas as pd
     sub_df = pd.DataFrame(submission)
-    sub_path = output_dir / 'submission' / 'en-nn-trial-pred.tsv'
+    stem = Path(cfg.trial_file).stem
+    out_name = stem.replace('-trial', '-pred') + '.tsv'
+    sub_path = output_dir / 'submission' / out_name
     sub_df.to_csv(sub_path, sep='\t', index=False, header=False)
-    logger.info('Submission written: %s (%d rows, no header)', sub_path, len(sub_df))
+    logger.info('Submission written: %s (%d rows, %d columns, no header)',
+                sub_path, len(sub_df), len(sub_df.columns))
     return metrics
 
 

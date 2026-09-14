@@ -73,8 +73,12 @@ class AttentionPool(nn.Module):
 
     def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         scores = (self.linear(hidden) * self.query).sum(-1)        # (B, L)
-        scores = scores.masked_fill(~mask, -1e9)
-        attn = F.softmax(scores, dim=-1).unsqueeze(-1)
+        # Use -1e4 instead of -1e9 to prevent FP16 underflow to -inf (which produces NaN in softmax)
+        scores = scores.masked_fill(~mask, -1e4)
+        attn = F.softmax(scores, dim=-1)
+        # If a row has no span tokens at all, zero out attention instead of NaN / uniform padding
+        has_span = mask.any(dim=-1, keepdim=True)
+        attn = torch.where(has_span, attn, torch.zeros_like(attn)).unsqueeze(-1)
         return (hidden * attn).sum(dim=1)
 
 
@@ -88,7 +92,7 @@ class SpanPool(nn.Module):
         self.attn = AttentionPool(hidden) if mode == 'attn' else None
 
     def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        if self.mode == 'attn' and mask.any():
+        if self.mode == 'attn':
             return self.attn(hidden, mask)
         return _masked_mean(hidden, mask)
 
@@ -310,6 +314,12 @@ class MMBertRegressor(nn.Module):
         self.use_lm_features = use_lm_features
 
         self.lm = AutoModelForMaskedLM.from_pretrained(backbone)
+        # Cached reference to the base transformer for the no-logits forward
+        # path. Deliberately NOT registered as a child module: registering the
+        # same instance under a second name would duplicate every state_dict
+        # key/parameter (double optimizer updates, 2x ckpt size, strict-load
+        # failures on pre-existing snapshots, and LoRA applied twice).
+        object.__setattr__(self, 'base_model', _backbone(self))
 
         context_dim = hidden_size if context_pool in ('mean', 'cls') else 2 * hidden_size
         self.head_in = hidden_size * 2 + context_dim + 3      # cos + 2 spans + 2 lens + context
@@ -364,13 +374,21 @@ class MMBertRegressor(nn.Module):
 
     def forward(self, batch, with_logits: bool = False, with_reps: bool = False,
                 with_lm: bool = False):
-        outputs = self.lm(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            output_hidden_states=True,
-        )
-        hidden = outputs.hidden_states[-1]
-        logits = outputs.logits if with_logits else None
+        if with_logits or self.use_lm_features:
+            outputs = self.lm(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                output_hidden_states=True,
+            )
+            hidden = outputs.hidden_states[-1]
+            logits = outputs.logits if with_logits else None
+        else:
+            outputs = self.base_model(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+            )
+            hidden = outputs[0] if isinstance(outputs, tuple) else outputs.last_hidden_state
+            logits = None
 
         mod_emb = self.mod_pool(hidden, batch['mod_span_mask'])
         head_emb = self.head_role_pool(hidden, batch['head_span_mask'])

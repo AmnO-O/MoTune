@@ -401,17 +401,14 @@ def _mlm_worker_init_fn(_worker_id: int) -> None:
 # --------------------------------------------------------------------------- #
 def collate_comp(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
+    seq_keys = ('input_ids', 'attention_mask', 'mod_span_mask', 'head_span_mask')
     for key in batch[0]:
-        if key in ('input_ids', 'attention_mask', 'mod_span_mask', 'head_span_mask'):
+        if key in seq_keys:
             length = max(int(b[key].size(0)) for b in batch)
-            pad = 0
             out[key] = torch.zeros(len(batch), length, dtype=batch[0][key].dtype)
             for i, b in enumerate(batch):
                 n = int(b[key].size(0))
                 out[key][i, :n] = b[key]
-                if key in ('attention_mask',):
-                    if n < length:
-                        out[key][i, n:] = pad
         else:
             out[key] = torch.stack([b[key] for b in batch])
     return out

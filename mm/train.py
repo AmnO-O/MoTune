@@ -55,7 +55,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 grad_clip=1.0, accum_steps=1, report=None,
                 consist_weight=0.0, consist_mode='pull', consist_temp=0.1,
                 compound_weight=0.0):
-    """One scoring epoch with AMP + gradient accumulation + per-group clipping.
+    """One scoring epoch with AMP + gradient accumulation + clipping.
 
     ``compound_weight > 0`` adds the gold-centroid MSE on labeled rows.
     Returns the mean supervised loss of the epoch.
@@ -72,9 +72,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
     opt_steps = skipped = 0
     last_grad_norm = last_scale = last_lr = float('nan')
-    group_grads: Dict[str, float] = {}
     overflow: Dict[str, int] = {}
     n_micro = len(dataloader)
+
+    tr_mod_preds, tr_head_preds = [], []
+    tr_mod_targets, tr_head_targets = [], []
+    tr_allowed = []
 
     for step_idx, batch in enumerate(dataloader, 1):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -126,41 +129,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
         scaler.scale(loss).backward()
 
+        # Collect train predictions directly to avoid re-evaluating on train_loader
+        tr_mod_preds.append(mod_pred.detach().cpu())
+        tr_head_preds.append(head_pred.detach().cpu())
+        tr_mod_targets.append(batch['mod_avg'].cpu())
+        tr_head_targets.append(batch['head_avg'].cpu())
+        tr_allowed.append(allowed.cpu())
+
         if step_idx % accum_steps == 0 or step_idx == n_micro:
             scaler.unscale_(optimizer)
-            param_to_name = {id(p): n for n, p in model.named_parameters()}
-            total_norm_sq = 0.0
-            trainable: List[torch.Tensor] = []
-            for group in optimizer.param_groups:
-                params = [p for p in group['params'] if p.grad is not None]
-                if not params:
-                    continue
-                trainable += params
-                raw = torch.sqrt(sum((p.grad.detach().float() ** 2).sum() for p in params))
-                raw = raw.item() if torch.isfinite(raw) else float('nan')
-                label = 'enc'
-                for p in params:
-                    name = param_to_name.get(id(p), '')
-                    if 'embed' in name:
-                        label = 'emb'
-                        break
-                    if 'regressor' in name:
-                        label = 'head'
-                        break
-                    if 'lora' in name or 'adapter' in name:
-                        label = 'lora'
-                if math.isnan(raw):
-                    overflow[label] = overflow.get(label, 0) + 1
-                    continue
-                if group_grads.get(label, -1.0) < 0 or raw > group_grads.get(label, 0.0):
-                    group_grads[label] = raw
-                total_norm_sq += raw ** 2
-            # ONE global clip over all trainable params preserves the relative
-            # gradient magnitudes between backbone/LoRA/head/embeddings;
-            # per-group norms are kept as diagnostics only.
+            trainable = [p for group in optimizer.param_groups for p in group['params'] if p.grad is not None]
             if trainable:
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=grad_clip)
-            last_grad_norm = total_norm_sq ** 0.5
+                last_grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, max_norm=grad_clip))
+            else:
+                last_grad_norm = 0.0
 
             if step_counter is not None:
                 prev = step_counter[0]
@@ -196,11 +178,18 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     if report is not None:
         report.update({
             'opt_steps': opt_steps, 'skipped': skipped,
-            'grad_norm': last_grad_norm, 'group_grads': group_grads,
+            'grad_norm': last_grad_norm,
             'overflow': overflow, 'scale': last_scale, 'lr': last_lr,
         })
         if n_consist:
             report['consist'] = consist_sum / n_consist
+        if tr_mod_preds:
+            m_p = torch.cat(tr_mod_preds).numpy()
+            h_p = torch.cat(tr_head_preds).numpy()
+            m_y = torch.cat(tr_mod_targets).numpy()
+            h_y = torch.cat(tr_head_targets).numpy()
+            al = torch.cat(tr_allowed).numpy()
+            report['train_preds'] = (m_p, h_p, m_y, h_y, al)
     return total_loss / n_micro
 
 
@@ -259,11 +248,13 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
     return total / n_micro
 
 
-def evaluate(model, dataloader, device):
-    """Predictions + gold labels masked by has_label (like the old evaluate).
+def evaluate(model, dataloader, device, return_all: bool = False):
+    """Predictions + gold labels.
 
-    Returns (mod_preds, head_preds[, mod_labels, head_labels]); the label
-    pair is returned only when at least one row is labeled.
+    If return_all=True: returns (all_mod, all_head, all_mod_y, all_head_y, label_mask)
+    for all rows regardless of whether has_label is True or False.
+    If return_all=False: returns (mod[mask], head[mask], mod_y[mask], head_y[mask]) if labeled,
+    or (mod, head).
     """
     model.eval()
     all_mod, all_head = [], []
@@ -285,12 +276,17 @@ def evaluate(model, dataloader, device):
             all_mod_y.append(batch['mod_avg'].cpu().numpy().reshape(-1))
             all_head_y.append(batch['head_avg'].cpu().numpy().reshape(-1))
 
-    mod, head = np.concatenate(all_mod), np.concatenate(all_head)
-    if has_mask:
-        mask = np.concatenate(masks)
-        if mask.any():
-            return (mod[mask], head[mask],
-                    np.concatenate(all_mod_y)[mask], np.concatenate(all_head_y)[mask])
+    mod = np.concatenate(all_mod) if all_mod else np.array([])
+    head = np.concatenate(all_head) if all_head else np.array([])
+    mod_y = np.concatenate(all_mod_y) if all_mod_y else np.array([])
+    head_y = np.concatenate(all_head_y) if all_head_y else np.array([])
+    mask = np.concatenate(masks) if has_mask else np.zeros(len(mod), dtype=bool)
+
+    if return_all:
+        return mod, head, mod_y, head_y, mask
+
+    if has_mask and mask.any():
+        return mod[mask], head[mask], mod_y[mask], head_y[mask]
     return mod, head
 
 

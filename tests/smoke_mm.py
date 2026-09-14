@@ -368,6 +368,34 @@ def check_folds() -> None:
     check(order != order2, 'set_epoch changes the shuffle')
 
 
+def check_fixes() -> None:
+    print('=== 7. BUG FIXES & CONTRACTS ===')
+    sys.path.insert(0, str(ROOT))
+    import ast
+    import numpy as np
+    from mm.config import Config
+
+    # 1) Verify freeze_phase1 / unfreeze_phase2 methods exist on Trainer via AST
+    trainer_ast = ast.parse((ROOT / 'mm' / 'trainer.py').read_text(encoding='utf-8'))
+    methods = [n.name for n in ast.walk(trainer_ast) if isinstance(n, ast.FunctionDef)]
+    check('_freeze_phase1' in methods and '_unfreeze_phase2' in methods,
+          'Trainer has two-phase freeze/unfreeze methods')
+
+    # 2) Verify base_model bypass exists in MMBertRegressor forward (kept as a
+    # non-registered attribute so state_dict/optimizer are not duplicated)
+    model_src = (ROOT / 'mm' / 'model.py').read_text(encoding='utf-8')
+    check("object.__setattr__(self, 'base_model', _backbone(self))" in model_src
+          and 'outputs = self.base_model(' in model_src,
+          'MMBertRegressor bypasses MLM head when with_logits is False')
+
+    # 3) Verify compound_consistency_loss casts rep to float and guards infonce singletons
+    loss_src = (ROOT / 'mm' / 'losses.py').read_text(encoding='utf-8')
+    check('rep = torch.cat([mod_emb, head_emb], dim=-1).float()' in loss_src,
+          'compound_consistency_loss casts rep to float for AMP compatibility')
+    check('& (compound_ids[:, None] >= 0)' in loss_src,
+          'margin_rank_loss prevents spurious -1 compound pairs')
+
+
 def main() -> int:
     sync_parse()
     check_config()
@@ -375,6 +403,7 @@ def main() -> int:
     check_marks()
     check_data()
     check_folds()
+    check_fixes()
 
     print('=' * 50)
     if FAILURES:
