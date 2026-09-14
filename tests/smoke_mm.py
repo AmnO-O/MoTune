@@ -397,8 +397,8 @@ def check_fixes() -> None:
 
     # 4) Verify the LoRA layer-window knob is wired end to end
     cfg = Config()
-    check(getattr(cfg, 'lora_from_layer', 0) == 14,
-          'config exposes lora_from_layer defaulting to 14')
+    check(getattr(cfg, 'lora_from_layer', 0) == 18,
+          'config exposes lora_from_layer defaulting to 18')
     model_src2 = (ROOT / 'mm' / 'model.py').read_text(encoding='utf-8')
     check("def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,"
           "\n               dropout: float = 0.1, targets: Optional[List[str]] = None,"

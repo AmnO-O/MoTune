@@ -221,8 +221,8 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
         with autocast(device_type):
             outputs = encoder(input_ids=batch['input_ids'],
                               attention_mask=batch['attention_mask'])
-            hidden = (getattr(outputs, 'last_hidden_state', None)
-                      or outputs[0])
+            hidden = (outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state')
+                      else outputs[0])
             labels = batch['labels']
             mask = labels != -100
             if mask.any():
