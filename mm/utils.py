@@ -1,7 +1,7 @@
-"""Small, dependency-light utilities shared across the pipeline.
+"""Process-level utilities: seeding, device, logging, path auto-detection.
 
-Only imports torch lazily so that config-only or data-only tooling still
-works in minimal environments.
+Ported from the old ``src/utils.py`` — these are battle-tested on Kaggle
+(auto-detection of the mounted dataset / working dir) and kept untouched.
 """
 
 from __future__ import annotations
@@ -15,14 +15,16 @@ from typing import Optional
 
 import numpy as np
 
-from config import Config
+from mm.config import Config
 
 _LOG_FORMAT = '%(asctime)s | %(levelname)-7s | %(message)s'
 _LOG_DATE = '%H:%M:%S'
 
+_KAGGLE_DATASET = Path('/kaggle/input/datasets/ieltsmater/compartment/Compartment')
+_KAGGLE_WORKING = Path('/kaggle/working')
+
 
 def set_seed(seed: int) -> None:
-    """Seed every RNG in the process for reproducible runs."""
     random.seed(seed)
     np.random.seed(seed)
     try:
@@ -35,7 +37,6 @@ def set_seed(seed: int) -> None:
 
 
 def get_device():
-    """Return the best available torch device, or None if torch is absent."""
     try:
         import torch
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -43,7 +44,7 @@ def get_device():
         return None
 
 
-def get_logger(name: str = 'compartment', log_dir: Optional[str | Path] = None,
+def get_logger(name: str = 'mm', log_dir: Optional[str | Path] = None,
                level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
     if logger.handlers:
@@ -67,10 +68,6 @@ def get_logger(name: str = 'compartment', log_dir: Optional[str | Path] = None,
     return logger
 
 
-_KAGGLE_DATASET = Path('/kaggle/input/datasets/ieltsmater/compartment/Compartment')
-_KAGGLE_WORKING = Path('/kaggle/working')
-
-
 def _auto_data_path() -> Path:
     if _KAGGLE_DATASET.is_dir():
         return _KAGGLE_DATASET
@@ -90,29 +87,9 @@ def _auto_output_dir() -> Path:
 
 
 def resolve_paths(cfg: Config):
-    """Resolve and create the data + output directories for a run."""
     data_dir = Path(cfg.data_path) if cfg.data_path else _auto_data_path()
     output_dir = Path(cfg.output_dir) if cfg.output_dir else _auto_output_dir()
 
     (output_dir / 'models').mkdir(parents=True, exist_ok=True)
     (output_dir / 'submission').mkdir(parents=True, exist_ok=True)
     return data_dir, output_dir
-
-
-def find_src_root() -> Path:
-    """Locate the directory holding the src/ package (local or Kaggle input)."""
-    if Path('src').is_dir():
-        return Path(os.path.abspath('.'))
-
-    roots = sorted(
-        Path('/kaggle/input').glob('*/src')
-    ) + sorted(
-        Path('/kaggle/input').glob('*/**/src')
-    )
-    if roots:
-        return roots[0].parent
-
-    raise RuntimeError(
-        'src/ package not found. Run from the repo root or add the GitHub '
-        'repo as a Kaggle input (Add Input -> GitHub).'
-    )

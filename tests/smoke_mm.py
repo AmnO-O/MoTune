@@ -1,0 +1,234 @@
+"""Local smoke checks for the mmBERT rebuild -- NO torch / transformers needed.
+
+Run from the repo root:
+    python tests/smoke_mm.py        (or: python run.py smoke)
+
+Covers: syntax of every module, config construction/validation/round-trip and
+``--set`` coercion, CLI wiring, and the offset-based span matcher on synthetic
+token offsets (the real-tokenizer alignment check runs on Kaggle in M2).
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parent.parent
+FAILURES: list[str] = []
+
+
+def check(condition: bool, label: str) -> None:
+    status = 'OK' if condition else 'FAIL'
+    print(f'  [{status}] {label}')
+    if not condition:
+        FAILURES.append(label)
+
+
+def sync_parse() -> None:
+    print('=== 1. SYNTAX (run.py + mm/*.py) ===')
+    files = [ROOT / 'run.py', ROOT / 'tests' / 'smoke_mm.py'] + sorted((ROOT / 'mm').glob('*.py'))
+    for path in files:
+        try:
+            ast.parse(path.read_text(encoding='utf-8'))
+            check(True, str(path.relative_to(ROOT)))
+        except SyntaxError as exc:
+            check(False, f'{path.name}: {exc.msg} @ {exc.lineno}')
+
+
+def check_config() -> None:
+    print('=== 2. CONFIG (defaults / validation / round-trip / --set) ===')
+    sys.path.insert(0, str(ROOT))
+    from mm.config import Config, coerce_value
+
+    defaults = Config.defaults()
+    defaults.validate()
+    check(defaults.backbone == 'jhu-clsp/mmBERT-base', f'default backbone = mmBERT-base')
+    check(defaults.total_epochs == defaults.freeze_epochs + defaults.lora_epochs,
+          'total_epochs == freeze_epochs + lora_epochs')
+
+    bad = [
+        ('lambda_rank=-1', lambda: Config.defaults().update(lambda_rank=-1)),
+        ('head_pool=bogus', lambda: Config.defaults().update(head_pool='bogus')),
+        ('mlm_mask_span=bogus', lambda: Config.defaults().update(mlm_mask_span='bogus')),
+        ('freeze_epochs=-1', lambda: Config.defaults().update(freeze_epochs=-1)),
+        ('lora_epochs=0', lambda: Config.defaults().update(lora_epochs=0)),
+        ('warmup without data', lambda: Config.defaults().update(warmup_mlm_epochs=3)),
+        ('embedding_lr=-1', lambda: Config.defaults().update(embedding_lr=-1)),
+        ('unknown_key', lambda: Config.defaults().update(unknown_key=1)),
+    ]
+    for label, fn in bad:
+        try:
+            fn().validate()
+            check(False, f'[reject] {label}')
+        except ValueError:
+            check(True, f'[reject] {label}')
+
+    ok = Config.defaults().update(
+        warmup_mlm_epochs=2, mlm_data_paths=['en-nn-train.tsv', 'de-nn-train.tsv'],
+        head_pool='mean', lambda_compound=0.3,
+    )
+    ok.validate()
+    check(ok.warmup_mlm_epochs == 2 and ok.lambda_compound == 0.3,
+          'valid warmup config accepted')
+    check(ok.total_epochs == ok.freeze_epochs + ok.lora_epochs,
+          'total_epochs derived correctly')
+
+    # JSON round-trip
+    tmp = Path(tempfile.gettempdir()) / 'mm_cfg_smoke.json'
+    defaults.save(tmp)
+    check(Config.load(tmp).to_dict() == defaults.to_dict(), 'config JSON round-trip')
+    tmp.unlink()
+
+    # YAML path: works if PyYAML is installed, else must fail with a clear error
+    tmp = Path(tempfile.gettempdir()) / 'mm_cfg_smoke.yaml'
+    tmp.write_text('seed: 7\nfreeze_epochs: 2\nlora_epochs: 4\nmlm_data_paths:\n  - en-nn-train.tsv\n', encoding='utf-8')
+    try:
+        from mm.config import Config as C2
+        y = C2.load(tmp)
+        check(y.seed == 7 and y.total_epochs == 6, 'config YAML round-trip')
+        check((y.mlm_data_paths == ['en-nn-train.tsv']), 'YAML list field parsed')
+    except ValueError as exc:
+        check('PyYAML' in str(exc), f'YAML config without PyYAML raises clear error')
+    tmp.unlink()
+
+    # --set coercion
+    check(coerce_value('mlm_data_paths', 'a.tsv,b.tsv') == ['a.tsv', 'b.tsv'], 'coerce List')
+    check(coerce_value('freeze_epochs', '3') == 3, 'coerce int')
+    check(coerce_value('embedding_lr', '0.0') == 0.0, 'coerce float')
+    check(coerce_value('use_label_std', 'false') is False, 'coerce bool')
+    check(coerce_value('backbone', 'x/y') == 'x/y', 'str passes through')
+    check(coerce_value('not_a_field', '1') == '1', 'unknown key passes through (validated later)')
+
+
+def check_cli() -> None:
+    print('=== 3. CLI WIRING (run.py) ===')
+    sys.path.insert(0, str(ROOT))
+    import run as cli
+    from mm.config import Config
+
+    tmp_cfg = Path(tempfile.gettempdir()) / 'mm_cli_smoke.json'
+    tmp_cfg.write_text('{"head_pool": "mean", "freeze_epochs": 5}', encoding='utf-8')
+
+    args = cli._build_parser().parse_args([
+        'train5',
+        '--config', str(tmp_cfg),
+        '--set', 'freeze_epochs=2', '--set', 'lora_epochs=6',
+        '--set', 'mlm_data_paths=de-nn-train.tsv,nctti_en.tsv',
+        '--set', 'use_label_std=false',
+        '--seed', '7',
+    ])
+    overrides = cli._set_overrides(args)
+    cfg = cli._merge(Config.defaults(), args)
+
+    check(cfg.head_pool == 'mean', 'config file applied on top of defaults')
+    check(cfg.freeze_epochs == 2 and cfg.lora_epochs == 6 and cfg.total_epochs == 8,
+          'CLI --set ints map onto Config')
+    check(cfg.mlm_data_paths == ['de-nn-train.tsv', 'nctti_en.tsv'], 'CLI --set lists map')
+    check(cfg.use_label_std is False, 'CLI --set bool maps')
+    check(cfg.seed == 7 and cfg.mode == 'train5', 'CLI flags map (seed, mode)')
+    check(str(args.config) == str(tmp_cfg), '--config parsed')
+    tmp_cfg.unlink()
+
+    bad = cli._build_parser().parse_args(['train5', '--set', 'no_equals'])
+    try:
+        cli._set_overrides(bad)
+        check(False, '--set without = rejected')
+    except ValueError:
+        check(True, '--set without = rejected')
+
+
+def _word_offsets(text: str):
+    """Synthetic single-token-per-word offset map for unit tests."""
+    out = []
+    pos = 0
+    for w in text.split(' '):
+        s = text.index(w, pos)
+        out.append((s, s + len(w)))
+        pos = s + len(w)
+    return out
+
+
+def check_marks() -> None:
+    print('=== 4. OFFSET SPAN MATCHER (synthetic token offsets) ===')
+    sys.path.insert(0, str(ROOT))
+    from mm.marks import Span, find_spans
+
+    def tp(sp: Span):
+        return (sp.start, sp.end) if sp is not None else None
+
+    # 1) basic contiguous EN compound
+    r = find_spans('the night watch is useful', _word_offsets('the night watch is useful'),
+                   'night', 'watch')
+    check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (2, 3) and r.adjacent,
+          'EN spaced compound -> mod(1,2) head(2,3) adjacent')
+    check(not r.degenerate, 'EN spaced compound not degenerate')
+
+    # 2) head inflection (plural)
+    r = find_spans('the night watches are', _word_offsets('the night watches are'),
+                   'night', 'watch')
+    check(r.found and tp(r.head) == (2, 3) and r.adjacent, 'head inflection "watches" matched')
+
+    # 3) head possessive
+    r = find_spans("the night watch's value", _word_offsets("the night watch's value"),
+                   'night', 'watch')
+    check(r.found and tp(r.head) == (2, 3) and r.adjacent, "head possessive \"watch's\" matched")
+
+    # 4) German closed compound, single token
+    text = 'Das Abiturzeugnis ist gut'
+    r = find_spans(text, _word_offsets(text), 'Abitur', 'Zeugnis')
+    check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (1, 2) and r.adjacent,
+          'German closed compound aligned inside one token')
+    check(r.degenerate, 'collapse to one token flagged degenerate')
+
+    # 5) German compound, tokenizer SPLITS it -> two adjacent tokens
+    text = 'das abitur zeugnis ist'
+    r = find_spans(text, _word_offsets(text), 'abitur', 'zeugnis')
+    check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (2, 3) and r.adjacent,
+          'German split compound matched as adjacent tokens')
+
+    # 6) non-contiguous (head appears later, unrelated word between)
+    r = find_spans('the night sky, watch quietly', _word_offsets('the night sky, watch quietly'),
+                   'night', 'watch')
+    check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (3, 4) and not r.adjacent,
+          'non-contiguous compound falls back to ordered search')
+
+    # 7) no match -> found=False, no crash on empty spans
+    r = find_spans('the night is dark', _word_offsets('the night is dark'), 'banana', 'watch')
+    check(not r.found and r.mod.start is None and r.head.start is None,
+          'unmatched compound returns empty spans')
+
+    # 8) boundary: "watch" must NOT match inside "watchful"
+    r = find_spans('the watchful eye', _word_offsets('the watchful eye'), 'night', 'watch')
+    check(not r.found, '"watch" does not match the prefix of "watchful"')
+
+    # 9) punctuation boundary after head
+    r = find_spans('time watch.', _word_offsets('time watch.'), 'time', 'watch')
+    check(r.found and tp(r.head) == (1, 2) and r.adjacent, 'head at punctuation boundary')
+
+    # 10) capitalization is case-insensitive
+    r = find_spans('The Night Watch Is Long', _word_offsets('The Night Watch Is Long'),
+                   'night', 'watch')
+    check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (2, 3), 'case-insensitive matching')
+
+
+def main() -> int:
+    sync_parse()
+    check_config()
+    check_cli()
+    check_marks()
+
+    print('=' * 50)
+    if FAILURES:
+        print(f'RESULT: {len(FAILURES)} FAILURE(S): {FAILURES}')
+        return 1
+    print('RESULT: all smoke checks passed')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
