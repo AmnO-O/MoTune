@@ -123,21 +123,59 @@ def _df_to_rows(df: pd.DataFrame, tag: str, lang: str) -> List[Dict]:
 # --------------------------------------------------------------------------- #
 # top-level loaders
 # --------------------------------------------------------------------------- #
-def load_labeled(cfg) -> List[Dict]:
-    """Phase-1 labeled rows: the configured train_file (NN format)."""
+# --------------------------------------------------------------------------- #
+# top-level loaders
+# --------------------------------------------------------------------------- #
+def _load_files(cfg, file_attrs: List[str], fallback_attr: str) -> List[Dict]:
+    """Helper nạp và gộp nhiều file TSV (EN/DE, NN/PV) theo cấu hình Config."""
     data_dir, _ = _resolve(cfg)
-    path = data_dir / cfg.train_file
-    if not path.exists():
-        raise FileNotFoundError(f'train_file not found: {path}')
-    df = read_tsv(path)
-    rows = _df_to_rows(df, cfg.train_file, _auto_lang(cfg.train_file))
-    # stable per-compound id for the within-compound ranking loss
-    compounds = pd.Series([r['compound'] for r in rows])
-    codes, _ = pd.factorize(compounds)
-    for r, c in zip(rows, codes):
+    
+    files_to_load: List[str] = []
+    for attr in file_attrs:
+        fname = getattr(cfg, attr, None)
+        if fname and fname.strip() and fname not in files_to_load:
+            files_to_load.append(fname)
+
+    # Fallback về thuộc tính đơn lẻ cũ nếu không chỉ định multi-task
+    if not files_to_load:
+        fallback = getattr(cfg, fallback_attr, None)
+        if fallback and fallback.strip():
+            files_to_load.append(fallback)
+
+    all_rows: List[Dict] = []
+    for fname in files_to_load:
+        path = data_dir / fname
+        if not path.exists():
+            logger.warning('Dataset file missing, skipping: %s', path)
+            continue
+        df = read_tsv(path)
+        rows = _df_to_rows(df, fname, _auto_lang(fname))
+        all_rows.extend(rows)
+        logger.info('%s: %d rows', fname, len(rows))
+
+    if not all_rows:
+        raise FileNotFoundError(f'No valid dataset files found in {data_dir}')
+
+    # Định danh compound_id duy nhất kèm ngôn ngữ (vd: en_blackboard vs de_apfelbaum)
+    compound_keys = [f"{r['lang']}_{r['compound']}" for r in all_rows]
+    codes, _ = pd.factorize(pd.Series(compound_keys))
+    for r, c in zip(all_rows, codes):
         r['compound_id'] = int(c)
-    logger.info('%s: %d rows / %d compounds', cfg.train_file, len(rows), int(codes.max()) + 1)
-    return rows
+
+    logger.info('Loaded %d total rows across %d unique compounds', len(all_rows), int(codes.max()) + 1)
+    return all_rows
+
+
+def load_labeled(cfg) -> List[Dict]:
+    """Load dữ liệu Train đa ngữ/đa dạng (EN/DE, NN/PV)."""
+    train_attrs = ['en_nn_train', 'de_nn_train', 'en_pv_train', 'de_pv_train']
+    return _load_files(cfg, train_attrs, 'train_file')
+
+
+def load_trial(cfg) -> List[Dict]:
+    """Load dữ liệu Trial/Validation đa ngữ/đa dạng (EN/DE, NN/PV)."""
+    trial_attrs = ['en_nn_trial', 'de_nn_trial', 'en_pv_trial', 'de_pv_trial']
+    return _load_files(cfg, trial_attrs, 'trial_file')
 
 
 def load_aux(cfg) -> List[Dict]:

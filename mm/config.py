@@ -61,13 +61,28 @@ class Config:
     # tokens under the pretrained MLM head) to the head input. 0 = off.
     use_lm_features: bool = False
 
-    # === data / paths (filenames are resolved under data_path) ===
+# === data / paths (filenames are resolved under data_path) ===
     data_path: Optional[str] = None
     output_dir: Optional[str] = None
     max_context_length: int = 256
     max_mlm_length: int = 128
+    
+    # Legacy fallback (dùng khi train đơn lẻ 1 file)
     train_file: str = 'en-nn-train.tsv'
     trial_file: str = 'en-nn-trial.tsv'
+
+    # Multi-task Train Datasets (EN / DE)
+    en_nn_train: str = 'en-nn-train.tsv'
+    de_nn_train: str = 'de-nn-train.tsv'
+    en_pv_train: str = ''
+    de_pv_train: str = ''
+
+    # Multi-task Trial Datasets (EN / DE)
+    en_nn_trial: str = 'en-nn-trial.tsv'
+    de_nn_trial: str = 'de-nn-trial.tsv'
+    en_pv_trial: str = ''
+    de_pv_trial: str = ''
+
     # label-free rows appended to the scoring loader (consistency signal only)
     aux_data_paths: List[str] = field(default_factory=list)
     # label-free sentences for the compound-aware MLM warmup (any language)
