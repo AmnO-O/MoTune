@@ -411,6 +411,14 @@ def check_fixes() -> None:
     check('from_layer=self.cfg.lora_from_layer' in tr_src,
           'trainer passes lora_from_layer to apply_lora')
 
+    # 5) Verify MLM decoder lookup fix: _encoder_hidden_size + correct _mlm_projection
+    check('def _encoder_hidden_size(' in model_src2,
+          '_encoder_hidden_size function defined in model.py')
+    check('hidden = _encoder_hidden_size(model)' in model_src2,
+          '_mlm_projection uses _encoder_hidden_size (not _last_linear_out(head))')
+    check('head_in :=' not in model_src2,
+          '_mlm_projection no longer uses buggy walrus _last_linear_out(head) for decoder lookup')
+
 
 def main() -> int:
     sync_parse()

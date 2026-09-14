@@ -134,17 +134,53 @@ def _find_vocab_decoder(model: nn.Module, vocab: int, hidden_size: int):
     return best
 
 
+def _encoder_hidden_size(model: nn.Module) -> int:
+    """Encoder hidden dimension (e.g. 768 for BERT-base).
+
+    Prefers ``lm.config.hidden_size``; falls back to the embedding weight
+    width, then the first embedding-table dimension.
+    """
+    lm = getattr(model, 'lm', model)
+    cfg = getattr(lm, 'config', None)
+    if cfg is not None:
+        for attr in ('hidden_size', 'd_model', 'n_embd', 'dim'):
+            if hasattr(cfg, attr):
+                return int(getattr(cfg, attr))
+    # fallback: embedding weight
+    try:
+        emb = _backbone_embeddings(model)
+        if hasattr(emb, 'weight'):
+            return int(emb.weight.size(1))  # [vocab, hidden]
+    except AttributeError:
+        pass
+    raise AttributeError("Cannot determine encoder hidden size")
+
+
 def _mlm_projection(model: nn.Module):
     """Resolve (transform_head, vocab_decoder_or_None, head_name) for warmup.
 
     Warms the pretrained MLM head by running the encoder without the huge
     vocabulary head and projecting ONLY masked rows: ``decoder(head(rows))``
     where ``head`` is the head's transform and ``decoder`` the (possibly tied)
-    ``hidden -> vocab`` linear.
+    ``hidden → vocab`` linear.
+
+    The key fix: we pass the **encoder hidden size** (e.g. 768) to
+    ``_find_vocab_decoder``, NOT ``_last_linear_out(head)``.  For
+    ModernBertPredictionHead the last child Linear is the 768→vocab decoder
+    itself, so ``_last_linear_out(head)`` would return the vocab size (256000),
+    causing ``_find_vocab_decoder`` to look for an impossible 256000→256000
+    Linear and return None, leaving ``decoder=None`` and the 768-dim logits
+    uncorrected.
     """
     vocab = _embedding_vocab(model)
+    hidden = _encoder_hidden_size(model)
     head, head_name = _prediction_head(model)
-    decoder = _find_vocab_decoder(model, vocab, head_in := _last_linear_out(head))
+    # If the head itself outputs vocab dims (dense head), no separate decoder needed.
+    head_out = _last_linear_out(head)
+    if head_out == vocab:
+        decoder = None
+    else:
+        decoder = _find_vocab_decoder(model, vocab, hidden)
     return head, decoder, head_name, vocab
 
 
