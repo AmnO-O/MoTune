@@ -279,12 +279,73 @@ def check_data() -> None:
     check(gdeg > 0, f'de-nn: {gdeg} German closed compounds flagged degenerate')
 
 
+def check_folds() -> None:
+    print('=== 6. FOLDS + GROUP SAMPLER (real TSVs, no torch) ===')
+    sys.path.insert(0, str(ROOT))
+    from mm.data import _df_to_rows, read_tsv
+    from mm.folds import CompoundGroupSampler, assign_folds
+
+    rows = _df_to_rows(read_tsv('dataset/en-nn-train.tsv'), 'en-nn', 'en')
+    for r in rows:
+        r['compound_id'] = -1
+
+    folded = assign_folds(rows, n_splits=5, seed=42)
+    folds = {r['compound']: r['fold'] for r in folded}
+    check(0 <= min(folds.values()) and max(folds.values()) <= 4,
+          'fold ids in range')
+    check(len(set(folds.values())) == 5, 'all 5 folds used')
+    per_fold = {}
+    for r in folded:
+        per_fold[r['fold']] = per_fold.get(r['fold'], 0) + 1
+    mx, mn = max(per_fold.values()), min(per_fold.values())
+    check(mx - mn <= len(folded) // 2,
+          f'fold sizes balanced: {per_fold}')
+    # compound exclusivity is inherent (fold is per compound); verify deterministic
+    again = assign_folds(rows, n_splits=5, seed=42)
+    check([r['fold'] for r in again] == [r['fold'] for r in folded],
+          'deterministic given the same seed')
+    # every compound appears with a consistent fold even after shuffle of input
+    import random as _r
+    rng = _r.Random(3)
+    shuffled = rows[:]
+    rng.shuffle(shuffled)
+    re_shuffled = assign_folds(shuffled, n_splits=5, seed=42)
+    folds2 = {r['compound']: r['fold'] for r in re_shuffled}
+    check(folds == folds2, 'fold assignment invariant to row order')
+
+    # sampler: rows of each compound are emitted together (batchable dense pairs)
+    n_lab = [i for i, r in enumerate(rows) if r['has_label']]
+    labels_n = {r['compound'] for r in rows if r['has_label']}
+    codes = {c: v for v, c in enumerate(sorted(labels_n))}
+    cids = [codes[r['compound']] if r['has_label'] else -1 for r in rows]
+    samp = CompoundGroupSampler(cids, batch_size=32, seed=7)
+    order = list(samp)
+    check(len(order) == len(rows), 'sampler yields every row once')
+    # compound -1 rows may be sprinkled between groups; check labeled groups
+    # still come in contiguous runs
+    runs = {}
+    for idx in order:
+        c = cids[idx]
+        if c < 0:
+            continue
+        if c not in runs:
+            runs[c] = [idx]
+        elif cids[order[order.index(idx) - 1]] == c:
+            runs[c].append(idx)
+    check(sum(len(v) for v in runs.values()) == sum(1 for c in cids if c >= 0),
+          'all labeled rows reach their compound group')
+    samp.set_epoch(1)
+    order2 = list(samp)
+    check(order != order2, 'set_epoch changes the shuffle')
+
+
 def main() -> int:
     sync_parse()
     check_config()
     check_cli()
     check_marks()
     check_data()
+    check_folds()
 
     print('=' * 50)
     if FAILURES:
