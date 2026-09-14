@@ -22,6 +22,7 @@ from typing import Dict
 from mm.config import Config, coerce_value
 
 _COMMANDS = ('train80', 'train5', 'predict', 'warmup', 'probe', 'smoke')
+_TRAIN_MODES = ('train80', 'train5', 'predict')
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -70,7 +71,10 @@ def _merge(cfg: Config, args: argparse.Namespace) -> Config:
         overrides['output_dir'] = args.output_dir
     if args.seed is not None:
         overrides['seed'] = args.seed
-    overrides['mode'] = args.command if args.command != 'smoke' else cfg.mode
+    # only the training commands map onto a validated `mode`; probe/warmup are
+    # data/phase-0 stages and must leave cfg.mode untouched (or validation fails)
+    if args.command in _TRAIN_MODES:
+        overrides['mode'] = args.command
     return cfg.update(**overrides)
 
 

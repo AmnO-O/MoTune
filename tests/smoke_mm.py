@@ -141,6 +141,15 @@ def check_cli() -> None:
     except ValueError:
         check(True, '--set without = rejected')
 
+    # non-training commands must not set cfg.mode (validation only allows
+    # train modes) - regressed on Kaggle when probe hit Invalid configuration
+    for cmd in ('probe', 'warmup', 'smoke'):
+        a = cli._build_parser().parse_args([cmd])
+        merged = cli._merge(Config.defaults(), a)
+        merged.validate()
+        check(merged.mode in ('train80', 'train5', 'predict'),
+              f'{cmd} leaves a valid cfg.mode')
+
 
 def _word_offsets(text: str):
     """Synthetic single-token-per-word offset map for unit tests."""
