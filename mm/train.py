@@ -53,8 +53,6 @@ def _supervised_term(criterion, pred, target, logits, std, cid, allowed):
         if pred.numel() == 0:
             return torch.zeros((), device=pred.device, dtype=torch.float)
     return criterion(pred, target, logits, std, compound_ids=cid)
-
-
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
                 grad_clip=1.0, accum_steps=1, report=None,
                 consist_weight=0.0, consist_mode='pull', consist_temp=0.1,
@@ -89,9 +87,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         allowed = (batch['has_label'] & batch['has_mod'] & batch['has_head']
                    & ~batch['degenerate'])
 
-        with autocast(device_type):
+        with torch.amp.autocast(device_type):
             requires_logits = getattr(criterion, 'requires_logits', False)
             use_reps = consist_weight > 0
+            
+            mod_logits = head_logits = None
+            mod_emb = head_emb = None
+
             if requires_logits and use_reps:
                 (mod_pred, head_pred, mod_emb, head_emb,
                  mod_logits, head_logits) = model(batch, with_logits=True, with_reps=True)
@@ -111,7 +113,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             )
 
             consist_val = None
-            if use_reps:
+            if use_reps and mod_emb is not None:
                 cid = batch['compound_id'].clone()
                 cid[~allowed] = -1
                 consist = compound_consistency_loss(
@@ -282,6 +284,8 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
         total += v if math.isfinite(v) else 0.0
     return total / n_micro
 
+import numpy as np
+import torch
 
 def evaluate(model, dataloader, device, return_all: bool = False):
     """Predictions + gold labels.
@@ -300,16 +304,25 @@ def evaluate(model, dataloader, device, return_all: bool = False):
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            with autocast(device_type, enabled=(device_type == 'cuda')):
+            
+            with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
                 mod_pred, head_pred = model(batch)
+
             all_mod.append(mod_pred.detach().cpu().numpy().reshape(-1))
             all_head.append(head_pred.detach().cpu().numpy().reshape(-1))
+
             lab = batch.get('has_label')
             if lab is not None:
                 has_mask = True
-                masks.append(lab.cpu().numpy().reshape(-1))
-            all_mod_y.append(batch['mod_avg'].cpu().numpy().reshape(-1))
-            all_head_y.append(batch['head_avg'].cpu().numpy().reshape(-1))
+                masks.append(lab.cpu().numpy().astype(bool).reshape(-1))
+
+            # Xử lý an toàn nếu batch không chứa ground truth targets (ví dụ tập Test)
+            if 'mod_avg' in batch and 'head_avg' in batch:
+                all_mod_y.append(batch['mod_avg'].cpu().numpy().reshape(-1))
+                all_head_y.append(batch['head_avg'].cpu().numpy().reshape(-1))
+            else:
+                all_mod_y.append(np.zeros(len(mod_pred)))
+                all_head_y.append(np.zeros(len(head_pred)))
 
     mod = np.concatenate(all_mod) if all_mod else np.array([])
     head = np.concatenate(all_head) if all_head else np.array([])
@@ -323,7 +336,6 @@ def evaluate(model, dataloader, device, return_all: bool = False):
     if has_mask and mask.any():
         return mod[mask], head[mask], mod_y[mask], head_y[mask]
     return mod, head
-
 
 def unfreeze_top_layers(model, from_layer: int) -> None:
     """Unfreeze top encoder layers (from_layer..last) + final norm (if any)."""
