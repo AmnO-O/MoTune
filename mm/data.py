@@ -147,7 +147,8 @@ def load_aux(cfg) -> List[Dict]:
     for name in cfg.aux_data_paths:
         path = data_dir / name
         if not path.exists():
-            raise FileNotFoundError(f'aux_data_path not found: {path}')
+            logger.warning('aux_data_path missing, skipping: %s', path)
+            continue
         aux = _df_to_rows(read_tsv(path), name, _auto_lang(name))
         for r in aux:
             r.update({
@@ -171,14 +172,15 @@ def load_mlm_rows(cfg) -> List[Dict]:
     for name in cfg.mlm_data_paths:
         path = data_dir / name
         if not path.exists():
-            raise FileNotFoundError(f'mlm_data_path not found: {path}')
+            logger.warning('mlm_data_path missing, skipping: %s', path)
+            continue
         part = _df_to_rows(read_tsv(path), name, _auto_lang(name))
         for r in part:
             r.update({'has_label': False, 'compound_id': -1})
         rows += part
         logger.info('%s: %d warmup rows', name, len(part))
     if not rows:
-        raise ValueError('mlm_data_paths resolved to zero rows')
+        raise ValueError('mlm_data_paths resolved to zero rows (all files missing?)')
     logger.info('total warmup rows: %d', len(rows))
     return rows
 
