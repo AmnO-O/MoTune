@@ -116,6 +116,9 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
                           alpha=cfg.warmup_lora_alpha,
                           dropout=cfg.warmup_lora_dropout,
                           targets=cfg.lora_targets)
+    wpaths = getattr(model, '_lora_paths', [])
+    logger.info('warmup LoRA matched %d modules, e.g. %s',
+                len(wpaths), wpaths[:3])
 
     # freeze everything except LoRA + the pretrained MLM head
     base_ids = {id(p) for p in _backbone(model).parameters()}

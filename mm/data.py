@@ -392,7 +392,8 @@ def _mlm_worker_init_fn(_worker_id: int) -> None:
         return
     ds = getattr(info, 'dataset', None)
     if ds is not None and hasattr(ds, 'rng'):
-        ds.rng = np.random.RandomState(info.seed)
+        # torch worker seeds are 64-bit; numpy RandomState caps at 2**32-1
+        ds.rng = np.random.RandomState(int(info.seed) & 0xFFFFFFFF)
 
 
 # --------------------------------------------------------------------------- #

@@ -119,20 +119,40 @@ class LoRAAdapter(nn.Module):
 
 def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,
                dropout: float = 0.1, targets: Optional[List[str]] = None) -> List[LoRAAdapter]:
-    """Wrap every target Linear in-place (recursive) and return the adapters."""
+    """Wrap every target Linear in-place (recursive) and return the adapters.
+
+    Targets may be bare suffixes ('q_proj') or full dotted paths
+    ('self_attn.q_proj'): a module matches when the full path equals the target
+    or ends with '<target>'. Fails loudly instead of silently returning zero
+    adapters (that would train the scoring heads on a frozen backbone).
+    """
     if targets is None:
         targets = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
+    targets = [str(t).strip() for t in targets]
     adapters: List[LoRAAdapter] = []
+    paths: List[str] = []
 
-    def _walk(module: nn.Module, prefix: str) -> None:
+    def _is_target(full: str) -> bool:
+        return any(full == t or full.endswith('.' + t) for t in targets)
+
+    def _walk(module: nn.Module, path: str) -> None:
         for name, child in list(module.named_children()):
-            if isinstance(child, nn.Linear) and name in targets:
+            full = f'{path}.{name}' if path else name
+            if isinstance(child, nn.Linear) and _is_target(full):
                 setattr(module, name, LoRAAdapter(child, rank, alpha, dropout))
                 adapters.append(getattr(module, name))
+                paths.append(full)
             elif len(list(child.children())) > 0:
-                _walk(child, f'{prefix}.{name}' if prefix else name)
+                _walk(child, full)
 
     _walk(model, '')
+    # diagnostics for callers / logs
+    setattr(model, '_lora_paths', list(dict.fromkeys(paths)))
+    if not adapters:
+        raise RuntimeError(
+            f'apply_lora matched zero {targets}; the backbone uses different '
+            'attention-projection names. Inspect model.lm and pass lora_targets ',
+        )
     return adapters
 
 
