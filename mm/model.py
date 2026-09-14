@@ -105,6 +105,11 @@ class LoRAAdapter(nn.Module):
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.a = nn.Linear(linear.in_features, r, bias=False)
         self.b = nn.Linear(r, linear.out_features, bias=False)
+        # adapters may be created after the base already sits on GPU/device
+        dev = linear.weight.device
+        if dev.type not in ('cpu', 'meta'):
+            self.a.to(dev)
+            self.b.to(dev)
         nn.init.kaiming_uniform_(self.a.weight, a=math.sqrt(5))
         nn.init.zeros_(self.b.weight)
         self.scaling = alpha / r
@@ -127,31 +132,50 @@ def _linear_is(module: nn.Module) -> bool:
 
 
 def _derive_attn_targets(model: nn.Module) -> List[str]:
-    """Leaf names of every linear module living under an attention block."""
+    """Path-suffix targets for linear modules living under an attention block.
+
+    Returns one candidate per projection, ordered so common names come first.
+    Candidates are full-ish paths (digits stripped, last two segments), e.g.
+    'attn.Wqkv' / 'attn.Wo' / 'self_attn.q_proj', so a leaf like 'Wo' that is
+    also used by the MLP ('mlp.Wo') is NOT captured. Singly-named projections
+    (q/k/v/o, *_proj, query/key/value) are returned as bare names.
+    """
+    tails: List[str] = []
     names: List[str] = []
 
     def _walk(m: nn.Module, path: str) -> None:
         for name, child in list(m.named_children()):
             full = f'{path}.{name}' if path else name
             if _linear_is(child) and any(
-                    s in path for s in ('self_attn', 'attention', 'attn',
-                                        'mha', 'mhsa')):
+                    s in path for s in ('self_attn', 'attention', 'mha',
+                                        'mhsa', 'attn')):
+                segs = [s for s in full.split('.') if not s.isdigit()]
+                tails.append('.'.join(segs[-2:]))
                 names.append(name)
             elif len(list(child.children())) > 0:
                 _walk(child, full)
 
     _walk(model, '')
-    preferred = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'q', 'k', 'v', 'o',
+    if not tails:
+        return []
+    preferred = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'Wqkv', 'Wo',
+                 'q', 'k', 'v', 'o', 'query', 'key', 'value',
+                 'query_proj', 'key_proj', 'value_proj']
+    pri = {n: i for i, n in enumerate(preferred)}
+
+    best: Dict[str, str] = {}
+    for t, n in zip(tails, names):
+        if n not in best or len(t) < len(best[n]):
+            best[n] = t
+
+    ordered = sorted(best.items(), key=lambda kv: pri.get(kv[0], len(preferred)))
+    safe_bare = {'q_proj', 'k_proj', 'v_proj', 'o_proj', 'q', 'k', 'v', 'o',
                  'query', 'key', 'value', 'query_proj', 'key_proj',
-                 'value_proj']
-    ordered: List[str] = []
-    for n in preferred:
-        if n in names and n not in ordered:
-            ordered.append(n)
-    for n in names:
-        if n not in ordered:
-            ordered.append(n)
-    return ordered
+                 'value_proj'}
+    out: List[str] = []
+    for n, t in ordered:
+        out.append(n if n in safe_bare else t)
+    return out
 
 
 def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,
