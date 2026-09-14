@@ -12,7 +12,7 @@ Key adaptations for the rebuild:
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -130,10 +130,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             scaler.unscale_(optimizer)
             param_to_name = {id(p): n for n, p in model.named_parameters()}
             total_norm_sq = 0.0
+            trainable: List[torch.Tensor] = []
             for group in optimizer.param_groups:
                 params = [p for p in group['params'] if p.grad is not None]
                 if not params:
                     continue
+                trainable += params
                 raw = torch.sqrt(sum((p.grad.detach().float() ** 2).sum() for p in params))
                 raw = raw.item() if torch.isfinite(raw) else float('nan')
                 label = 'enc'
@@ -153,7 +155,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 if group_grads.get(label, -1.0) < 0 or raw > group_grads.get(label, 0.0):
                     group_grads[label] = raw
                 total_norm_sq += raw ** 2
-                torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
+            # ONE global clip over all trainable params preserves the relative
+            # gradient magnitudes between backbone/LoRA/head/embeddings;
+            # per-group norms are kept as diagnostics only.
+            if trainable:
+                torch.nn.utils.clip_grad_norm_(trainable, max_norm=grad_clip)
             last_grad_norm = total_norm_sq ** 0.5
 
             if step_counter is not None:
