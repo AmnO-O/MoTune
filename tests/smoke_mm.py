@@ -216,11 +216,75 @@ def check_marks() -> None:
     check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (2, 3), 'case-insensitive matching')
 
 
+def check_data() -> None:
+    print('=== 5. DATA LOADERS (real local TSVs, no torch) ===')
+    sys.path.insert(0, str(ROOT))
+    import random
+    from mm.config import Config
+    from mm.data import _df_to_rows, load_labeled, read_tsv
+    from mm.marks import find_spans
+
+    rows_en = _df_to_rows(read_tsv('dataset/en-nn-train.tsv'), 'en-nn', 'en')
+    check(len(rows_en) == 3480 and rows_en[0]['has_label'],
+          f'en-nn: {len(rows_en)} rows, labeled')
+
+    rows_de = _df_to_rows(read_tsv('dataset/de-nn-train.tsv'), 'de-nn', 'de')
+    check(rows_de[0]['compound'] == 'Abiturzeugnis' and rows_de[0]['mod'] == 'Abitur'
+          and rows_de[0]['lang'] == 'de',
+          'de-nn compound/mod/head/lang parsed')
+
+    rows_pv = _df_to_rows(read_tsv('dataset/en-pv-train.tsv'), 'en-pv', 'en')
+    check(rows_pv[0]['mod'] == 'crack' and rows_pv[0]['head'] == 'down'
+          and rows_pv[0]['has_label'],
+          'en-pv Base/Particle -> mod/head + label')
+
+    rows_nctti = _df_to_rows(read_tsv('dataset/nctti_en.tsv'), 'nctti_en', 'en')
+    check(len(rows_nctti) == 539 and not rows_nctti[0]['has_label'],
+          'nctti aux: label-free')
+
+    cfg = Config.defaults().update(data_path='dataset')
+    labeled = load_labeled(cfg)
+    n_compounds = len({r['compound_id'] for r in labeled})
+    check(len(labeled) == 3480 and n_compounds > 100,
+          f'load_labeled: {len(labeled)} rows / {n_compounds} compound ids')
+
+    def synth_offsets(context: str):
+        out, pos = [], 0
+        for w in context.split(' '):
+            if pos >= len(context):
+                break
+            s = context.find(w, pos)
+            if s < 0:
+                break
+            out.append((s, s + len(w)))
+            pos = s + len(w)
+        return out
+
+    def alignment(rows, sample):
+        found = deg = 0
+        for r in rows[:sample]:
+            res = find_spans(r['context'], synth_offsets(r['context']), r['mod'], r['head'])
+            found += bool(res.found)
+            deg += bool(res.degenerate)
+        return found, deg
+
+    n = min(len(rows_en), 2000)
+    found, _ = alignment(rows_en, n)
+    check(found / n > 0.4, f'en-nn synthetic-offset alignment {found}/{n} ({100*found/n:.0f}%)')
+
+    gn = min(len(rows_de), 2000)
+    gfound, gdeg = alignment(rows_de, gn)
+    check(gfound / gn > 0.2,
+          f'de-nn synthetic-offset alignment {gfound}/{gn} ({100*gfound/gn:.0f}%)')
+    check(gdeg > 0, f'de-nn: {gdeg} German closed compounds flagged degenerate')
+
+
 def main() -> int:
     sync_parse()
     check_config()
     check_cli()
     check_marks()
+    check_data()
 
     print('=' * 50)
     if FAILURES:
