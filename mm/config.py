@@ -206,6 +206,8 @@ class Config:
             errors.append(f'context_pool must be one of {_CONTEXT_POOLS}, got {self.context_pool!r}')
         if self.head_mode not in _HEAD_MODES:
             errors.append(f'head_mode must be one of {_HEAD_MODES}, got {self.head_mode!r}')
+        if self.ce_weight > 0 and self.head_mode != 'softmax':
+            errors.append('ce_weight > 0 (Gaussian soft-target CE) requires head_mode="softmax"')
         if self.rank_margin_mode not in _RANK_MARGIN_MODES:
             errors.append(
                 f'rank_margin_mode must be one of {_RANK_MARGIN_MODES}, got {self.rank_margin_mode!r}'
