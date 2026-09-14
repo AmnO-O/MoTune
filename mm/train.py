@@ -19,6 +19,9 @@ import torch
 from torch.amp import autocast
 
 from .losses import compound_center_loss, compound_consistency_loss
+from .utils import get_logger
+
+logger = get_logger('mm.train')
 
 
 def track_optimizer_steps(optimizer) -> None:
@@ -217,7 +220,6 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
     head, head_name = _prediction_head(model)
     if not getattr(model, '_warmup_head_logged', False):
         model._warmup_head_logged = True
-        from .utils import logger
         logger.info('MLM head chosen: %s (%s), vocab=%s',
                     type(head).__name__, head_name, _embedding_vocab(model))
 

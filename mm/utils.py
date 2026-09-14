@@ -69,6 +69,9 @@ def get_logger(name: str = 'mm', log_dir: Optional[str | Path] = None,
     return logger
 
 
+logger = get_logger('mm')
+
+
 def _find_data_dir() -> Optional[Path]:
     """Locate the directory that actually contains the train file.
 

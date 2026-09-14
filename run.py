@@ -132,11 +132,10 @@ def main(argv=None) -> int:
             'probe': pipeline.run_probe,
         }[args.command]
         entry(cfg, logger, device, data_dir, output_dir)
-    except (NotImplementedError, FileNotFoundError, ValueError, RuntimeError) as exc:
+    except Exception as exc:
         logger.error('%s: %s', type(exc).__name__, exc)
-        if args.debug:
-            import traceback
-            traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return 1
 
     logger.info('Finished in %s', datetime.now() - started)
