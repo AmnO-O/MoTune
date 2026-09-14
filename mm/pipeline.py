@@ -94,24 +94,26 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
     from transformers import get_linear_schedule_with_warmup as _linearsched
 
     from mm.data import MlmDataset, _mlm_worker_init_fn, collate_mlm, load_mlm_rows
-    from mm.model import _backbone, apply_lora, build_model, lora_parameters, merge_lora
+    from mm.model import (_backbone, _embedding_vocab, apply_lora, build_model,
+                          lora_parameters, merge_lora)
 
     logger.info('=== warmup: compound-aware MLM (epochs=%d, mask_span=%s) ===',
                 cfg.warmup_mlm_epochs, cfg.mlm_mask_span)
 
     tokenizer = _tokenizer(cfg, logger)
+    model = build_model(cfg, device)
+
     rows = load_mlm_rows(cfg)
     mds = MlmDataset(
         rows, tokenizer, max_len=cfg.max_mlm_length, mask_span=cfg.mlm_mask_span,
         mask_prob=cfg.mlm_mask_prob, random_prob=cfg.mlm_random_prob,
-        seed=cfg.seed, vocab_size=getattr(tokenizer, 'vocab_size', None),
+        seed=cfg.seed, vocab_size=_embedding_vocab(model),
     )
     loader = DataLoader(mds, batch_size=cfg.warmup_batch_size, shuffle=True,
                         num_workers=cfg.num_workers, collate_fn=collate_mlm,
                         worker_init_fn=_mlm_worker_init_fn)
     logger.info('warmup rows: %d (%d batches/epoch)', len(rows), len(loader))
 
-    model = build_model(cfg, device)
     adapters = apply_lora(model, rank=cfg.warmup_lora_rank,
                           alpha=cfg.warmup_lora_alpha,
                           dropout=cfg.warmup_lora_dropout,

@@ -41,6 +41,9 @@ class Config:
     # === run ===
     mode: Mode = 'train5'
     seed: int = 42
+    # CUDA_LAUNCH_BLOCKING + TORCH_USE_CUDA_DSA (slow, debug only): pinpoints
+    # the exact kernel behind an async device-side assert.
+    debug_cuda: bool = False
 
     # === model ===
     backbone: str = 'jhu-clsp/mmBERT-base'

@@ -39,11 +39,19 @@ def _backbone(model: nn.Module) -> nn.Module:
 
 
 def _backbone_embeddings(model: nn.Module) -> nn.Module:
+    lm = getattr(model, 'lm', model)
+    if hasattr(lm, 'get_input_embeddings') and lm.get_input_embeddings() is not None:
+        return lm.get_input_embeddings()
     base = _backbone(model)
-    for attr in ('embed_tokens', 'embeddings', 'word_embeddings', 'wte'):
+    if hasattr(base, 'get_input_embeddings') and base.get_input_embeddings() is not None:
+        return base.get_input_embeddings()
+    for attr in ('embed_tokens', 'embeddings', 'word_embeddings', 'wte', 'tok_embeddings'):
         m = getattr(base, attr, None)
         if m is not None:
-            return m.word_embeddings if hasattr(m, 'word_embeddings') else m
+            for sub in ('tok_embeddings', 'word_embeddings'):
+                if hasattr(m, sub):
+                    return getattr(m, sub)
+            return m
     raise AttributeError("Cannot locate the embedding module")
 
 
@@ -65,9 +73,19 @@ def _last_linear_out(module: nn.Module) -> Optional[int]:
 
 def _embedding_vocab(model: nn.Module) -> int:
     """Tokenizer/index size implied by the base embedding table."""
-    emb = _backbone_embeddings(model)
-    w = emb.weight
-    return int(w.size(0))
+    try:
+        emb = _backbone_embeddings(model)
+        if hasattr(emb, 'weight'):
+            return int(emb.weight.size(0))
+        if hasattr(emb, 'num_embeddings'):
+            return int(emb.num_embeddings)
+    except AttributeError:
+        pass
+    lm = getattr(model, 'lm', model)
+    cfg = getattr(lm, 'config', None)
+    if cfg is not None and hasattr(cfg, 'vocab_size'):
+        return int(cfg.vocab_size)
+    raise AttributeError("Cannot determine embedding vocabulary size")
 
 
 def _prediction_head(model: nn.Module):

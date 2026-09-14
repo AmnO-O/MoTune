@@ -94,6 +94,11 @@ def main(argv=None) -> int:
     if args.command == 'smoke':
         return _run_smoke()
 
+    if cfg.debug_cuda:
+        import os
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        os.environ['TORCH_USE_CUDA_DSA'] = '1'
+
     import torch
     from mm.utils import get_device, get_logger, resolve_paths, set_seed
 

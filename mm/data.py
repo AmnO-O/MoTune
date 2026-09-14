@@ -282,9 +282,22 @@ class MlmDataset(_DatasetBase):
         self.mask_prob = mask_prob          # P([MASK]) over span tokens
         self.random_prob = random_prob      # P(random token) over span tokens
         self.seed = seed
-        # random-replacement tokens must sample the FULL vocabulary, not some
-        # hard-coded 32k default: fall back to the tokenizer's own vocab_size.
-        self.vocab_size = int(vocab_size or getattr(tokenizer, 'vocab_size', None) or 32000)
+        # random-replacement tokens must be EMBEDDABLE: never sample above the
+        # model's real vocabulary (which can differ from tokenizer.vocab_size,
+        # e.g. mmBERT: model 256k vs tokenizer 256k+added specials). The caller
+        # may pass the model's embedding-table width via `vocab_size`; clamp to
+        # the tokenizer's size too so ids are in range for BOTH.
+        tok_vocab = int(getattr(tokenizer, 'vocab_size', 0) or 0)
+        requested = int(vocab_size) if vocab_size else 0
+        self.vocab_size = requested or tok_vocab or 32000
+        if tok_vocab:
+            self.vocab_size = min(self.vocab_size, tok_vocab)
+        if requested and tok_vocab and requested != tok_vocab:
+            logger.warning(
+                'MlmDataset: tokenizer vocab=%d != model vocab=%d; '
+                'random-replacement ids clamped to [0, %d)',
+                tok_vocab, requested, self.vocab_size,
+            )
         self.rng = np.random.RandomState(seed)
 
         # pre-tokenize once; store (ids, mask, label) templates
@@ -315,6 +328,10 @@ class MlmDataset(_DatasetBase):
             self._base.append({'input_ids': input_ids, 'attention_mask': attention_mask})
 
     # ------------------------------------------------------------------ #
+    def _rand_token_id(self) -> int:
+        """Random replacement id that is guaranteed to be embeddable."""
+        return int(self.rng.randint(max(1, self.vocab_size)))
+
     def _span_positions(self, plan: Dict) -> Optional[List[int]]:
         spans = plan['spans']
         if spans is None:
@@ -343,7 +360,7 @@ class MlmDataset(_DatasetBase):
                 if r < self.mask_prob:
                     ids[p] = self.tokenizer.mask_token_id
                 elif r < self.mask_prob + self.random_prob:
-                    ids[p] = int(self.rng.randint(self.vocab_size or 32000))
+                    ids[p] = self._rand_token_id()
             labels[positions] = base['input_ids'][positions]
             return {
                 'input_ids': torch.tensor(ids, dtype=torch.long),
@@ -362,7 +379,7 @@ class MlmDataset(_DatasetBase):
             if r < self.mask_prob:
                 ids[p] = self.tokenizer.mask_token_id
             elif r < self.mask_prob + self.random_prob:
-                ids[p] = int(self.rng.randint(self.vocab_size or 32000))
+                ids[p] = self._rand_token_id()
         labels[chosen] = base['input_ids'][chosen]
         return {
             'input_ids': torch.tensor(ids, dtype=torch.long),
