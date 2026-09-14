@@ -115,11 +115,12 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
     adapters = apply_lora(model, rank=cfg.warmup_lora_rank,
                           alpha=cfg.warmup_lora_alpha,
                           dropout=cfg.warmup_lora_dropout,
-                          targets=cfg.lora_targets)
+                          targets=cfg.lora_targets,
+                          from_layer=cfg.lora_from_layer)
     wpaths = getattr(model, '_lora_paths', [])
     wtgt = getattr(model, '_lora_targets_used', None)
-    logger.info('warmup LoRA matched %d modules, e.g. %s%s',
-                len(wpaths), wpaths[:3],
+    logger.info('warmup LoRA matched %d modules (layers >= %d), e.g. %s%s',
+                len(wpaths), cfg.lora_from_layer, wpaths[:3],
                 f' (auto-fell back to targets {wtgt})' if wtgt else '')
 
     # freeze everything except LoRA + the pretrained MLM head
@@ -321,7 +322,8 @@ def run_predict(cfg: Config, logger: logging.Logger, device,
     def _predict(ckpt: str):
         model = build_model(cfg, device, load_from=load_from)
         adapters = apply_lora(model, rank=cfg.lora_rank, alpha=cfg.lora_alpha,
-                              dropout=cfg.lora_dropout, targets=cfg.lora_targets)
+                              dropout=cfg.lora_dropout, targets=cfg.lora_targets,
+                              from_layer=cfg.lora_from_layer)
         state = torch.load(ckpt, map_location=device, weights_only=True)
         model.load_state_dict(state)
         model.eval()

@@ -95,12 +95,13 @@ class Trainer:
             return []
         adapters = apply_lora(
             model, rank=self.cfg.lora_rank, alpha=self.cfg.lora_alpha,
-            dropout=self.cfg.lora_dropout, targets=self.cfg.lora_targets)
+            dropout=self.cfg.lora_dropout, targets=self.cfg.lora_targets,
+            from_layer=self.cfg.lora_from_layer)
         paths = getattr(model, '_lora_paths', [])
         wtgt = getattr(model, '_lora_targets_used', None)
-        self.logger.info('Applied LoRA: %d adapters (r=%d, alpha=%d) e.g. %s%s',
+        self.logger.info('Applied LoRA: %d adapters (r=%d, alpha=%d, layers >= %d) e.g. %s%s',
                          len(adapters), self.cfg.lora_rank, self.cfg.lora_alpha,
-                         paths[:3],
+                         self.cfg.lora_from_layer, paths[:3],
                          f' (auto-fell back to targets {wtgt})' if wtgt else '')
         return adapters
 

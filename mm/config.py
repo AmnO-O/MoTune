@@ -95,6 +95,9 @@ class Config:
     lora_alpha: int = 16
     lora_dropout: float = 0.1
     lora_targets: List[str] = field(default_factory=lambda: ['q_proj', 'k_proj', 'v_proj', 'o_proj'])
+    # Apply LoRA only to layer index >= this (0 = all 22 layers of mmBERT);
+    # top layers carry the compositional semantics.
+    lora_from_layer: int = 14
 
     # === optimization ===
     batch_size: int = 32
