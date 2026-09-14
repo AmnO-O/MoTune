@@ -206,7 +206,7 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
     ``[batch, seq, vocab]``, which alone (~1.2 GiB fp16 + 2.4 GiB fp32 copy)
     would OOM a 15 GiB T4 on top of the frozen encoder.
     """
-    from .model import _backbone, _embedding_vocab, _prediction_head
+    from .model import _backbone, _mlm_projection
 
     if not hasattr(optimizer, '_cmp_step_counter'):
         track_optimizer_steps(optimizer)
@@ -217,11 +217,14 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
     device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
 
     encoder = getattr(model, 'base_model', None) or _backbone(model)
-    head, head_name = _prediction_head(model)
+    head, decoder, head_name, vocab = _mlm_projection(model)
     if not getattr(model, '_warmup_head_logged', False):
         model._warmup_head_logged = True
-        logger.info('MLM head chosen: %s (%s), vocab=%s',
-                    type(head).__name__, head_name, _embedding_vocab(model))
+        from .utils import logger
+        logger.info('MLM head chosen: %s (%s), %s, vocab=%d',
+                    type(head).__name__, head_name,
+                    f'decoder={decoder[0]}' if decoder else 'vocab-decoder',
+                    vocab)
 
     for step_idx, batch in enumerate(dataloader, 1):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -233,14 +236,23 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
             labels = batch['labels']
             mask = labels != -100
             if mask.any():
-                # hidden [B,T,H] -> hidden[mask] [M,H] -> [M, vocab] -> [M, vocab]
-                logits = head(hidden[mask])
+                # run the (transform + decoder) head ONLY on the masked rows:
+                # hidden[B,T,H] -> rows[M,H] -> head -> [M,H] -> decoder -> [M,V]
+                rows = hidden[mask]
+                logits = head(rows)
+                if logits.size(-1) != vocab:
+                    if decoder is None:
+                        raise ValueError(
+                            f"MLM head '{head_name}' outputs {logits.size(-1)} "
+                            f"classes and no {vocab}-output decoder was found "
+                            "in the LM module tree")
+                    logits = FUNC.linear(logits, decoder[1].weight, decoder[1].bias)
                 targets = labels[mask]
                 if logits.size(-1) <= int(targets.max()):
                     raise ValueError(
-                        f"MLM head '{head_name}' outputs {logits.size(-1)} classes "
-                        f"but labels reach {int(targets.max())} — wrong head picked "
-                        "or tokenizer/model vocab mismatch")
+                        f"MLM head outputs {logits.size(-1)} classes but labels "
+                        f"reach {int(targets.max())} — wrong head picked or "
+                        "tokenizer/model vocab mismatch")
                 loss = criterion(logits.float(), targets) / accum_steps
             else:
                 loss = torch.zeros((), device=hidden.device, dtype=hidden.dtype)

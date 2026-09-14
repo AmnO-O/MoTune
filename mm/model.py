@@ -89,22 +89,20 @@ def _embedding_vocab(model: nn.Module) -> int:
 
 
 def _prediction_head(model: nn.Module):
-    """The MLM prediction head whose final Linear maps hidden -> model vocab.
+    """The MLM head exposed on the LM wrapper (transform, or already vocab).
 
-    Returns ``(module, name)``. Candidates are checked by their last Linear's
-    ``out_features`` against the base embedding table's width, so an unrelated
-    small classifier (e.g. a classification head also exposed as ``cls``) is
-    skipped instead of silently producing an index-out-of-range CUDA assert.
+    Returns ``(module, name)``. Prefers a head whose last child Linear already
+    projects to the embedding vocab (dense heads); otherwise falls back to the
+    first present candidate (e.g. the transform half of a
+    ModernBertPredictionHead, whose vocab projection is found separately by
+    ``_find_vocab_decoder``).
     """
     vocab = _embedding_vocab(model)
     attrs = ('cls', 'lm_head', 'head', 'classifier', 'decoder',
              'prediction_head')
     for attr in attrs:
         h = getattr(model.lm, attr, None)
-        if h is None:
-            continue
-        last = _last_linear_out(h)
-        if last is not None and last == vocab:
+        if h is not None and _last_linear_out(h) == vocab:
             return h, attr
     for attr in attrs:
         h = getattr(model.lm, attr, None)
@@ -113,6 +111,41 @@ def _prediction_head(model: nn.Module):
     raise AttributeError(
         f"Cannot locate the MLM prediction head among {attrs} "
         f"(embedding vocab={vocab})")
+
+
+def _find_vocab_decoder(model: nn.Module, vocab: int, hidden_size: int):
+    """The ``hidden -> vocab`` nn.Linear inside the LM head (its decoder).
+
+    ``_prediction_head`` may surface only the transform half of a
+    ModernBertPredictionHead (its last child Linear is ``hidden -> hidden``);
+    the vocabulary projection is a separate ``768 -> vocab`` Linear that
+    must be applied on top for the masked-MLM logits. Returns ``(name, module)``
+    or ``None`` when the head already projects straight to ``vocab``.
+    """
+    best, best_hit = None, False
+    for name, mod in model.lm.named_modules():
+        if not isinstance(mod, nn.Linear) or mod.out_features != vocab:
+            continue
+        hit = mod.in_features == hidden_size
+        if best is None or (hit and not best_hit):
+            best, best_hit = (name, mod), hit
+        if hit:
+            break
+    return best
+
+
+def _mlm_projection(model: nn.Module):
+    """Resolve (transform_head, vocab_decoder_or_None, head_name) for warmup.
+
+    Warms the pretrained MLM head by running the encoder without the huge
+    vocabulary head and projecting ONLY masked rows: ``decoder(head(rows))``
+    where ``head`` is the head's transform and ``decoder`` the (possibly tied)
+    ``hidden -> vocab`` linear.
+    """
+    vocab = _embedding_vocab(model)
+    head, head_name = _prediction_head(model)
+    decoder = _find_vocab_decoder(model, vocab, head_in := _last_linear_out(head))
+    return head, decoder, head_name, vocab
 
 
 # --------------------------------------------------------------------------- #

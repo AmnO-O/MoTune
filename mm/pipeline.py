@@ -40,7 +40,8 @@ def _load_all(cfg: Config, logger: logging.Logger) -> List[Dict]:
     from mm.data import load_aux, load_labeled
     rows = load_labeled(cfg)
     if cfg.aux_data_paths:
-        rows += load_aux(cfg)
+        aux_rows = load_aux(cfg)
+        rows.extend(aux_rows)
     return rows
 
 
@@ -65,7 +66,9 @@ def _resolve_trial_path(cfg: Config, data_dir: Path) -> Path:
 def _load_trial(cfg: Config, data_dir: Path) -> List[Dict]:
     from mm.data import _df_to_rows, read_tsv
     path = _resolve_trial_path(cfg, data_dir)
-    rows = _df_to_rows(read_tsv(path.as_posix()), path.name, 'en')
+    # Tối ưu: Lấy ngôn ngữ động từ config thay vì gán cứng 'en'
+    lang = getattr(cfg, 'lang', 'en')
+    rows = _df_to_rows(read_tsv(path.as_posix()), path.name, lang)
     return rows
 
 
@@ -79,7 +82,6 @@ def _warmup_snapshot(output_dir: Path) -> Optional[Path]:
     p = Path(output_dir) / 'models' / 'warmup_merged.pt'
     return p if p.is_file() else None
 
-
 # --------------------------------------------------------------------------- #
 # phase 0: compound-aware MLM warmup + LoRA merge
 # --------------------------------------------------------------------------- #
@@ -89,13 +91,17 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
         logger.info('warmup disabled (warmup_mlm_epochs=0)')
         return {'warmup_epochs': 0}
 
+    import torch
     import torch.nn as nn
+    from torch.amp import GradScaler
+    from torch.optim import AdamW
     from torch.utils.data import DataLoader
     from transformers import get_linear_schedule_with_warmup as _linearsched
 
     from mm.data import MlmDataset, _mlm_worker_init_fn, collate_mlm, load_mlm_rows
     from mm.model import (_backbone, _embedding_vocab, apply_lora, build_model,
                           lora_parameters, merge_lora)
+    from mm.train import track_optimizer_steps, warmup_epoch
 
     logger.info('=== warmup: compound-aware MLM (epochs=%d, mask_span=%s) ===',
                 cfg.warmup_mlm_epochs, cfg.mlm_mask_span)
@@ -125,48 +131,65 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
                 len(wpaths), cfg.lora_from_layer, wpaths[:3],
                 f' (auto-fell back to targets {wtgt})' if wtgt else '')
 
-    # freeze everything except LoRA + the pretrained MLM head
-    base_ids = {id(p) for p in _backbone(model).parameters()}
-    mlm_head = [p for n, p in model.lm.named_parameters() if id(p) not in base_ids]
+    # 1. Đóng băng toàn bộ tham số của mô hình
     for p in model.parameters():
         p.requires_grad = False
-    for p in lora_parameters(adapters):
-        p.requires_grad = True
-    for p in mlm_head:
-        p.requires_grad = True
-    logger.info('warmup trainable: %d LoRA + %d MLM-head params',
-                len(lora_parameters(adapters)), len(mlm_head))
 
-    from torch.optim import AdamW
+    # 2. Lọc chính xác các tham số MLM Head (nằm ngoài base transformer backbone)
+    base_ids = {id(p) for p in _backbone(model).parameters()}
+    mlm_head_params = [p for n, p in model.lm.named_parameters() if id(p) not in base_ids]
+
+    # 3. Lấy danh sách tham số LoRA
+    lora_params = lora_parameters(adapters)
+
+    # 4. Kích hoạt grad cho LoRA và MLM Head
+    for p in lora_params:
+        p.requires_grad = True
+    for p in mlm_head_params:
+        p.requires_grad = True
+
+    # 5. Khử trùng lặp qua Dict ID (đảm bảo an toàn tuyệt đối cho AdamW)
+    trainable_params = list({id(p): p for p in (lora_params + mlm_head_params)}.values())
+    logger.info('warmup trainable: %d unique parameter tensors (%d LoRA, %d MLM Head)',
+                len(trainable_params), len(lora_params), len(mlm_head_params))
+
+    # 6. Khởi tạo Optimizer & Scheduler
     optimizer = AdamW([
-        {'params': lora_parameters(adapters) + mlm_head,
-         'lr': cfg.warmup_lr, 'weight_decay': 0.01},
+        {'params': trainable_params, 'lr': cfg.warmup_lr, 'weight_decay': 0.01},
     ])
-    from mm.train import track_optimizer_steps
     track_optimizer_steps(optimizer)
-    steps = len(loader) * cfg.warmup_mlm_epochs
-    scheduler = _linearsched(optimizer, num_warmup_steps=int(steps * cfg.warmup_warmup_ratio),
-                             num_training_steps=steps)
 
-    from torch.amp import GradScaler
-    scaler = GradScaler('cuda', enabled=(device.type == 'cuda'),
-                        init_scale=cfg.amp_init_scale,
-                        growth_interval=cfg.amp_growth_interval)
+    steps = len(loader) * cfg.warmup_mlm_epochs
+    scheduler = _linearsched(
+        optimizer,
+        num_warmup_steps=int(steps * cfg.warmup_warmup_ratio),
+        num_training_steps=steps
+    )
+
+    scaler = GradScaler(
+        'cuda',
+        enabled=(device.type == 'cuda'),
+        init_scale=cfg.amp_init_scale,
+        growth_interval=cfg.amp_growth_interval
+    )
     criterion = nn.CrossEntropyLoss()
 
-    from mm.train import warmup_epoch
+    # 7. Huấn luyện Warmup
     for epoch in range(1, cfg.warmup_mlm_epochs + 1):
-        loss = warmup_epoch(model, loader, optimizer, scheduler, criterion, scaler,
-                            device, grad_clip=cfg.grad_clip,
-                            accum_steps=cfg.accum_steps)
+        loss = warmup_epoch(
+            model, loader, optimizer, scheduler, criterion, scaler,
+            device, grad_clip=cfg.grad_clip, accum_steps=cfg.accum_steps
+        )
         logger.info('warmup epoch %d/%d | MLM loss %.4f', epoch,
                     cfg.warmup_mlm_epochs, loss)
 
+    # 8. Gộp LoRA trọng số và lưu Snapshot
     merge_lora(model, adapters)
     out = Path(output_dir) / 'models' / 'warmup_merged.pt'
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), out)
     logger.info('warmup LoRA merged + snapshot saved: %s', out)
+
     return {'warmup_epochs': cfg.warmup_mlm_epochs}
 
 

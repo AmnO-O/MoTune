@@ -1,8 +1,4 @@
-"""Process-level utilities: seeding, device, logging, path auto-detection.
-
-Ported from the old ``src/utils.py`` — these are battle-tested on Kaggle
-(auto-detection of the mounted dataset / working dir) and kept untouched.
-"""
+"""Process-level utilities: seeding, device, logging, path auto-detection."""
 
 from __future__ import annotations
 
@@ -25,6 +21,7 @@ _KAGGLE_WORKING = Path('/kaggle/working')
 
 
 def set_seed(seed: int) -> None:
+    os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     try:
@@ -34,7 +31,9 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.benchmark = True
+        # Đảm bảo tính tái lập 100% thay vì ưu tiên tối ưu tốc độ cuDNN
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def get_device():
@@ -48,23 +47,29 @@ def get_device():
 def get_logger(name: str = 'mm', log_dir: Optional[str | Path] = None,
                level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
-
     logger.setLevel(level)
     logger.propagate = False
     formatter = logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE)
 
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(formatter)
-    logger.addHandler(stream)
+    # Thêm StreamHandler nếu chưa có handler nào
+    if not logger.handlers:
+        stream = logging.StreamHandler(sys.stdout)
+        stream.setFormatter(formatter)
+        logger.addHandler(stream)
 
     if log_dir is not None:
         log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_dir / 'run.log', encoding='utf-8')
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        log_file = log_dir / 'run.log'
+        
+        has_file_handler = any(
+            isinstance(h, logging.FileHandler) and Path(h.baseFilename) == log_file.resolve() 
+            for h in logger.handlers
+        )
+        if not has_file_handler:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
     return logger
 
@@ -73,13 +78,6 @@ logger = get_logger('mm')
 
 
 def _find_data_dir() -> Optional[Path]:
-    """Locate the directory that actually contains the train file.
-
-    On Kaggle the repo is mounted at ``/kaggle/input/datasets/ieltsmater/
-    compartment/Compartment``; its data lives one level deeper in a ``dataset/``
-    subfolder (``dataset/*.tsv`` are gitignored but re-uploaded with the repo),
-    or the row files sit directly at the input root. Locally it's ``dataset/``.
-    """
     candidates: List[Path] = []
     if _KAGGLE_DATASET.is_dir():
         candidates += [_KAGGLE_DATASET / 'dataset', _KAGGLE_DATASET]

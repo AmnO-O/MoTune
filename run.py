@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
-"""Single CLI entry point for the mmBERT compositionality pipeline.
-
-Usage
------
-    python run.py train5                             # defaults
-    python run.py train5 --config config/en_nn.yaml  # config file (YAML or JSON)
-    python run.py train80 --set batch_size=16 --set freeze_epochs=2
-    python run.py predict --config config/en_nn.yaml
-    python run.py smoke                              # local (no-torch) checks
-"""
+"""Single CLI entry point for the mmBERT compositionality pipeline."""
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -30,12 +22,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('command', choices=_COMMANDS)
     p.add_argument(
         '--config', type=Path, metavar='PATH',
-        help='YAML or JSON config file applied on top of defaults '
-             '(before --set overrides).',
+        help='YAML or JSON config file applied on top of defaults (before --set overrides).'
     )
     p.add_argument(
         '--set', action='append', default=[], metavar='KEY=VALUE',
-        help='override a config knob (repeatable). Lists are comma-separated.',
+        help='override a config knob (repeatable). Lists are comma-separated.'
     )
     p.add_argument('--data-path', type=str, help='override data_path')
     p.add_argument('--output-dir', type=str, help='override output_dir')
@@ -45,7 +36,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _set_overrides(args: argparse.Namespace) -> Dict[str, object]:
-    """Turn ``--set k=v`` flags into a typed config dict."""
     out: Dict[str, object] = {}
     for item in args.set:
         if '=' not in item:
@@ -71,8 +61,7 @@ def _merge(cfg: Config, args: argparse.Namespace) -> Config:
         overrides['output_dir'] = args.output_dir
     if args.seed is not None:
         overrides['seed'] = args.seed
-    # only the training commands map onto a validated `mode`; probe/warmup are
-    # data/phase-0 stages and must leave cfg.mode untouched (or validation fails)
+        
     if args.command in _TRAIN_MODES:
         overrides['mode'] = args.command
     return cfg.update(**overrides)
@@ -94,8 +83,8 @@ def main(argv=None) -> int:
     if args.command == 'smoke':
         return _run_smoke()
 
+    # THIẾT LẬP MÔI TRƯỜNG TRƯỚC KHI IMPORT TORCH
     if cfg.debug_cuda:
-        import os
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
         os.environ['TORCH_USE_CUDA_DSA'] = '1'
 
@@ -139,8 +128,9 @@ def main(argv=None) -> int:
         entry(cfg, logger, device, data_dir, output_dir)
     except Exception as exc:
         logger.error('%s: %s', type(exc).__name__, exc)
-        import traceback
-        traceback.print_exc()
+        if args.debug:
+            import traceback
+            traceback.print_exc()
         return 1
 
     logger.info('Finished in %s', datetime.now() - started)
@@ -148,7 +138,6 @@ def main(argv=None) -> int:
 
 
 def _run_smoke() -> int:
-    """Run the local no-torch smoke checks as a subprocess."""
     root = Path(__file__).resolve().parent
     result = subprocess.run(
         [sys.executable, str(root / 'tests' / 'smoke_mm.py')],
