@@ -1,17 +1,11 @@
 """Owns the full scoring fit loop for one split/fold (ported from src/trainer.py).
 
-Adapted for the mmBERT rebuild:
-  * LoRA adapter is applied to the backbone ONCE per fit; the adapter weights
-    live in the same state_dict (so fold checkpoints are self-contained).
-  * Phase 1 = frozen encoder + LoRA + heads; Phase 2 additionally unfreezes
-    top ``unfreeze_from_layer..last``. Embeddings train only if
-    ``embedding_lr > 0`` (mmBERT table ~197M, default frozen).
-  * Rows that did not align (has_mod/has_head False) or German-closed
-    degenerate rows are excluded from span supervision inside train_epoch.
+Adapted for the mmBERT rebuild with safety logging and memory protection.
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 from dataclasses import dataclass
@@ -63,31 +57,37 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     def _build_loaders(self, train_rows, val_rows, tokenizer):
-        train_ds = CompDataset(train_rows, tokenizer,
-                               max_len=self.cfg.max_context_length)
-        val_ds = CompDataset(val_rows, tokenizer,
-                             max_len=self.cfg.max_context_length)
-        use_workers = self.cfg.num_workers > 0
+        self.logger.info("Building Datasets & Tokenizing %d train / %d val rows...", len(train_rows), len(val_rows))
+        train_ds = CompDataset(train_rows, tokenizer, max_len=self.cfg.max_context_length)
+        val_ds = CompDataset(val_rows, tokenizer, max_len=self.cfg.max_context_length)
+        
+        # Chỉ bật persistent_workers khi num_workers > 0 để tránh deadlock
+        num_workers = max(0, self.cfg.num_workers)
+        use_workers = num_workers > 0
         is_cuda = (getattr(self.device, 'type', '') == 'cuda')
+        
         if self.cfg.lambda_rank > 0:
             cids = [r['compound_id'] for r in train_rows]
             self._train_sampler = CompoundGroupSampler(
                 cids, batch_size=self.cfg.batch_size, seed=self.cfg.seed)
             train_loader = DataLoader(
                 train_ds, batch_size=self.cfg.batch_size, shuffle=False,
-                sampler=self._train_sampler, num_workers=self.cfg.num_workers,
+                sampler=self._train_sampler, num_workers=num_workers,
                 pin_memory=is_cuda, persistent_workers=use_workers,
                 collate_fn=collate_comp)
         else:
             self._train_sampler = None
             train_loader = DataLoader(
                 train_ds, batch_size=self.cfg.batch_size, shuffle=True,
-                num_workers=self.cfg.num_workers, pin_memory=is_cuda,
+                num_workers=num_workers, pin_memory=is_cuda,
                 persistent_workers=use_workers, collate_fn=collate_comp)
+                
         val_loader = DataLoader(
             val_ds, batch_size=self.cfg.batch_size * 2, shuffle=False,
-            num_workers=self.cfg.num_workers, pin_memory=is_cuda,
+            num_workers=num_workers, pin_memory=is_cuda,
             persistent_workers=use_workers, collate_fn=collate_comp)
+            
+        self.logger.info("DataLoaders ready (num_workers=%d, pin_memory=%s)", num_workers, is_cuda)
         return train_loader, val_loader
 
     def _apply_lora(self, model):
@@ -122,7 +122,7 @@ class Trainer:
         if others:
             groups.append({'params': others, 'lr': self.cfg.encoder_lr,
                            'weight_decay': self.cfg.weight_decay})
-        self.logger.info('phase %d param groups: %s',
+        self.logger.info('Phase %d param groups: %s',
                          phase, [len(g['params']) for g in groups])
         return groups
 
@@ -163,8 +163,10 @@ class Trainer:
     # ------------------------------------------------------------------ #
     def fit(self, train_rows, val_rows, tokenizer, fold: Optional[int] = None,
             ckpt_name: str = 'best.pt', load_from: Optional[str | Path] = None) -> FoldResult:
+        
         train_loader, val_loader = self._build_loaders(train_rows, val_rows, tokenizer)
 
+        self.logger.info("Building model architecture (load_from=%s)...", load_from)
         model = build_model(self.cfg, self.device, load_from=load_from)
         adapters = self._apply_lora(model)
 
@@ -205,16 +207,24 @@ class Trainer:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = ckpt_dir / ckpt_name
 
+        self.logger.info("Starting training loop for %d epochs...", self.cfg.total_epochs)
+
         for epoch in range(self.cfg.total_epochs):
             if self._train_sampler is not None:
                 self._train_sampler.set_epoch(epoch)
+                
             if epoch == self.cfg.freeze_epochs and self.cfg.freeze_epochs > 0:
-                if self.device.type == 'cuda':
-                    torch.cuda.empty_cache()
                 self.logger.info(
                     '>>> Entering Phase 2 (unfreezing LoRA%s) at epoch %d <<<',
                     f', top layers from {self.cfg.unfreeze_from_layer}' if self.cfg.unfreeze_from_layer > 0 else '',
                     epoch + 1)
+                
+                # Giải phóng optimizer & scheduler cũ để tránh đọng VRAM
+                del optimizer, scheduler
+                gc.collect()
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                    
                 self._unfreeze_phase2(model, adapters)
                 optimizer, scheduler = self._optimizer(
                     model, adapters, phase=2,
@@ -222,6 +232,7 @@ class Trainer:
 
             phase = 'FROZEN' if epoch < self.cfg.freeze_epochs else 'UNFROZEN-TOP'
             diag: Dict[str, float] = {}
+            
             train_loss = train_epoch(
                 model, train_loader, optimizer, scheduler, criterion, scaler,
                 self.device, grad_clip=self.cfg.grad_clip,
@@ -232,7 +243,7 @@ class Trainer:
                 compound_weight=self.cfg.lambda_compound,
             )
 
-            # Compute train rho directly from in-epoch predictions (saves full duplicate pass)
+            # Compute train rho directly from in-epoch predictions
             if 'train_preds' in diag:
                 tr_m, tr_h, tr_my, tr_hy, tr_al = diag['train_preds']
                 tr_rho_m = _safe_rho(tr_my[tr_al], tr_m[tr_al]) if tr_al.any() else 0.0
@@ -286,6 +297,10 @@ class Trainer:
 
         if best is None:
             raise RuntimeError('No improvement over any epoch - check the hyperparameters.')
+            
+        # Dọn dẹp GPU sạch đống rác sau khi fit xong 1 fold
+        del model, optimizer, scheduler, criterion
+        gc.collect()
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 

@@ -245,15 +245,12 @@ def run_train80(cfg: Config, logger: logging.Logger, device,
 # --------------------------------------------------------------------------- #
 def run_train5(cfg: Config, logger: logging.Logger, device,
                data_dir: Path, output_dir: Path) -> Dict[str, float]:
-    logger.info('=== MODE: train5 (stratified %d-fold CV, compounds never leaked) ===',
-                cfg.n_splits)
+    logger.info('=== MODE: train5 (stratified %d-fold CV, compounds never leaked) ===', cfg.n_splits)
     rows = _load_all(cfg, logger)
     from mm.folds import assign_folds
     rows = assign_folds(rows, n_splits=cfg.n_splits, seed=cfg.seed)
 
     tokenizer = _tokenizer(cfg, logger)
-    from mm.trainer import Trainer
-    trainer = Trainer(cfg, device, logger, output_dir)
     load_from = _warmup_snapshot(output_dir)
 
     n_rows = len(rows)
@@ -263,12 +260,16 @@ def run_train5(cfg: Config, logger: logging.Logger, device,
     fold_results: List[Dict] = []
     all_history: List[Dict] = []
 
+    from mm.trainer import Trainer
+
     for fold in range(cfg.n_splits):
         logger.info('=' * 60)
         logger.info('FOLD %d', fold)
         logger.info('=' * 60)
         val_rows = [r for r in rows if r['fold'] == fold]
         train_rows = [r for r in rows if r['fold'] != fold]
+
+        trainer = Trainer(cfg, device, logger, output_dir)
 
         result = trainer.fit(train_rows, val_rows, tokenizer, fold=fold,
                              ckpt_name=f'fold{fold}_best.pt', load_from=load_from)
@@ -285,6 +286,11 @@ def run_train5(cfg: Config, logger: logging.Logger, device,
             'rho_mean': round(result.rho_mean, 5),
             'best_epoch': result.best_epoch,
         })
+
+        # 2. XÓA SẠCH BỘ NHỚ VRAM & RAM SAU MỖI FOLD
+        del trainer
+        import gc
+        gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
@@ -318,7 +324,6 @@ def run_train5(cfg: Config, logger: logging.Logger, device,
     logger.info('OOF Mod ρ %.4f | OOF Head ρ %.4f | OOF Mean ρ %.4f',
                 oof_rho_mod, oof_rho_head, oof_rho_mean)
     return {k: metrics[k] for k in ('oof_rho_mean', 'oof_rho_mod', 'oof_rho_head')}
-
 
 # --------------------------------------------------------------------------- #
 # predict - trial predictions + submission file
