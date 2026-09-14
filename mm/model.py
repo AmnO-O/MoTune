@@ -539,7 +539,8 @@ class MMBertRegressor(nn.Module):
 
     def forward(self, batch, with_logits: bool = False, with_reps: bool = False,
                 with_lm: bool = False):
-        if with_logits or self.use_lm_features:
+        need_lm = (with_logits and self.head_mode != 'softmax') or self.use_lm_features
+        if need_lm:
             outputs = self.lm(
                 input_ids=batch['input_ids'],
                 attention_mask=batch['attention_mask'],

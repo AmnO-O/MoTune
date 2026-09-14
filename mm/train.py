@@ -44,6 +44,11 @@ def track_optimizer_steps(optimizer) -> None:
 
 
 def _supervised_term(criterion, pred, target, logits, std, cid, allowed):
+    # Compute anchor BEFORE any indexing so requires_grad is preserved.
+    # Boolean indexing on an empty result drops requires_grad in PyTorch;
+    # anchoring to the full pred.sum()*0 ensures .backward() works even
+    # when all rows are filtered (backbone frozen, only heads trainable).
+    _zero = pred.sum() * 0.0
     if allowed is not None:
         pred = pred[allowed]
         target = target[allowed]
@@ -51,10 +56,7 @@ def _supervised_term(criterion, pred, target, logits, std, cid, allowed):
         std = std[allowed] if std is not None else None
         cid = cid[allowed] if cid is not None else None
         if pred.numel() == 0:
-            # Return a graph-connected zero so .backward() works even when the
-            # backbone is fully frozen (no detached leaf — use pred.sum()*0 which
-            # has a grad_fn tied to the model forward graph).
-            return pred.sum() * 0.0
+            return _zero
     return criterion(pred, target, logits, std, compound_ids=cid)
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
                 grad_clip=1.0, accum_steps=1, report=None,
@@ -133,6 +135,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                     head_pred, batch['head_avg'], center_ids,
                 )
                 loss = loss + compound_weight * center
+
+            if not loss.requires_grad:
+                loss = loss + (mod_pred.sum() + head_pred.sum()) * 0.0
 
             loss = loss / accum_steps
 
