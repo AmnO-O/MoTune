@@ -221,7 +221,14 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
                         f'but {sel.numel()} non-[-100] labels')
                 loss = criterion(logits, sel) / accum_steps
             else:
-                loss = criterion(logits, labels) / accum_steps
+                # Standard dense MLM logits [batch, seq_len, vocab]: index only
+                # non-[-100] positions to avoid shape mismatch and save computing
+                # 256k-vocab softmax over unmasked/padded tokens.
+                mask = (labels != -100)
+                if mask.any():
+                    loss = criterion(logits[mask], labels[mask]) / accum_steps
+                else:
+                    loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
         scaler.scale(loss).backward()
         if step_idx % accum_steps == 0 or step_idx == n_micro:
             scaler.unscale_(optimizer)
