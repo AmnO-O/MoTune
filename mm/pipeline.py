@@ -44,12 +44,28 @@ def _load_all(cfg: Config, logger: logging.Logger) -> List[Dict]:
     return rows
 
 
+def _resolve_trial_path(cfg: Config, data_dir: Path) -> Path:
+    """Find the trial file wherever it lives relative to the data dir.
+
+    Kaggle layout mounts the repo with ``dataset/`` (data) and ``trial/``
+    (trial rows) as siblings; locally the trial may sit directly in data_dir.
+    """
+    cands = [
+        data_dir / 'trial' / cfg.trial_file,
+        data_dir.parent / 'trial' / cfg.trial_file,
+        data_dir / cfg.trial_file,
+    ]
+    for c in cands:
+        if c.is_file():
+            return c
+    raise FileNotFoundError(
+        f'Trial data not found (looked in {[str(c) for c in cands]})')
+
+
 def _load_trial(cfg: Config, data_dir: Path) -> List[Dict]:
     from mm.data import _df_to_rows, read_tsv
-    path = data_dir / cfg.trial_file
-    if not path.is_file():
-        raise FileNotFoundError(f'Trial data not found at {path}')
-    rows = _df_to_rows(read_tsv(path), cfg.trial_file, 'en')
+    path = _resolve_trial_path(cfg, data_dir)
+    rows = _df_to_rows(read_tsv(path.as_posix()), path.name, 'en')
     return rows
 
 

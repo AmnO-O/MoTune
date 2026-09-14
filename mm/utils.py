@@ -11,7 +11,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -68,15 +68,32 @@ def get_logger(name: str = 'mm', log_dir: Optional[str | Path] = None,
     return logger
 
 
-def _auto_data_path() -> Path:
+def _find_data_dir() -> Optional[Path]:
+    """Locate the directory that actually contains the train file.
+
+    On Kaggle the repo is mounted at ``/kaggle/input/datasets/ieltsmater/
+    compartment/Compartment``; its data lives one level deeper in a ``dataset/``
+    subfolder (``dataset/*.tsv`` are gitignored but re-uploaded with the repo),
+    or the row files sit directly at the input root. Locally it's ``dataset/``.
+    """
+    candidates: List[Path] = []
     if _KAGGLE_DATASET.is_dir():
-        return _KAGGLE_DATASET
-    local = Path('dataset')
-    if local.is_dir():
-        return local
+        candidates += [_KAGGLE_DATASET / 'dataset', _KAGGLE_DATASET]
+    candidates += [Path('dataset')]
+    for c in candidates:
+        if (c / 'en-nn-train.tsv').is_file():
+            return c
+    return None
+
+
+def _auto_data_path() -> Path:
+    d = _find_data_dir()
+    if d is not None:
+        return d
     raise RuntimeError(
-        'Training data not found. Mount the Compartment Kaggle dataset or '
-        'place dataset/ locally, or set data_path in the config.'
+        'Training data not found (need en-nn-train.tsv + friends). Mount the '
+        'Compartment Kaggle dataset with a dataset/ folder, keep dataset/ '
+        'locally, or set data_path in the config.'
     )
 
 
