@@ -220,7 +220,19 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
         with autocast(device_type):
             outputs = model.lm(input_ids=batch['input_ids'],
                                attention_mask=batch['attention_mask'])
-            loss = criterion(outputs.logits.float(), batch['labels']) / accum_steps
+            logits = outputs.logits.float()
+            labels = batch['labels']
+            if logits.dim() == 2:
+                # ModernBERT sparse prediction: logits [num_masked, vocab], only
+                # for positions where masks/labels were not -100.
+                sel = labels[labels != -100]
+                if sel.numel() != logits.shape[0]:
+                    raise RuntimeError(
+                        f'sparse MLM mismatch: {logits.shape[0]} sparse logit rows '
+                        f'but {sel.numel()} non-[-100] labels')
+                loss = criterion(logits, sel) / accum_steps
+            else:
+                loss = criterion(logits, labels) / accum_steps
         scaler.scale(loss).backward()
         if step_idx % accum_steps == 0 or step_idx == n_micro:
             scaler.unscale_(optimizer)
