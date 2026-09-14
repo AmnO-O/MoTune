@@ -195,7 +195,16 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
 def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
                  grad_clip=1.0, accum_steps=1):
-    """One compound-aware MLM warmup epoch (CrossEntropy on -100-masked labels)."""
+    """One compound-aware MLM warmup epoch (CrossEntropy on -100-masked labels).
+
+    Runs the base transformer WITHOUT the 256k-vocab prediction head, then
+    applies the MLM head only to the masked positions (``labels != -100``).
+    This sidesteps ModernBERT's fully-materialised dense logits
+    ``[batch, seq, vocab]``, which alone (~1.2 GiB fp16 + 2.4 GiB fp32 copy)
+    would OOM a 15 GiB T4 on top of the frozen encoder.
+    """
+    from .model import _backbone, _prediction_head
+
     if not hasattr(optimizer, '_cmp_step_counter'):
         track_optimizer_steps(optimizer)
     step_counter = getattr(optimizer, '_cmp_step_counter', None)
@@ -204,31 +213,24 @@ def warmup_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, dev
     optimizer.zero_grad()
     device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
 
+    encoder = getattr(model, 'base_model', None) or _backbone(model)
+    head = _prediction_head(model)
+
     for step_idx, batch in enumerate(dataloader, 1):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         with autocast(device_type):
-            outputs = model.lm(input_ids=batch['input_ids'],
-                               attention_mask=batch['attention_mask'])
-            logits = outputs.logits.float()
+            outputs = encoder(input_ids=batch['input_ids'],
+                              attention_mask=batch['attention_mask'])
+            hidden = (getattr(outputs, 'last_hidden_state', None)
+                      or outputs[0])
             labels = batch['labels']
-            if logits.dim() == 2:
-                # ModernBERT sparse prediction: logits [num_masked, vocab], only
-                # for positions where masks/labels were not -100.
-                sel = labels[labels != -100]
-                if sel.numel() != logits.shape[0]:
-                    raise RuntimeError(
-                        f'sparse MLM mismatch: {logits.shape[0]} sparse logit rows '
-                        f'but {sel.numel()} non-[-100] labels')
-                loss = criterion(logits, sel) / accum_steps
+            mask = labels != -100
+            if mask.any():
+                # hidden [B,T,H] -> hidden[mask] [M,H] -> [M, vocab] -> [M, vocab]
+                logits = head(hidden[mask])
+                loss = criterion(logits.float(), labels[mask]) / accum_steps
             else:
-                # Standard dense MLM logits [batch, seq_len, vocab]: index only
-                # non-[-100] positions to avoid shape mismatch and save computing
-                # 256k-vocab softmax over unmasked/padded tokens.
-                mask = (labels != -100)
-                if mask.any():
-                    loss = criterion(logits[mask], labels[mask]) / accum_steps
-                else:
-                    loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
+                loss = torch.zeros((), device=hidden.device, dtype=hidden.dtype)
         scaler.scale(loss).backward()
         if step_idx % accum_steps == 0 or step_idx == n_micro:
             scaler.unscale_(optimizer)
