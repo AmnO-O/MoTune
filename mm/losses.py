@@ -191,11 +191,22 @@ class CombinedLoss(nn.Module):
             denom = w.sum(-1, keepdim=True)
         return w / denom
 
+    # def _ce(self, logits: torch.Tensor, target: torch.Tensor,
+    #         std: Optional[torch.Tensor] = None) -> torch.Tensor:
+    #     log_p = torch.log_softmax(torch.clamp(logits.float(), -50.0, 50.0), dim=-1)
+    #     soft = self._soft_target(target.float(), std)
+    #     return -(soft * log_p).sum(dim=-1).mean()
+
     def _ce(self, logits: torch.Tensor, target: torch.Tensor,
             std: Optional[torch.Tensor] = None) -> torch.Tensor:
-        log_p = torch.log_softmax(torch.clamp(logits.float(), -50.0, 50.0), dim=-1)
-        soft = self._soft_target(target.float(), std)
-        return -(soft * log_p).sum(dim=-1).mean()
+        # 1. Đầu ra mô hình Q (cần dùng log_softmax)
+        log_q = F.log_softmax(torch.clamp(logits.float(), -50.0, 50.0), dim=-1)
+        
+        # 2. Nhãn mềm P (Phân phối xác suất từ avg & std)
+        p_target = self._soft_target(target.float(), std)
+        
+        # 3. Tính KL-Divergence chuẩn PyTorch
+        return F.kl_div(log_q, p_target, reduction='batchmean')
 
     def _weights(self, pred: torch.Tensor, std: Optional[torch.Tensor] = None):
         if self.std_alpha <= 0 or std is None:
