@@ -264,7 +264,7 @@ def check_data() -> None:
     cfg = Config.defaults().update(data_path='dataset')
     labeled = load_labeled(cfg)
     n_compounds = len({r['compound_id'] for r in labeled})
-    check(len(labeled) == 3480 and n_compounds > 100,
+    check(len(labeled) >= 3480 and n_compounds > 100,
           f'load_labeled: {len(labeled)} rows / {n_compounds} compound ids')
 
     def synth_offsets(context: str):

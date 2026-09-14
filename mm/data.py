@@ -260,8 +260,9 @@ class CompDataset(_DatasetBase):
         offsets = enc['offset_mapping'].squeeze(0).tolist()
         length = input_ids.size(0)
 
-        result: SpanResult = find_spans(r['context'], offsets, r['mod'], r['head']) \
-            if (r['mod'] and r['head']) \
+        result: SpanResult = find_spans(
+            r['context'], offsets, r['mod'], r['head'], r.get('compound', '')
+        ) if (r['mod'] and r['head']) \
             else SpanResult(Span(None, None), Span(None, None), found=False)
 
         return {
@@ -356,7 +357,9 @@ class MlmDataset(_DatasetBase):
 
             r_sp = None
             if r['mod'] and r['head']:
-                res = find_spans(r['context'], offsets, r['mod'], r['head'])
+                res = find_spans(
+                    r['context'], offsets, r['mod'], r['head'], r.get('compound', '')
+                )
                 if res.found and not res.degenerate:
                     r_sp = {
                         'mod': list(range(res.mod.start, res.mod.end)),

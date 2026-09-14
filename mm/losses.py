@@ -41,7 +41,7 @@ def margin_rank_loss(
 
     n = pred.shape[0]
     if n < 2:
-        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return pred.sum() * 0.0   # graph-connected zero
 
     target_diff = target[:, None] - target[None, :]
     pred_diff = pred[:, None] - pred[None, :]
@@ -51,7 +51,7 @@ def margin_rank_loss(
         mask = mask & (compound_ids[:, None] == compound_ids[None, :]) & (compound_ids[:, None] >= 0)
 
     if not mask.any():
-        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return pred.sum() * 0.0   # graph-connected zero
 
     dynamic_margin = torch.clamp(target_diff[mask], max=margin) if mode == 'clamp' \
         else target_diff[mask]
@@ -78,7 +78,7 @@ def compound_consistency_loss(
     ids = compound_ids.to(rep.device)
     keep = ids >= 0
     if not keep.any():
-        return torch.zeros((), device=rep.device, dtype=rep.dtype)
+        return rep.sum() * 0.0   # graph-connected zero; .backward() works in frozen phase
     ids, rep = ids[keep], rep[keep]
 
     if mode == 'pull':
@@ -92,14 +92,14 @@ def compound_consistency_loss(
 
     n = rep.shape[0]
     if n < 2:
-        return torch.zeros((), device=rep.device, dtype=rep.dtype)
+        return rep.sum() * 0.0   # graph-connected zero
     rep = F.normalize(rep, dim=-1)
     logits = rep @ rep.t() / temp
     same = (ids[:, None] == ids[None, :]).float()
     pos = same - torch.eye(n, device=rep.device, dtype=rep.dtype)
     has_pos = pos.sum(-1) > 0
     if not has_pos.any():
-        return torch.zeros((), device=rep.device, dtype=rep.dtype)
+        return rep.sum() * 0.0   # graph-connected zero
     num_pos = pos.sum(-1).clamp(min=1.0)
     log_p = F.log_softmax(logits, dim=-1)
     loss_per_row = (pos * log_p).sum(-1) / num_pos
@@ -129,7 +129,7 @@ def compound_center_loss(pred: torch.Tensor, target: torch.Tensor,
     pred = pred.float()
     labeled = (~torch.isnan(target)) & (ids >= 0)
     if not labeled.any():
-        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return pred.sum() * 0.0   # graph-connected zero; .backward() works in frozen phase
 
     p, t = pred[labeled], target[labeled]
     g = ids[labeled]

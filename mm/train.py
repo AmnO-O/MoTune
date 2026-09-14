@@ -51,7 +51,10 @@ def _supervised_term(criterion, pred, target, logits, std, cid, allowed):
         std = std[allowed] if std is not None else None
         cid = cid[allowed] if cid is not None else None
         if pred.numel() == 0:
-            return torch.zeros((), device=pred.device, dtype=torch.float)
+            # Return a graph-connected zero so .backward() works even when the
+            # backbone is fully frozen (no detached leaf — use pred.sum()*0 which
+            # has a grad_fn tied to the model forward graph).
+            return pred.sum() * 0.0
     return criterion(pred, target, logits, std, compound_ids=cid)
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
                 grad_clip=1.0, accum_steps=1, report=None,
