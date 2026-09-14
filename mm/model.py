@@ -134,7 +134,8 @@ def _derive_attn_targets(model: nn.Module) -> List[str]:
         for name, child in list(m.named_children()):
             full = f'{path}.{name}' if path else name
             if _linear_is(child) and any(
-                    s in path for s in ('self_attn', 'attention', 'attn')):
+                    s in path for s in ('self_attn', 'attention', 'attn',
+                                        'mha', 'mhsa')):
                 names.append(name)
             elif len(list(child.children())) > 0:
                 _walk(child, full)
