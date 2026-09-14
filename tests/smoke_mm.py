@@ -215,6 +215,16 @@ def check_marks() -> None:
                    'night', 'watch')
     check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (2, 3), 'case-insensitive matching')
 
+    # 11) German 'ß' must NOT expand to 'ss' ("Großstadt" keeps char positions):
+    #     casefold would shift offsets and corrupt the token mapping.
+    text = 'Die Großstadt Berlin'
+    r = find_spans(text, _word_offsets(text), 'Groß', 'stadt')
+    check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (1, 2) and r.degenerate,
+          'German "ß" preserves length (no casefold expansion)')
+    r = find_spans(text, _word_offsets(text), 'groß', 'Stadt')
+    check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (1, 2),
+          '"ß" lowercase input still matches (case-insensitive)')
+
 
 def check_data() -> None:
     print('=== 5. DATA LOADERS (real local TSVs, no torch) ===')

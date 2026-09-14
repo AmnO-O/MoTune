@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
 # Head-inflection suffixes allowed AFTER a base form, longest-first so
-# "watch's" matches before plain "s" could shorten it. Casefolded matching.
+# "watch's" matches before plain "s" could shorten it. Lowercased matching.
 _INFLECTION = (
     "\u2019s", "'s",           # possessive  -> watch's
     "es",                      # plural/3rd  -> watches
@@ -44,7 +44,11 @@ _END_BOUNDARY = f"(?![{_WORD}])"
 
 
 def normalize(s: str) -> str:
-    return s.casefold()
+    # `.lower()` (NOT casefold): casefold expands German 'ß' -> 'ss' (1->2
+    # chars), shifting character indices so they no longer line up with the
+    # tokenizer's offset_mapping (computed on the ORIGINAL string). lower()
+    # keeps 'ß' as 'ß', so every codepoint keeps its length for our DE/EN data.
+    return s.lower()
 
 
 @dataclass(frozen=True)
