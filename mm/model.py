@@ -117,14 +117,52 @@ class LoRAAdapter(nn.Module):
             self.linear.weight += self.scaling * (self.b.weight @ self.a.weight)
 
 
+def _linear_is(module: nn.Module) -> bool:
+    """True for nn.Linear and any duck-typed linear (custom proj classes)."""
+    return (
+        isinstance(module, nn.Linear)
+        or (hasattr(module, 'weight') and hasattr(module, 'in_features')
+            and hasattr(module, 'out_features') and hasattr(module, 'bias'))
+    )
+
+
+def _derive_attn_targets(model: nn.Module) -> List[str]:
+    """Leaf names of every linear module living under an attention block."""
+    names: List[str] = []
+
+    def _walk(m: nn.Module, path: str) -> None:
+        for name, child in list(m.named_children()):
+            full = f'{path}.{name}' if path else name
+            if _linear_is(child) and any(
+                    s in path for s in ('self_attn', 'attention', 'attn')):
+                names.append(name)
+            elif len(list(child.children())) > 0:
+                _walk(child, full)
+
+    _walk(model, '')
+    preferred = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'q', 'k', 'v', 'o',
+                 'query', 'key', 'value', 'query_proj', 'key_proj',
+                 'value_proj']
+    ordered: List[str] = []
+    for n in preferred:
+        if n in names and n not in ordered:
+            ordered.append(n)
+    for n in names:
+        if n not in ordered:
+            ordered.append(n)
+    return ordered
+
+
 def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,
                dropout: float = 0.1, targets: Optional[List[str]] = None) -> List[LoRAAdapter]:
     """Wrap every target Linear in-place (recursive) and return the adapters.
 
     Targets may be bare suffixes ('q_proj') or full dotted paths
     ('self_attn.q_proj'): a module matches when the full path equals the target
-    or ends with '<target>'. Fails loudly instead of silently returning zero
-    adapters (that would train the scoring heads on a frozen backbone).
+    or ends with '<target>'. If the configured targets match nothing, the
+    attention-block leaf names are derived from the real module tree and used
+    as a fallback (logs via ``model._lora_targets_used``); if that still finds
+    nothing the error lists the Linear layers so lora_targets can be fixed.
     """
     if targets is None:
         targets = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
@@ -132,26 +170,47 @@ def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,
     adapters: List[LoRAAdapter] = []
     paths: List[str] = []
 
-    def _is_target(full: str) -> bool:
-        return any(full == t or full.endswith('.' + t) for t in targets)
+    def _run(tgt: List[str]) -> None:
+        def _matches(full: str) -> bool:
+            return any(full == t or full.endswith('.' + t) for t in tgt)
 
-    def _walk(module: nn.Module, path: str) -> None:
-        for name, child in list(module.named_children()):
-            full = f'{path}.{name}' if path else name
-            if isinstance(child, nn.Linear) and _is_target(full):
-                setattr(module, name, LoRAAdapter(child, rank, alpha, dropout))
-                adapters.append(getattr(module, name))
-                paths.append(full)
-            elif len(list(child.children())) > 0:
-                _walk(child, full)
+        def _walk(module: nn.Module, path: str) -> None:
+            for name, child in list(module.named_children()):
+                full = f'{path}.{name}' if path else name
+                if _linear_is(child) and _matches(full):
+                    setattr(module, name, LoRAAdapter(child, rank, alpha, dropout))
+                    adapters.append(getattr(module, name))
+                    paths.append(full)
+                elif len(list(child.children())) > 0:
+                    _walk(child, full)
 
-    _walk(model, '')
+        _walk(model, '')
+
+    _run(targets)
+    if not adapters:
+        derived = _derive_attn_targets(model)
+        if derived:
+            merged = list(dict.fromkeys(targets + derived))
+            _run(merged)
+            setattr(model, '_lora_targets_used', merged)
     # diagnostics for callers / logs
     setattr(model, '_lora_paths', list(dict.fromkeys(paths)))
     if not adapters:
+        # surface the actual projection names so lora_targets can be fixed
+        lin = []
+
+        def _collect(m: nn.Module, path: str) -> None:
+            for name, child in list(m.named_children()):
+                full = f'{path}.{name}' if path else name
+                if isinstance(child, nn.Linear):
+                    lin.append(full)
+                elif len(list(child.children())) > 0:
+                    _collect(child, full)
+
+        _collect(model, '')
         raise RuntimeError(
-            f'apply_lora matched zero {targets}; the backbone uses different '
-            'attention-projection names. Inspect model.lm and pass lora_targets ',
+            f'apply_lora matched zero {targets}. Backbone linear layers include, '
+            f'e.g.: {lin[:30]} - update lora_targets to match these names.'
         )
     return adapters
 
