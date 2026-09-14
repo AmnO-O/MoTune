@@ -395,7 +395,11 @@ def collate_mlm(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     for key in ('input_ids', 'attention_mask', 'labels'):
         length = max(int(b[key].size(0)) for b in batch)
-        t = torch.full((len(batch), length), _PAD_ID, dtype=batch[0][key].dtype)
+        # labels: padded positions must be -100 so CrossEntropyLoss skips them
+        # (in-sequence unmasked positions are already -100 from MlmDataset);
+        # anything else pads with _PAD_ID.
+        pad_val = -100 if key == 'labels' else _PAD_ID
+        t = torch.full((len(batch), length), pad_val, dtype=batch[0][key].dtype)
         for i, b in enumerate(batch):
             n = int(b[key].size(0))
             t[i, :n] = b[key]

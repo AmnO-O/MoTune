@@ -278,6 +278,16 @@ def check_data() -> None:
           f'de-nn synthetic-offset alignment {gfound}/{gn} ({100*gfound/gn:.0f}%)')
     check(gdeg > 0, f'de-nn: {gdeg} German closed compounds flagged degenerate')
 
+    # collate_mlm must pad *labels* with -100 (ignore_index), never _PAD_ID=0:
+    # padded positions would otherwise contribute CrossEntropy against token 0.
+    dl_src = (ROOT / 'mm' / 'data.py').read_text(encoding='utf-8')
+    tree = ast.parse(dl_src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == 'collate_mlm')
+    seg = ast.get_source_segment(dl_src, fn)
+    check("pad_val = -100 if key == 'labels' else _PAD_ID" in seg,
+          'collate_mlm: labels padded with -100 (MLM loss-leak guard)')
+
 
 def check_folds() -> None:
     print('=== 6. FOLDS + GROUP SAMPLER (real TSVs, no torch) ===')
