@@ -7,7 +7,9 @@ and therefore no embedding resize.
 
 Head input (compact, ported): mod/head span embeddings
 (+ optional learned attention pooling) + span-length fractions + context
-(mean and/or CLS). Two regressors score the modifier and the head.
+(mean and/or CLS), plus optional literality ``cos(use, prototype)`` per span
+and optional LM-predictability stats. Two regressors score the modifier and
+the head.
 
 LoRA is implemented inline (no ``peft`` dependency): target ``nn.Linear``
 modules are wrapped in ``LoraAdapter`` (keeps the frozen base path), trained,
@@ -460,7 +462,8 @@ class MMBertRegressor(nn.Module):
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
                  head_mode: str = 'reg', num_bins: int = 6,
                  context_pool: str = 'mean+cls', head_pool: str = 'attn',
-                 head_hidden: int = 128, use_lm_features: bool = False):
+                 head_hidden: int = 128, use_lm_features: bool = False,
+                 use_proto_cos: bool = False):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
@@ -469,6 +472,7 @@ class MMBertRegressor(nn.Module):
         self.context_pool = context_pool
         self.head_pool = head_pool
         self.use_lm_features = use_lm_features
+        self.use_proto_cos = use_proto_cos
 
         self.lm = AutoModelForMaskedLM.from_pretrained(backbone)
         # Cached reference to the base transformer for the no-logits forward
@@ -482,6 +486,8 @@ class MMBertRegressor(nn.Module):
         self.head_in = hidden_size * 2 + context_dim + 2      # 2 spans + 2 lens + context
         if use_lm_features:
             self.head_in += 4                                  # avg_logp + entropy x mod/head
+        if use_proto_cos:
+            self.head_in += 2                                  # cos(use, prototype) x mod/head
 
         self.mod_pool = SpanPool(hidden_size, head_pool)
         self.head_role_pool = SpanPool(hidden_size, head_pool)
@@ -524,6 +530,24 @@ class MMBertRegressor(nn.Module):
             return torch.stack([avg, ent], dim=-1)                # (B, 2)
 
         return torch.cat([_stats(mod_mask), _stats(head_mask)], dim=-1)
+
+    def _prototype_cos(self, input_ids: torch.Tensor, span_mask: torch.Tensor,
+                       use_emb: torch.Tensor) -> torch.Tensor:
+        """Literality: cosine between the contextualised USE embedding and the
+        static prototype (base/lemma) embedding rows of the span's own tokens.
+
+        High = the word keeps its literal meaning in this context (e.g.
+        "market" in "flea market"); low = drift/lexicalised use (e.g. "tower"
+        in "ivory tower"). Rows with no span contribute 0.
+        """
+        weight = self.lm.get_input_embeddings().weight
+        tok = weight.index_select(0, input_ids.reshape(-1)).reshape(
+            input_ids.size(0), input_ids.size(1), -1)
+        n = span_mask.long().sum(-1).clamp(min=1).unsqueeze(-1)
+        proto = (tok * span_mask.float().unsqueeze(-1)).sum(1) / n
+        cos = F.cosine_similarity(use_emb.float(), proto.float(), dim=-1)
+        cos = torch.where(span_mask.any(-1), cos, torch.zeros_like(cos))
+        return cos.type_as(use_emb).unsqueeze(-1)
 
     def _pool(self, hidden: torch.Tensor, mask: torch.Tensor,
               pool: SpanPool) -> torch.Tensor:
@@ -568,6 +592,9 @@ class MMBertRegressor(nn.Module):
             feats.append(self._lm_span_stats(
                 batch['input_ids'], batch['attention_mask'],
                 batch['mod_span_mask'], batch['head_span_mask']))
+        if self.use_proto_cos:
+            feats.append(self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], mod_emb))
+            feats.append(self._prototype_cos(batch['input_ids'], batch['head_span_mask'], head_emb))
         features = torch.cat(feats, dim=1)
 
         mod_out = self.mod_regressor(features)
@@ -603,6 +630,7 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertRe
         head_mode=cfg.head_mode, num_bins=cfg.num_bins,
         context_pool=cfg.context_pool, head_pool=cfg.head_pool,
         head_hidden=cfg.head_hidden, use_lm_features=cfg.use_lm_features,
+        use_proto_cos=cfg.use_proto_cos,
     )
     if load_from is not None:
         load_from = Path(load_from)

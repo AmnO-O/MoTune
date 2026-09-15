@@ -60,6 +60,13 @@ class Config:
     # attach LM-predictability features (avg log P + span entropy of the span
     # tokens under the pretrained MLM head) to the head input. 0 = off.
     use_lm_features: bool = False
+    # literality feature: cosine between the contextualised USE embedding of a
+    # constituent span and the static prototype (base/lemma) embedding row of
+    # its own tokens. High = word keeps its literal meaning in context (e.g.
+    # "market" in "flea market"); low = drift/lexicalised (e.g. "tower" in
+    # "ivory tower"). Off by default so it can be A/B'd against the cosine-free
+    # baseline.
+    use_proto_cos: bool = False
 
 # === data / paths (filenames are resolved under data_path) ===
     data_path: Optional[str] = None

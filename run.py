@@ -16,6 +16,32 @@ from mm.config import Config, coerce_value
 _COMMANDS = ('train80', 'train5', 'predict', 'warmup', 'probe', 'smoke')
 _TRAIN_MODES = ('train80', 'train5', 'predict')
 
+_LOCK_FH = None
+
+
+def _acquire_run_lock(output_dir) -> bool:
+    """Refuse to start a second run.py against the same output dir.
+
+    Kaggle (and accidental notebook re-runs) frequently fire two processes at
+    the same GPU; both then contend for the HF cache / CUDA and appear to
+    HANG right after the mode header. Lock via flock (POSIX only; harmless
+    no-op on Windows for local dev).
+    """
+    global _LOCK_FH
+    try:
+        import fcntl
+    except ImportError:
+        return True
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fh = open(output_dir / 'run.lock', 'w')
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    _LOCK_FH = fh  # keep the file handle alive for the whole process lifetime
+    return True
+
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog='run.py', description=__doc__)
@@ -113,6 +139,12 @@ def main(argv=None) -> int:
     logger.info('Config:\n%s', cfg.pretty())
 
     set_seed(cfg.seed)
+
+    if not _acquire_run_lock(output_dir):
+        logger.error('Another run.py is already running against %s; refusing '
+                     'to start a duplicate process (remove %s/run.lock to force).',
+                     output_dir, output_dir)
+        return 1
 
     from mm import pipeline
 

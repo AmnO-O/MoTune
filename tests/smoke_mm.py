@@ -55,6 +55,8 @@ def check_config() -> None:
           'total_epochs == freeze_epochs + lora_epochs')
     check(defaults.mlm_ctx_mask_ratio == 0.0,
           'mlm_ctx_mask_ratio defaults to 0 (backwards compatible)')
+    check(defaults.use_proto_cos is False,
+          'use_proto_cos defaults to False (off so it can be A/B\'d)')
 
     bad = [
         ('lambda_rank=-1', lambda: Config.defaults().update(lambda_rank=-1)),
@@ -660,6 +662,10 @@ def check_fixes() -> None:
           'pipeline passes lora_from_layer to apply_lora')
     check('ctx_mask_ratio=cfg.mlm_ctx_mask_ratio' in pipe_src,
           'pipeline wires mlm_ctx_mask_ratio into MlmDataset')
+    check('use_proto_cos=cfg.use_proto_cos' in model_src2,
+          'build_model wires use_proto_cos from config')
+    check('self._prototype_cos(' in model_src2,
+          'forward appends cos(use, prototype) features when use_proto_cos')
     tr_src = (ROOT / 'mm' / 'trainer.py').read_text(encoding='utf-8')
     check('from_layer=self.cfg.lora_from_layer' in tr_src,
           'trainer passes lora_from_layer to apply_lora')
