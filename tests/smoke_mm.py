@@ -4,14 +4,17 @@ Run from the repo root:
     python tests/smoke_mm.py        (or: python run.py smoke)
 
 Covers: syntax of every module, config construction/validation/round-trip and
-``--set`` coercion, CLI wiring, and the offset-based span matcher on synthetic
-token offsets (the real-tokenizer alignment check runs on Kaggle in M2).
+``--set`` coercion, CLI wiring, the offset-based span matcher on synthetic
+token offsets (the real-tokenizer alignment check runs on Kaggle in M2), and
+-- when torch is available -- the MlmDataset masking behaviour (span /
+context / degenerate-fallback) with a synthetic tokenizer.
 """
 
 from __future__ import annotations
 
 import ast
 import json
+import math
 import sys
 import tempfile
 from pathlib import Path
@@ -50,11 +53,15 @@ def check_config() -> None:
     check(defaults.backbone == 'jhu-clsp/mmBERT-base', f'default backbone = mmBERT-base')
     check(defaults.total_epochs == defaults.freeze_epochs + defaults.lora_epochs,
           'total_epochs == freeze_epochs + lora_epochs')
+    check(defaults.mlm_ctx_mask_ratio == 0.0,
+          'mlm_ctx_mask_ratio defaults to 0 (backwards compatible)')
 
     bad = [
         ('lambda_rank=-1', lambda: Config.defaults().update(lambda_rank=-1)),
         ('head_pool=bogus', lambda: Config.defaults().update(head_pool='bogus')),
         ('mlm_mask_span=bogus', lambda: Config.defaults().update(mlm_mask_span='bogus')),
+        ('mlm_ctx_mask_ratio=-0.1', lambda: Config.defaults().update(mlm_ctx_mask_ratio=-0.1)),
+        ('mlm_ctx_mask_ratio=1.5', lambda: Config.defaults().update(mlm_ctx_mask_ratio=1.5)),
         ('freeze_epochs=-1', lambda: Config.defaults().update(freeze_epochs=-1)),
         ('lora_epochs=0', lambda: Config.defaults().update(lora_epochs=0)),
         ('warmup without data', lambda: Config.defaults().update(warmup_mlm_epochs=3)),
@@ -70,11 +77,12 @@ def check_config() -> None:
 
     ok = Config.defaults().update(
         warmup_mlm_epochs=2, mlm_data_paths=['en-nn-train.tsv', 'de-nn-train.tsv'],
-        head_pool='mean', lambda_compound=0.3,
+        head_pool='mean', lambda_compound=0.3, mlm_ctx_mask_ratio=0.25,
     )
     ok.validate()
-    check(ok.warmup_mlm_epochs == 2 and ok.lambda_compound == 0.3,
-          'valid warmup config accepted')
+    check(ok.warmup_mlm_epochs == 2 and ok.lambda_compound == 0.3
+          and ok.mlm_ctx_mask_ratio == 0.25,
+          'valid warmup config (incl. mlm_ctx_mask_ratio) accepted')
     check(ok.total_epochs == ok.freeze_epochs + ok.lora_epochs,
           'total_epochs derived correctly')
 
@@ -308,6 +316,249 @@ def check_data() -> None:
           'collate_mlm: labels padded with -100 (MLM loss-leak guard)')
 
 
+class _StubTokenizer:
+    """Synthetic tokenizer: one token per word, [CLS]/[SEP] specials.
+
+    Matches the MlmDataset call contract: ``__call__(text, max_length,
+    truncation, return_tensors, return_offsets_mapping)`` returning
+    ``input_ids`` / ``attention_mask`` ([1, L]) and ``offset_mapping``
+    ([1, L, 2]) as torch tensors plus ``mask_token_id`` / ``vocab_size``.
+    """
+
+    mask_token_id = 9998
+
+    def __init__(self):
+        self.mask_token_id = 9998
+        self.vocab_size = 10000
+        self._cls = 0
+        self._sep = 2
+
+    def __call__(self, text, max_length=None, truncation=False,
+                 return_tensors=None, return_offsets_mapping=True):
+        import torch
+        word_ids = [self._cls]
+        offsets = [(0, 0)]
+        pos = 0
+        for w in text.split(' '):
+            s = text.index(w, pos)
+            e = s + len(w)
+            # keep word ids out of [self._cls, self._sep, self.mask_token_id]
+            word_ids.append(2 + (hash(w) % 9000))
+            offsets.append((s, e))
+            pos = e + 1
+        word_ids.append(self._sep)
+        offsets.append((0, 0))
+        input_ids = torch.tensor([word_ids], dtype=torch.long)
+        attn = torch.ones_like(input_ids)
+        om = torch.tensor([offsets], dtype=torch.long) if return_offsets_mapping else None
+        return {'input_ids': input_ids, 'attention_mask': attn, 'offset_mapping': om}
+
+
+def _stub_rows():
+    return [
+        {'context': 'the night watch is useful', 'mod': 'night', 'head': 'watch',
+         'compound': 'night watch', 'lang': 'en', 'has_label': False, 'compound_id': -1},
+        {'context': 'Das Abiturzeugnis ist gut', 'mod': 'Abitur', 'head': 'Zeugnis',
+         'compound': 'Abiturzeugnis', 'lang': 'de', 'has_label': False, 'compound_id': -1},
+    ]
+
+
+def check_mlm() -> None:
+    print('=== 5b. MLM MASKING (MlmDataset; span + context + fallback) ===')
+    sys.path.insert(0, str(ROOT))
+    try:
+        import torch
+    except ImportError:
+        print('  [SKIP] torch not installed; MlmDataset masking behaviour not exercised')
+        check(True, 'MlmDataset behavioural tests skipped (no torch)')
+        return
+
+    from mm.data import MlmDataset, collate_mlm
+
+    rows = _stub_rows()
+
+    def masked_positions(item):
+        return sorted((item['labels'] != -100).nonzero().flatten().tolist())
+
+    def base_ids(item, ds, i):
+        return ds._base[i]['input_ids']
+
+    # --- (1) 'both': span + context tokens masked, labels = gold ids ------
+    ds = MlmDataset(rows, _StubTokenizer(), mask_span='both',
+                    mask_prob=1.0, random_prob=0.0, ctx_mask_ratio=1.0, seed=0)
+    en0 = ds[0]
+    positions = masked_positions(en0)
+    # row 0: [CLS] the / night / watch / is / useful [SEP] -> non-special 1..5
+    # EN spaced compound -> mod=2, head=3; context pool = {1,4,5}
+    check(positions == [1, 2, 3, 4, 5],
+          f"'both' ctx=1.0: span+context all corrupted [{positions}]")
+    check(bool((en0['input_ids'][positions] == 9998).all()),
+          "'both' ctx=1.0: every corrupted position is [MASK]")
+    gold = base_ids(en0, ds, 0)
+    check(bool((en0['labels'][positions] == gold[positions]).all()),
+          "'both' ctx=1.0: labels hold original token ids")
+
+    # --- (2) 'one': the OTHER span half stays visible --------------------
+    ds = MlmDataset(rows, _StubTokenizer(), mask_span='one',
+                    mask_prob=1.0, random_prob=0.0, ctx_mask_ratio=1.0, seed=0)
+    item = ds[0]
+    positions = masked_positions(item)
+    span2 = {2, 3}
+    picked = set(positions) & span2
+    # exactly one span token is masked; the other must be untouched
+    check(len(picked) == 1, f"'one' ctx=1.0: exactly one compound half masked [{picked}]")
+    untouched = span2 - picked
+    t = int(untouched.pop())
+    check(int(item['input_ids'][t]) != 9998 and int(item['labels'][t]) == -100,
+          f"'one' ctx=1.0: other half untouched (token {t} visible, label ignored)")
+    # context pool must exclude BOTH spans even in 'one' mode
+    check({1, 4, 5} <= set(positions), "'one' ctx=1.0: all context tokens corrupted")
+
+    # --- (3) degenerate German row: falls back to 15% random, ctx ignored -
+    ds = MlmDataset(rows, _StubTokenizer(), mask_span='both',
+                    mask_prob=1.0, random_prob=0.0, ctx_mask_ratio=1.0, seed=0)
+    de0 = ds[1]
+    positions = masked_positions(de0)
+    # non_special = [1,2,3,4] over 6 tokens incl. [CLS]/[SEP]; n = max(1, round(.15*4)) = 1
+    check(len(positions) == 1 and positions[0] in [1, 2, 3, 4],
+          f"German degenerate -> random fallback masks exactly 1 of 4 [{positions}]")
+    check(int((de0['input_ids'] == 9998).sum()) == 1,
+          'German degenerate -> exactly one input token replaced by [MASK]')
+    # ctx_mask_ratio=1.0 must NOT leak into the degenerate/fallback path
+    gold = base_ids(de0, ds, 1)
+    other = [p for p in [1, 2, 3, 4] if p not in positions]
+    check(bool((de0['labels'][other] == -100).all()) and
+          bool((de0['input_ids'][other] == gold[other]).all()),
+          'German degenerate -> context masking ignored in fallback path')
+
+    # --- (4) ctx_mask_ratio=0 (default): spans only, exact old behaviour --
+    ds = MlmDataset(rows, _StubTokenizer(), mask_span='both',
+                    mask_prob=0.8, random_prob=0.1, ctx_mask_ratio=0.0, seed=3)
+    item = ds[0]
+    positions = masked_positions(item)
+    check(positions == [2, 3],
+          f"ctx=0 (default): only span positions got labels [{positions}]")
+    check(int(item['input_ids'][2]) == 9998 or int(item['input_ids'][2]) != int(base_ids(item, ds, 0)[2]),
+          'ctx=0: span token corrupted (mask or random) as before')
+
+    # --- (5) collate_mlm: padded labels -100, seq attention_masks padded --
+    items = [ds[0], ds[1]]
+    batch = collate_mlm(items)
+    check(batch['input_ids'].shape == (2, batch['input_ids'].shape[1]),
+          'collate_mlm: batched dimensions ok')
+    check(bool((batch['labels'][:, -1] == -100).all()),
+          'collate_mlm: padded label columns are -100 (CE-ignored)')
+
+
+def check_warmup_loss() -> None:
+    """Numerically verify warmup_epoch's MLM loss = manual CrossEntropy.
+
+    Runs the real training loop (warmup_epoch in mm.train) on a tiny fake
+    model -- the same frozen-encoder + MLM-head projection _mlm_projection
+    picks for the real mmBERT -- and checks the returned loss equals a manual
+    ``F.cross_entropy`` over the -100-masked positions of the same batch. The
+    context-masked tokens must be scored exactly like span tokens.
+    """
+    print('=== 5c. WARMUP LOSS (warmup_epoch == manual CE; span + ctx) ===')
+    sys.path.insert(0, str(ROOT))
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from torch.amp import autocast, GradScaler
+        from transformers import AutoModelForMaskedLM  # mm.model imports this
+    except ImportError:
+        print('  [SKIP] torch/transformers not installed; loss numeric check not exercised')
+        check(True, 'warmup loss numeric check skipped (no torch/transformers)')
+        return
+
+    from types import SimpleNamespace
+
+    from mm.data import MlmDataset, collate_mlm
+    from mm.train import warmup_epoch
+    from torch.utils.data import DataLoader
+
+    vocab, hidden = 10000, 64
+
+    class _FakeEncoder(nn.Module):
+        def __init__(self, emb):
+            super().__init__()
+            self.emb = emb
+
+        def forward(self, input_ids, attention_mask=None):
+            return SimpleNamespace(
+                last_hidden_state=self.emb(input_ids.clamp(0, self.emb.num_embeddings - 1)))
+
+    class _FakeLM(nn.Module):
+        def __init__(self, enc_emb):
+            super().__init__()
+            self.config = SimpleNamespace(vocab_size=vocab, hidden_size=hidden)
+            self.cls = nn.Sequential(nn.Linear(hidden, vocab))
+            self._enc_emb = enc_emb
+
+        def get_input_embeddings(self):
+            return self._enc_emb
+
+    class _Estimator(nn.Module):
+        pass
+
+    torch.manual_seed(7)
+    enc_emb = nn.Embedding(vocab, hidden)
+    enc_emb.weight.requires_grad_(False)  # encoder frozen, as in the real warmup
+    encoder = _FakeEncoder(enc_emb)
+    model = _Estimator()
+    model.base_model = encoder
+    model.lm = _FakeLM(enc_emb)
+
+    rows = _stub_rows()  # EN compound-aware row + DE degenerate row
+    ds = MlmDataset(rows, _StubTokenizer(), mask_span='both',
+                    mask_prob=0.8, random_prob=0.1, ctx_mask_ratio=0.5,
+                    seed=0, vocab_size=vocab)
+    loader = DataLoader(ds, batch_size=len(rows), shuffle=False,
+                        collate_fn=collate_mlm)
+    optimizer = torch.optim.AdamW(model.lm.cls.parameters(), lr=1e-3)
+    scheduler = _ConstScheduler(lr=1e-3)
+    scaler = GradScaler('cpu', enabled=False)
+
+    # head weights BEFORE warmup's single optimizer step: the returned epoch
+    # loss is CE on the pre-step weights, so the manual recomputation must
+    # use these exact weights, not the post-step ones.
+    head_linear = model.lm.cls[0]
+    w0 = head_linear.weight.detach().clone()
+    b0 = head_linear.bias.detach().clone()
+
+    rng_state = ds.rng.get_state()  # warmup consumes masking draws; replay them
+    loss = warmup_epoch(model, loader, optimizer, scheduler,
+                        nn.CrossEntropyLoss(), scaler,
+                        torch.device('cpu'), grad_clip=1.0, accum_steps=1)
+    check(math.isfinite(loss), f'warmup_epoch returned finite loss ({loss:.6f})')
+
+    # Replay the masking draws so loader yields the very batch warmup scored,
+    # under the same CPU autocast (bfloat16 for Linear) the real loop uses.
+    ds.rng.set_state(rng_state)
+    batch = next(iter(loader))
+    with autocast('cpu'):
+        hidden = encoder.emb(batch['input_ids'].clamp(0, vocab - 1))
+        rows = hidden[batch['labels'] != -100]
+        logits = F.linear(rows, w0, b0)
+    manual = F.cross_entropy(logits.float(), batch['labels'][batch['labels'] != -100])
+    check(abs(loss - manual) < 1e-5,
+          f'warmup_epoch loss {loss:.6f} == manual CE {manual.item():.6f}')
+
+
+class _ConstScheduler:
+    """Minimal scheduler: constant LR, sees the step() calls warmup_epoch makes."""
+
+    def __init__(self, lr):
+        self.lr = lr
+
+    def step(self):
+        pass
+
+    def get_last_lr(self):
+        return [self.lr]
+
+
 def check_folds() -> None:
     print('=== 6. FOLDS + GROUP SAMPLER (real TSVs, no torch) ===')
     sys.path.insert(0, str(ROOT))
@@ -407,6 +658,8 @@ def check_fixes() -> None:
     pipe_src = (ROOT / 'mm' / 'pipeline.py').read_text(encoding='utf-8')
     check('from_layer=cfg.lora_from_layer' in pipe_src,
           'pipeline passes lora_from_layer to apply_lora')
+    check('ctx_mask_ratio=cfg.mlm_ctx_mask_ratio' in pipe_src,
+          'pipeline wires mlm_ctx_mask_ratio into MlmDataset')
     tr_src = (ROOT / 'mm' / 'trainer.py').read_text(encoding='utf-8')
     check('from_layer=self.cfg.lora_from_layer' in tr_src,
           'trainer passes lora_from_layer to apply_lora')
@@ -426,6 +679,8 @@ def main() -> int:
     check_cli()
     check_marks()
     check_data()
+    check_mlm()
+    check_warmup_loss()
     check_folds()
     check_fixes()
 

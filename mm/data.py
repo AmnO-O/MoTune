@@ -307,19 +307,27 @@ class MlmDataset(_DatasetBase):
     Rows without an aligned compound (or with a degenerate fused token) fall
     back to standard 15% random masking over non-special tokens, so every
     sentence still contributes a masking signal.
+
+    ``ctx_mask_ratio > 0`` additionally corrupts that fraction of the NON-span
+    (context) tokens in a span-masked row. Both the modifier span and the head
+    span are excluded from the context pool so the compound itself stays the
+    corruption target (in 'one' mode the other, still-visible half of the
+    compound is also never touched).
     """
 
     RANDOM_RATIO = 0.15
 
     def __init__(self, rows: List[Dict], tokenizer, max_len: int = 128,
                  mask_span: str = 'both', mask_prob: float = 0.8,
-                 random_prob: float = 0.1, seed: int = 0, vocab_size: Optional[int] = None):
+                 random_prob: float = 0.1, ctx_mask_ratio: float = 0.0,
+                 seed: int = 0, vocab_size: Optional[int] = None):
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.mask_span = mask_span          # 'one' | 'both'
-        self.mask_prob = mask_prob          # P([MASK]) over span tokens
-        self.random_prob = random_prob      # P(random token) over span tokens
+        self.mask_prob = mask_prob          # P([MASK]) over selected tokens
+        self.random_prob = random_prob      # P(random token) over selected tokens
+        self.ctx_mask_ratio = ctx_mask_ratio  # P(select) for context tokens
         self.seed = seed
         # random-replacement tokens must be EMBEDDABLE: never sample above the
         # model's real vocabulary (which can differ from tokenizer.vocab_size,
@@ -386,6 +394,38 @@ class MlmDataset(_DatasetBase):
         joined = spans['mod'] + spans['head']
         return list(dict.fromkeys(joined)) if joined else None
 
+    def _corrupt_positions(self, ids: List[int], labels: torch.Tensor,
+                           positions: List[int], base_ids: torch.Tensor) -> None:
+        """Apply 80/10/10 corruption + gold labels to ``positions`` in place.
+
+        ``ids`` is the (mutable) replacement input; ``labels`` gets the original
+        token id at every corrupted position; anything unselected stays -100 so
+        CrossEntropyLoss ignores it.
+        """
+        for p in positions:
+            r = self.rng.rand()
+            if r < self.mask_prob:
+                ids[p] = self.tokenizer.mask_token_id
+            elif r < self.mask_prob + self.random_prob:
+                ids[p] = self._rand_token_id()
+        labels[positions] = base_ids[positions]
+
+    def _ctx_positions(self, plan: Dict) -> List[int]:
+        """Context (non-compound) token positions eligible for extra masking.
+
+        Excludes BOTH spans so the mod/head pair stays the corruption target,
+        even in 'one' mode where only one side is span-masked.
+        """
+        spans = plan['spans']
+        span_set = set(spans['mod']) | set(spans['head'])
+        cand = [p for p in plan['non_special'] if p not in span_set]
+        if not cand:
+            return []
+        n = max(1, int(round(self.ctx_mask_ratio * len(cand))))
+        if len(cand) <= n:
+            return cand
+        return list(self.rng.choice(cand, size=n, replace=False))
+
     def __getitem__(self, idx: int) -> Dict:
         base = self._base[idx]
         plan = self._plan[idx]
@@ -396,13 +436,11 @@ class MlmDataset(_DatasetBase):
         if positions:
             # compound-aware: mask (nearly) all span tokens, 80/10/10
             ids = input_ids.tolist()
-            for p in positions:
-                r = self.rng.rand()
-                if r < self.mask_prob:
-                    ids[p] = self.tokenizer.mask_token_id
-                elif r < self.mask_prob + self.random_prob:
-                    ids[p] = self._rand_token_id()
-            labels[positions] = base['input_ids'][positions]
+            self._corrupt_positions(ids, labels, positions, base['input_ids'])
+            if self.ctx_mask_ratio > 0:
+                ctx = self._ctx_positions(plan)
+                if ctx:
+                    self._corrupt_positions(ids, labels, ctx, base['input_ids'])
             return {
                 'input_ids': torch.tensor(ids, dtype=torch.long),
                 'attention_mask': base['attention_mask'].clone(),
@@ -415,13 +453,7 @@ class MlmDataset(_DatasetBase):
         chosen = cand if len(cand) <= n else list(
             self.rng.choice(cand, size=n, replace=False))
         ids = input_ids.tolist()
-        for p in chosen:
-            r = self.rng.rand()
-            if r < self.mask_prob:
-                ids[p] = self.tokenizer.mask_token_id
-            elif r < self.mask_prob + self.random_prob:
-                ids[p] = self._rand_token_id()
-        labels[chosen] = base['input_ids'][chosen]
+        self._corrupt_positions(ids, labels, chosen, base['input_ids'])
         return {
             'input_ids': torch.tensor(ids, dtype=torch.long),
             'attention_mask': base['attention_mask'].clone(),

@@ -103,8 +103,8 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
                           lora_parameters, merge_lora)
     from mm.train import track_optimizer_steps, warmup_epoch
 
-    logger.info('=== warmup: compound-aware MLM (epochs=%d, mask_span=%s) ===',
-                cfg.warmup_mlm_epochs, cfg.mlm_mask_span)
+    logger.info('=== warmup: compound-aware MLM (epochs=%d, mask_span=%s, ctx_mask_ratio=%s) ===',
+                cfg.warmup_mlm_epochs, cfg.mlm_mask_span, cfg.mlm_ctx_mask_ratio)
 
     tokenizer = _tokenizer(cfg, logger)
     model = build_model(cfg, device)
@@ -113,6 +113,7 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
     mds = MlmDataset(
         rows, tokenizer, max_len=cfg.max_mlm_length, mask_span=cfg.mlm_mask_span,
         mask_prob=cfg.mlm_mask_prob, random_prob=cfg.mlm_random_prob,
+        ctx_mask_ratio=cfg.mlm_ctx_mask_ratio,
         seed=cfg.seed, vocab_size=_embedding_vocab(model),
     )
     loader = DataLoader(mds, batch_size=cfg.warmup_batch_size, shuffle=True,
@@ -450,6 +451,7 @@ def run_probe(cfg: Config, logger: logging.Logger, device,
                 mask_span=cfg.mlm_mask_span,
                 mask_prob=cfg.mlm_mask_prob,
                 random_prob=cfg.mlm_random_prob,
+                ctx_mask_ratio=cfg.mlm_ctx_mask_ratio,
                 seed=cfg.seed,
                 vocab_size=getattr(tokenizer, 'vocab_size', None),
             ),

@@ -95,6 +95,12 @@ class Config:
     mlm_mask_span: MlmMaskSpan = 'both'
     mlm_mask_prob: float = 0.8
     mlm_random_prob: float = 0.1
+    # fraction of NON-compound (context) tokens additionally masked in a
+    # span-masked row, forcing the model to reconstruct the compound from
+    # partially hidden surroundings. 0 = off (span tokens only); the span
+    # tokens themselves are excluded so the mod/head pairing stays visible
+    # as the corruption target (BERT-style 0.15 is a reasonable start).
+    mlm_ctx_mask_ratio: float = 0.0
     warmup_batch_size: int = 32
     warmup_lr: float = 5e-5
     warmup_warmup_ratio: float = 0.1
@@ -264,6 +270,8 @@ class Config:
             errors.append(f'mlm_random_prob must be in [0, 1], got {self.mlm_random_prob}')
         if self.mlm_mask_prob + self.mlm_random_prob > 1:
             errors.append('mlm_mask_prob + mlm_random_prob must be <= 1')
+        if not 0 <= self.mlm_ctx_mask_ratio <= 1:
+            errors.append(f'mlm_ctx_mask_ratio must be in [0, 1], got {self.mlm_ctx_mask_ratio}')
 
         if self.lora_rank < 1 or self.warmup_lora_rank < 1:
             errors.append('lora_rank/r and warmup_lora_rank must be >= 1')
