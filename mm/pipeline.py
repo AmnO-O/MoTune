@@ -343,8 +343,12 @@ def run_predict(cfg: Config, logger: logging.Logger, device,
     tokenizer = _tokenizer(cfg, logger)
     trial_ds = CompDataset(trial_rows, tokenizer,
                            max_len=cfg.max_context_length, is_test=True)
+    # num_workers=0: this loader is first iterated inside evaluate() AFTER
+    # build_model() has initialized CUDA; forking DataLoader workers from a
+    # process with an existing CUDA context is a known Linux/Kaggle deadlock.
+    # Inference on a few thousand rows is GPU-bound anyway, not CPU-bound.
     trial_loader = DataLoader(trial_ds, batch_size=cfg.batch_size * 2,
-                              shuffle=False, num_workers=cfg.num_workers,
+                              shuffle=False, num_workers=0,
                               pin_memory=(getattr(device, 'type', '') == 'cuda'),
                               collate_fn=collate_comp)
 
