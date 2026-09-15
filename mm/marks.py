@@ -16,7 +16,7 @@ Handled cases:
     ("watch" -> "watches" / "watch's").
   - German closed compounds where mod+head collapse onto the SAME token
     (``degenerate=True``): the caller skips span-supervised losses for that
-    row instead of letting cos(mod, head) collapse to 1.
+    row instead of feeding duplicate mod==head span embeddings.
 
 Matching is deliberately conservative: an unaligned row returns
 ``Span(None, None)`` and the dataset skips the affected supervision rather

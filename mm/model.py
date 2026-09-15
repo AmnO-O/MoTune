@@ -5,7 +5,7 @@ yields both encoder hidden states (for span pooling) and full-vocabulary
 logits (for MLM-warmup / LM-predictability features), with no marker tokens
 and therefore no embedding resize.
 
-Head input (compact, ported): ``cos(mod, head)`` + mod/head span embeddings
+Head input (compact, ported): mod/head span embeddings
 (+ optional learned attention pooling) + span-length fractions + context
 (mean and/or CLS). Two regressors score the modifier and the head.
 
@@ -191,13 +191,6 @@ def _masked_mean(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask = mask.float().unsqueeze(-1)
     counts = mask.sum(dim=1).clamp(min=1.0)
     return (hidden * mask).sum(dim=1) / counts
-
-
-def _safe_cosine_similarity(x1: torch.Tensor, x2: torch.Tensor,
-                            eps: float = 1e-7) -> torch.Tensor:
-    n1 = torch.sqrt((x1 ** 2).sum(dim=1, keepdim=True) + eps)
-    n2 = torch.sqrt((x2 ** 2).sum(dim=1, keepdim=True) + eps)
-    return (x1 * x2).sum(dim=1, keepdim=True) / (n1 * n2)
 
 
 class AttentionPool(nn.Module):
@@ -453,7 +446,6 @@ def _build_head(head_in: int, head_hidden: int, out_features: int,
         nn.Linear(64, out_features),
     )
 
-
 # --------------------------------------------------------------------------- #
 # the model
 # --------------------------------------------------------------------------- #
@@ -487,7 +479,7 @@ class MMBertRegressor(nn.Module):
         object.__setattr__(self, 'base_model', _backbone(self))
 
         context_dim = hidden_size if context_pool in ('mean', 'cls') else 2 * hidden_size
-        self.head_in = hidden_size * 2 + context_dim + 3      # cos + 2 spans + 2 lens + context
+        self.head_in = hidden_size * 2 + context_dim + 2      # 2 spans + 2 lens + context
         if use_lm_features:
             self.head_in += 4                                  # avg_logp + entropy x mod/head
 
@@ -567,12 +559,11 @@ class MMBertRegressor(nn.Module):
         else:
             context_emb = torch.cat([mean_emb, hidden[:, 0]], dim=1)
 
-        cos = _safe_cosine_similarity(mod_emb, head_emb)
         seq_len = batch['attention_mask'].sum(dim=1).clamp(min=1.0).float()
         mod_len = (batch['mod_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
         head_len = (batch['head_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
 
-        feats = [cos, mod_emb, head_emb, mod_len, head_len, context_emb]
+        feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
         if self.use_lm_features:
             feats.append(self._lm_span_stats(
                 batch['input_ids'], batch['attention_mask'],
