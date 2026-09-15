@@ -106,9 +106,24 @@ class Trainer:
         return adapters
 
     # ------------------------------------------------------------------ #
+    def _pred_heads(self, model) -> List[nn.Module]:
+        """The two output-head modules that phase-1 (co-train, head-only)
+        warmup actually steers. For head_mode='gauss' those are the Gaussian
+        (mu, sigma) heads; for 'reg'/'softmax' they are the two regressors.
+        LoRA/backbone stays frozen either way, so the SAME phase-1 recipe
+        (freeze backbone, train heads) works unchanged for every mode.
+        """
+        if model.head_mode == 'gauss':
+            return [model.mod_gauss, model.head_gauss]
+        return [model.mod_regressor, model.head_regressor]
+
+    # ------------------------------------------------------------------ #
     def _param_groups(self, model, adapters, phase: int):
         emb = list(_backbone_embeddings(model).parameters())
-        head = list(model.mod_regressor.parameters()) + list(model.head_regressor.parameters())
+        heads = self._pred_heads(model)
+        head = []
+        for m in heads:
+            head += list(m.parameters())
         head_ids = {id(p) for p in head}
         emb_ids = {id(p) for p in emb}
         others = [p for n, p in model.named_parameters()
@@ -130,10 +145,9 @@ class Trainer:
         """Phase 1: freeze backbone and LoRA, train only prediction heads."""
         for p in model.parameters():
             p.requires_grad = False
-        for p in model.mod_regressor.parameters():
-            p.requires_grad = True
-        for p in model.head_regressor.parameters():
-            p.requires_grad = True
+        for m in self._pred_heads(model):
+            for p in m.parameters():
+                p.requires_grad = True
         if self.cfg.embedding_lr > 0:
             for p in _backbone_embeddings(model).parameters():
                 p.requires_grad = True
