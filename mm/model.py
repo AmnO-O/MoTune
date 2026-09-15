@@ -609,6 +609,9 @@ class MMBertRegressor(nn.Module):
         # around half-depth; `(-1,)` = last layer (the old behaviour / A-B base).
         # LM/MLM logits + context embeddings ALWAYS stay on the LAST layer (that is
         # where the pretrained forecast head lives). Only the span-pool branch moves.
+        # Cache only the resolved layer INDICES (not the tensor itself — tensors
+        # are shaped [B, seq_len, H] and seq_len varies between batches, so
+        # caching the tensor causes a shape mismatch on the second batch).
         if self._span_hidden is None:
             hid_all = outputs.hidden_states
             layers = self.span_layers
@@ -619,9 +622,13 @@ class MMBertRegressor(nn.Module):
                     layers = tuple(range(mid - 2, mid + 3))
                 else:
                     layers = (-1,)
-            self._span_hidden = torch.mean(
-                torch.stack([hid_all[int(i) % n_layers] for i in layers]), dim=0)
-        span_hidden = self._span_hidden
+            # Resolve negative indices once and store as a plain tuple of ints
+            self._span_hidden = tuple(int(i) % n_layers for i in layers)
+        # Always recompute the mean hidden tensor from the CURRENT batch
+        hid_all = outputs.hidden_states
+        n_layers = len(hid_all)
+        span_hidden = torch.mean(
+            torch.stack([hid_all[i] for i in self._span_hidden]), dim=0)
 
         mod_emb = self.mod_pool(span_hidden, batch['mod_span_mask'])
         head_emb = self.head_role_pool(span_hidden, batch['head_span_mask'])
