@@ -483,7 +483,7 @@ class MMBertRegressor(nn.Module):
         self.span_layers = tuple(int(i) for i in (span_layers or ()))
         self._span_hidden = None
 
-        self.lm = AutoModelForMaskedLM.from_pretrained(backbone)
+        self.lm = AutoModelForMaskedLM.from_pretrained(backbone, tie_word_embeddings=False)
         # Cached reference to the base transformer for the no-logits forward
         # path. Deliberately NOT registered as a child module: registering the
         # same instance under a second name would duplicate every state_dict
