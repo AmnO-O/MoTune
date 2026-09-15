@@ -7,9 +7,9 @@ and therefore no embedding resize.
 
 Head input (compact, ported): mod/head span embeddings
 (+ optional learned attention pooling) + span-length fractions + context
-(mean and/or CLS), plus optional literality ``cos(use, prototype)`` per span
-and optional LM-predictability stats. Two regressors score the modifier and
-the head.
+(mean and/or CLS), plus optional LM-predictability stats. Optionally the
+modifier regressor and the head regressor each receive their own per-word
+literality ``cos(use, prototype)`` scalar (no cross-talk between the two).
 
 LoRA is implemented inline (no ``peft`` dependency): target ``nn.Linear``
 modules are wrapped in ``LoraAdapter`` (keeps the frozen base path), trained,
@@ -486,8 +486,9 @@ class MMBertRegressor(nn.Module):
         self.head_in = hidden_size * 2 + context_dim + 2      # 2 spans + 2 lens + context
         if use_lm_features:
             self.head_in += 4                                  # avg_logp + entropy x mod/head
-        if use_proto_cos:
-            self.head_in += 2                                  # cos(use, prototype) x mod/head
+        # NOTE: proto-cos is NOT added to head_in; each output branch instead
+        # gets ONLY its own word's cos(use, prototype) appended at the front,
+        # so mod_out never sees head's literalness and vice-versa.
 
         self.mod_pool = SpanPool(hidden_size, head_pool)
         self.head_role_pool = SpanPool(hidden_size, head_pool)
@@ -592,13 +593,20 @@ class MMBertRegressor(nn.Module):
             feats.append(self._lm_span_stats(
                 batch['input_ids'], batch['attention_mask'],
                 batch['mod_span_mask'], batch['head_span_mask']))
-        if self.use_proto_cos:
-            feats.append(self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], mod_emb))
-            feats.append(self._prototype_cos(batch['input_ids'], batch['head_span_mask'], head_emb))
         features = torch.cat(feats, dim=1)
 
-        mod_out = self.mod_regressor(features)
-        head_out = self.head_regressor(features)
+        # mod_out/head_out are separate MLPs, so each only sees its OWN word's
+        # literalness signal (cos with the static prototype), not the other's.
+        if self.use_proto_cos:
+            cos_mod = self._prototype_cos(
+                batch['input_ids'], batch['mod_span_mask'], mod_emb)
+            cos_head = self._prototype_cos(
+                batch['input_ids'], batch['head_span_mask'], head_emb)
+            mod_out = self.mod_regressor(torch.cat([features, cos_mod], dim=1))
+            head_out = self.head_regressor(torch.cat([features, cos_head], dim=1))
+        else:
+            mod_out = self.mod_regressor(features)
+            head_out = self.head_regressor(features)
 
         if self.head_mode == 'softmax':
             mod_out = torch.clamp(mod_out, -50.0, 50.0)
