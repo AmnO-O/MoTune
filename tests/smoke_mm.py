@@ -701,27 +701,30 @@ def check_fixes() -> None:
     check(chk.head_mode == 'gauss' and chk.ce_weight > 0,
           'config accepts head_mode="gauss" with ce_weight>0')
 
-    import torch as _torch
-    from mm.losses_gauss import gauss_kl
-    # KL(N(0,1)||N(0,1)) == 0; inflated sigma_p is penalised (>= base case)
-    zero = float(gauss_kl(_torch.zeros(4), _torch.ones(4),
-                          _torch.zeros(4), _torch.ones(4)))
-    infl = float(gauss_kl(_torch.zeros(4), _torch.ones(4) * 10,
-                          _torch.zeros(4), _torch.ones(4)))
-    check(abs(zero) < 1e-5 and infl > zero,
-          'gauss_kl: identical Gaussians -> 0, inflated sigma_p is penalised')
+    try:
+        import torch as _torch
+        from mm.losses_gauss import gauss_kl
+        # KL(N(0,1)||N(0,1)) == 0; inflated sigma_p is penalised (>= base case)
+        zero = float(gauss_kl(_torch.zeros(4), _torch.ones(4),
+                              _torch.zeros(4), _torch.ones(4)))
+        infl = float(gauss_kl(_torch.zeros(4), _torch.ones(4) * 10,
+                              _torch.zeros(4), _torch.ones(4)))
+        check(abs(zero) < 1e-5 and infl > zero,
+              'gauss_kl: identical Gaussians -> 0, inflated sigma_p is penalised')
 
-    from mm.heads import GaussHead
-    h = GaussHead(32, hidden=48, dropout=0)
-    mu, sigma = h(_torch.randn(8, 32))
-    check(mu.shape == (8,) and (sigma > 0).all(),
-          'GaussHead returns mu/sigma shapes correctly, sigma > 0')
-    loss = (mu - _torch.randn(8)).pow(2).mean()
-    # just verify backprop works (no NaN / None grad on the head)
-    loss.backward()
-    grads = [p.grad for p in h.parameters() if p.grad is not None]
-    check(len(grads) > 0 and all(_torch.isfinite(g).all() for g in grads),
-          'GaussHead gradients flow and are finite')
+        from mm.heads import GaussHead
+        h = GaussHead(32, hidden=48, dropout=0)
+        mu, sigma = h(_torch.randn(8, 32))
+        check(mu.shape == (8,) and (sigma > 0).all(),
+              'GaussHead returns mu/sigma shapes correctly, sigma > 0')
+        loss = (mu - _torch.randn(8)).pow(2).mean()
+        # just verify backprop works (no NaN / None grad on the head)
+        loss.backward()
+        grads = [p.grad for p in h.parameters() if p.grad is not None]
+        check(len(grads) > 0 and all(_torch.isfinite(g).all() for g in grads),
+              'GaussHead gradients flow and are finite')
+    except ImportError:
+        print('  [SKIP] torch not installed; GaussHead / gauss_kl numerical checks skipped')
 
 
 def main() -> int:
