@@ -682,6 +682,47 @@ def check_fixes() -> None:
     check('head_in :=' not in model_src2,
           '_mlm_projection no longer uses buggy walrus _last_linear_out(head) for decoder lookup')
 
+    # 6) Gaussian head (head_mode='gauss') lives in its own modules, dispatched
+    # once, and never touches the ordinal/regression heads.
+    heads_src = (ROOT / 'mm' / 'heads.py').read_text(encoding='utf-8')
+    check('class GaussHead' in heads_src and 'softplus' in heads_src,
+          'mm/heads.py defines GaussHead with positive sigma (softplus)')
+    gl_src = (ROOT / 'mm' / 'losses_gauss.py').read_text(encoding='utf-8')
+    check('def gauss_kl' in gl_src and 'class GaussLoss' in gl_src
+          and 'self.requires_logits = True' in gl_src,
+          'mm/losses_gauss.py defines gauss_kl + GaussLoss (sigma via logits channel)')
+    check("if self.head_mode == 'gauss':" in model_src2
+          and 'def _forward_gauss(' in model_src2,
+          'model dispatches gauss head in ONE place (_forward_gauss)')
+    check("self.cfg.head_mode == 'gauss'" in tr_src,
+          'trainer builds GaussLoss in one place')
+    chk = Config.defaults().update(head_mode='gauss', ce_weight=1.0)
+    chk.validate()
+    check(chk.head_mode == 'gauss' and chk.ce_weight > 0,
+          'config accepts head_mode="gauss" with ce_weight>0')
+
+    import torch as _torch
+    from mm.losses_gauss import gauss_kl
+    # KL(N(0,1)||N(0,1)) == 0; inflated sigma_p is penalised (>= base case)
+    zero = float(gauss_kl(_torch.zeros(4), _torch.ones(4),
+                          _torch.zeros(4), _torch.ones(4)))
+    infl = float(gauss_kl(_torch.zeros(4), _torch.ones(4) * 10,
+                          _torch.zeros(4), _torch.ones(4)))
+    check(abs(zero) < 1e-5 and infl > zero,
+          'gauss_kl: identical Gaussians -> 0, inflated sigma_p is penalised')
+
+    from mm.heads import GaussHead
+    h = GaussHead(32, hidden=48, dropout=0)
+    mu, sigma = h(_torch.randn(8, 32))
+    check(mu.shape == (8,) and (sigma > 0).all(),
+          'GaussHead returns mu/sigma shapes correctly, sigma > 0')
+    loss = (mu - _torch.randn(8)).pow(2).mean()
+    # just verify backprop works (no NaN / None grad on the head)
+    loss.backward()
+    grads = [p.grad for p in h.parameters() if p.grad is not None]
+    check(len(grads) > 0 and all(_torch.isfinite(g).all() for g in grads),
+          'GaussHead gradients flow and are finite')
+
 
 def main() -> int:
     sync_parse()

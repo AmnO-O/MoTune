@@ -10,6 +10,8 @@ Head input (compact, ported): mod/head span embeddings
 (mean and/or CLS), plus optional LM-predictability stats. Optionally the
 modifier regressor and the head regressor each receive their own per-word
 literality ``cos(use, prototype)`` scalar (no cross-talk between the two).
+For ``head_mode='gauss'`` a separate ``GaussHead`` (see ``mm/heads.py``)
+produces ``(mu, sigma)`` per word with no ordinal bins or regression head.
 
 LoRA is implemented inline (no ``peft`` dependency): target ``nn.Linear``
 modules are wrapped in ``LoraAdapter`` (keeps the frozen base path), trained,
@@ -29,6 +31,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForMaskedLM
 
 from .constants import SCORE_MAX, SCORE_MIN
+from .heads import GaussHead
 
 
 def _backbone(model: nn.Module) -> nn.Module:
@@ -492,6 +495,13 @@ class MMBertRegressor(nn.Module):
 
         self.mod_pool = SpanPool(hidden_size, head_pool)
         self.head_role_pool = SpanPool(hidden_size, head_pool)
+        if head_mode == 'gauss':
+            # value + uncertainty head (see mm/heads.py); regression/ordinal heads
+            # are not built, so all gauss logic stays out of the shared classes
+            self.mod_gauss = GaussHead(self.head_in, head_hidden, dropout)
+            self.head_gauss = GaussHead(self.head_in, head_hidden, dropout)
+            self.out_features = 2
+            return
         self.out_features = num_bins if head_mode == 'softmax' else 1
         self.register_buffer('bin_centers', torch.linspace(SCORE_MIN, SCORE_MAX, num_bins))
         self.mod_regressor = _build_head(self.head_in, head_hidden, self.out_features, dropout)
@@ -554,9 +564,12 @@ class MMBertRegressor(nn.Module):
               pool: SpanPool) -> torch.Tensor:
         return pool(hidden, mask)
 
-    def forward(self, batch, with_logits: bool = False, with_reps: bool = False,
-                with_lm: bool = False):
-        need_lm = (with_logits and self.head_mode != 'softmax') or self.use_lm_features
+    def _features(self, batch, need_lm: bool, with_mlm_logits: bool = False):
+        """Encoder forward + shared span/context feature building.
+
+        Returns ``(mod_emb, head_emb, features, logits)``; ``logits`` are the
+        MLM logits only when the caller explicitly requests them.
+        """
         if need_lm:
             outputs = self.lm(
                 input_ids=batch['input_ids'],
@@ -564,7 +577,7 @@ class MMBertRegressor(nn.Module):
                 output_hidden_states=True,
             )
             hidden = outputs.hidden_states[-1]
-            logits = outputs.logits if with_logits else None
+            logits = outputs.logits if with_mlm_logits else None
         else:
             outputs = self.base_model(
                 input_ids=batch['input_ids'],
@@ -594,6 +607,42 @@ class MMBertRegressor(nn.Module):
                 batch['input_ids'], batch['attention_mask'],
                 batch['mod_span_mask'], batch['head_span_mask']))
         features = torch.cat(feats, dim=1)
+        return mod_emb, head_emb, features, logits
+
+    def _forward_gauss(self, batch, with_logits: bool = False, with_reps: bool = False,
+                       with_lm: bool = False):
+        """head_mode='gauss': predict N(mu, sigma^2) per span, sigma via the
+        logits channel so the shared training loop works unchanged."""
+        need_lm = self.use_lm_features or with_lm
+        mod_emb, head_emb, features, _ = self._features(batch, need_lm, with_mlm_logits=False)
+        if self.use_proto_cos:
+            cos_mod = self._prototype_cos(
+                batch['input_ids'], batch['mod_span_mask'], mod_emb)
+            cos_head = self._prototype_cos(
+                batch['input_ids'], batch['head_span_mask'], head_emb)
+            mod_mu, mod_sigma = self.mod_gauss(torch.cat([features, cos_mod], dim=1))
+            head_mu, head_sigma = self.head_gauss(torch.cat([features, cos_head], dim=1))
+        else:
+            mod_mu, mod_sigma = self.mod_gauss(features)
+            head_mu, head_sigma = self.head_gauss(features)
+        mod_pred = mod_mu.clamp(SCORE_MIN, SCORE_MAX)
+        head_pred = head_mu.clamp(SCORE_MIN, SCORE_MAX)
+        if with_reps and with_logits:
+            return mod_pred, head_pred, mod_emb, head_emb, mod_sigma, head_sigma
+        if with_reps:
+            return mod_pred, head_pred, mod_emb, head_emb
+        if with_logits:
+            return mod_pred, head_pred, mod_sigma, head_sigma
+        return mod_pred, head_pred
+
+    def forward(self, batch, with_logits: bool = False, with_reps: bool = False,
+                with_lm: bool = False):
+        if self.head_mode == 'gauss':
+            return self._forward_gauss(batch, with_logits, with_reps, with_lm)
+
+        need_lm = (with_logits and self.head_mode != 'softmax') or self.use_lm_features
+        mod_emb, head_emb, features, logits = self._features(batch, need_lm,
+                                                             with_mlm_logits=with_logits)
 
         # mod_out/head_out are separate MLPs, so each only sees its OWN word's
         # literalness signal (cos with the static prototype), not the other's.

@@ -190,15 +190,27 @@ class Trainer:
             init_scale=self.cfg.amp_init_scale,
             growth_interval=self.cfg.amp_growth_interval,
         )
-        criterion = CombinedLoss(
-            ccc_weight=self.cfg.ccc_weight, lambda_rank=self.cfg.lambda_rank,
-            rank_margin=self.cfg.rank_margin,
-            rank_margin_mode=self.cfg.rank_margin_mode,
-            ccc_var_floor=self.cfg.ccc_var_floor,
-            std_alpha=self.cfg.loss_std_alpha,
-            ce_weight=self.cfg.ce_weight, num_bins=self.cfg.num_bins,
-            bin_sigma=self.cfg.bin_sigma, use_label_std=self.cfg.use_label_std,
-        ).to(self.device)
+        if self.cfg.head_mode == 'gauss':
+            from mm.losses_gauss import GaussLoss
+            criterion = GaussLoss(
+                lambda_dist=self.cfg.ce_weight, ccc_weight=self.cfg.ccc_weight,
+                lambda_rank=self.cfg.lambda_rank,
+                rank_margin=self.cfg.rank_margin,
+                rank_margin_mode=self.cfg.rank_margin_mode,
+                ccc_var_floor=self.cfg.ccc_var_floor,
+                bin_sigma=self.cfg.bin_sigma, use_label_std=self.cfg.use_label_std,
+                std_alpha=self.cfg.loss_std_alpha,
+            ).to(self.device)
+        else:
+            criterion = CombinedLoss(
+                ccc_weight=self.cfg.ccc_weight, lambda_rank=self.cfg.lambda_rank,
+                rank_margin=self.cfg.rank_margin,
+                rank_margin_mode=self.cfg.rank_margin_mode,
+                ccc_var_floor=self.cfg.ccc_var_floor,
+                std_alpha=self.cfg.loss_std_alpha,
+                ce_weight=self.cfg.ce_weight, num_bins=self.cfg.num_bins,
+                bin_sigma=self.cfg.bin_sigma, use_label_std=self.cfg.use_label_std,
+            ).to(self.device)
 
         best_rho, best_epoch, no_improve_epochs = -float('inf'), -1, 0
         best: Optional[Dict[str, np.ndarray]] = None

@@ -17,7 +17,7 @@ Mode = Literal['train80', 'train5', 'predict']
 PredictMode = Literal['single', '5fold']
 ContextPool = Literal['mean', 'cls', 'mean+cls']
 HeadPool = Literal['mean', 'attn']
-HeadMode = Literal['reg', 'softmax']
+HeadMode = Literal['reg', 'softmax', 'gauss']
 RankMarginMode = Literal['clamp', 'dynamic']
 ConsistMode = Literal['pull', 'infonce']
 MlmMaskSpan = Literal['one', 'both']
@@ -27,7 +27,7 @@ _MODES = ('train80', 'train5', 'predict')
 _PREDICT_MODES = ('single', '5fold')
 _CONTEXT_POOLS = ('mean', 'cls', 'mean+cls')
 _HEAD_POOLS = ('mean', 'attn')
-_HEAD_MODES = ('reg', 'softmax')
+_HEAD_MODES = ('reg', 'softmax', 'gauss')
 _RANK_MARGIN_MODES = ('clamp', 'dynamic')
 _CONSIST_MODES = ('pull', 'infonce')
 _MLM_MASK_SPANS = ('one', 'both')
@@ -52,7 +52,8 @@ class Config:
     # attention pool (recommended: a compound is usually 1-2 tokens)
     head_pool: HeadPool = 'attn'
     context_pool: ContextPool = 'mean+cls'
-    # output head: 'reg' = scalar regression; 'softmax' = ordinal bins -> E[Y]
+    # output head: 'reg' = scalar regression; 'softmax' = ordinal bins -> E[Y];
+    # 'gauss' = predict (mu, sigma) of a Gaussian (value + uncertainty)
     head_mode: HeadMode = 'reg'
     num_bins: int = 6
     head_hidden: int = 128
@@ -240,8 +241,8 @@ class Config:
             errors.append(f'context_pool must be one of {_CONTEXT_POOLS}, got {self.context_pool!r}')
         if self.head_mode not in _HEAD_MODES:
             errors.append(f'head_mode must be one of {_HEAD_MODES}, got {self.head_mode!r}')
-        if self.ce_weight > 0 and self.head_mode != 'softmax':
-            errors.append('ce_weight > 0 (Gaussian soft-target CE) requires head_mode="softmax"')
+        if self.ce_weight > 0 and self.head_mode not in ('softmax', 'gauss'):
+            errors.append('ce_weight > 0 (Gaussian soft-target CE / KL) requires head_mode="softmax" or "gauss"')
         if self.rank_margin_mode not in _RANK_MARGIN_MODES:
             errors.append(
                 f'rank_margin_mode must be one of {_RANK_MARGIN_MODES}, got {self.rank_margin_mode!r}'
