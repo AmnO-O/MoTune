@@ -224,6 +224,12 @@ class Trainer:
         for epoch in range(self.cfg.total_epochs):
             if self._train_sampler is not None:
                 self._train_sampler.set_epoch(epoch)
+
+            # Re-pool the mid-5 span cache whenever the backbone can have
+            # moved since the previous epoch (LoRA phase-1 unfreezing steps
+            # the LM every batch). Frozen-backbone runs pay a trivial one-off
+            # recompute and stay correct either way.
+            model.reset_span_cache()
                 
             if epoch == self.cfg.freeze_epochs and self.cfg.freeze_epochs > 0:
                 self.logger.info(

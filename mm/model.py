@@ -465,8 +465,9 @@ class MMBertRegressor(nn.Module):
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
                  head_mode: str = 'reg', num_bins: int = 6,
                  context_pool: str = 'mean+cls', head_pool: str = 'attn',
-                 head_hidden: int = 128, use_lm_features: bool = False,
-                 use_proto_cos: bool = False):
+                 head_hidden: int = 128,                  use_lm_features: bool = False,
+                 use_proto_cos: bool = False,
+                 span_layers: Optional[Sequence[int]] = None):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
@@ -476,6 +477,11 @@ class MMBertRegressor(nn.Module):
         self.head_pool = head_pool
         self.use_lm_features = use_lm_features
         self.use_proto_cos = use_proto_cos
+        # MID-layer span pooling (option a). Empty/None = auto mid-5; a
+        # concrete tuple (e.g. (-1,)) pins exact layers. Resolved lazily in
+        # _features on the first forward, so __init__ only needs the raw knob.
+        self.span_layers = tuple(int(i) for i in (span_layers or ()))
+        self._span_hidden = None
 
         self.lm = AutoModelForMaskedLM.from_pretrained(backbone)
         # Cached reference to the base transformer for the no-logits forward
@@ -542,6 +548,16 @@ class MMBertRegressor(nn.Module):
 
         return torch.cat([_stats(mod_mask), _stats(head_mask)], dim=-1)
 
+    def reset_span_cache(self) -> None:
+        """Drop the lazily-cached MID-layer span hidden state.
+
+        Called once per training epoch so LoRA-updated backbone weights are
+        re-pooled on the first forward of the epoch (otherwise the mid-5
+        span branch would keep serving the pre-epoch snapshot).
+        """
+        self._span_hidden = None
+
+    # ------------------------------------------------------------------ #
     def _prototype_cos(self, input_ids: torch.Tensor, span_mask: torch.Tensor,
                        use_emb: torch.Tensor) -> torch.Tensor:
         """Literality: cosine between the contextualised USE embedding and the
@@ -582,12 +598,33 @@ class MMBertRegressor(nn.Module):
             outputs = self.base_model(
                 input_ids=batch['input_ids'],
                 attention_mask=batch['attention_mask'],
+                output_hidden_states=True,
             )
             hidden = outputs[0] if isinstance(outputs, tuple) else outputs.last_hidden_state
             logits = None
 
-        mod_emb = self.mod_pool(hidden, batch['mod_span_mask'])
-        head_emb = self.head_role_pool(hidden, batch['head_span_mask'])
+        # Span embeddings come from a MID-pool of layers. Early/mid layers keep
+        # the span's literal (word-identity) signal; late layers over-contextualize
+        # and blur it (BERT mixing layer). `span_layers=None` auto-selects 5 layers
+        # around half-depth; `(-1,)` = last layer (the old behaviour / A-B base).
+        # LM/MLM logits + context embeddings ALWAYS stay on the LAST layer (that is
+        # where the pretrained forecast head lives). Only the span-pool branch moves.
+        if self._span_hidden is None:
+            hid_all = outputs.hidden_states
+            layers = self.span_layers
+            n_layers = len(hid_all)
+            if not layers:
+                if n_layers > 8:
+                    mid = n_layers // 2
+                    layers = tuple(range(mid - 2, mid + 3))
+                else:
+                    layers = (-1,)
+            self._span_hidden = torch.mean(
+                torch.stack([hid_all[int(i) % n_layers] for i in layers]), dim=0)
+        span_hidden = self._span_hidden
+
+        mod_emb = self.mod_pool(span_hidden, batch['mod_span_mask'])
+        head_emb = self.head_role_pool(span_hidden, batch['head_span_mask'])
         mean_emb = _masked_mean(hidden, batch['attention_mask'])
 
         if self.context_pool == 'cls':
@@ -693,7 +730,7 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertRe
         head_mode=cfg.head_mode, num_bins=cfg.num_bins,
         context_pool=cfg.context_pool, head_pool=cfg.head_pool,
         head_hidden=cfg.head_hidden, use_lm_features=cfg.use_lm_features,
-        use_proto_cos=cfg.use_proto_cos,
+        use_proto_cos=cfg.use_proto_cos, span_layers=cfg.span_layers,
     )
     if load_from is not None:
         load_from = Path(load_from)

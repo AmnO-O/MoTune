@@ -52,9 +52,20 @@ class Config:
     # attention pool (recommended: a compound is usually 1-2 tokens)
     head_pool: HeadPool = 'attn'
     context_pool: ContextPool = 'mean+cls'
+    # Span-pool layers for the literalness branch (mod_emb/head_emb). `None`
+    # = auto mid-5 (mean of 5 layers around half-depth; falls back to last
+    # layer for backbones with <= 8 blocks). `(-1,)` = keep last layer.
+    # LM logits + context features still use the LAST layer either way.
+    # ONLY cosmeticity-prototype cos is computed from these span embeddings, so
+    # changing this does NOT touch the self-supervised MLM objective.
+    span_layers: Optional[Tuple[int, ...]] = None
     # output head: 'reg' = scalar regression; 'softmax' = ordinal bins -> E[Y];
-    # 'gauss' = predict (mu, sigma) of a Gaussian (value + uncertainty)
+    # 'gauss' = predict (mu, sigma) of a Gaussian (value + uncertainty),
+    # sigma via the logits/MLM channel so the shared self-supervised loop is
+    # untouched (see mm/heads.py + mm/losses_gauss.py).
     head_mode: HeadMode = 'reg'
+    ce_weight: float = 0.0
+    ccc_weight: float = 1.0
     num_bins: int = 6
     head_hidden: int = 128
     dropout: float = 0.2
