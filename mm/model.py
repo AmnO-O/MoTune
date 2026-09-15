@@ -624,6 +624,12 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertRe
 
     ``load_from`` is a torch state_dict SAVED BY US (e.g.
     ``output_dir/models/warmup_merged.pt``), NOT a Hugging Face directory.
+    Two formats are accepted:
+    - backbone-only (current): keys are the LM state without any ``lm.`` prefix
+      (``model.lm.state_dict()``); scorer heads get fresh init, so the same
+      snapshot works across any head config (use_proto_cos, use_lm_features, ...).
+    - legacy full-model snapshot: includes ``mod_regressor.*`` / ``head_regressor.*``
+      (older warmups); loaded strictly as before.
     """
     model = MMBertRegressor(
         cfg.backbone, hidden_size=cfg.hidden_size, dropout=cfg.dropout,
@@ -637,5 +643,8 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertRe
         if not load_from.is_file():
             raise FileNotFoundError(f'state dict not found: {load_from}')
         state = torch.load(load_from, map_location='cpu', weights_only=True)
-        model.load_state_dict(state)
+        if any(k.startswith('mod_regressor') for k in state):
+            model.load_state_dict(state)
+        else:
+            model.lm.load_state_dict(state)
     return model.to(device)

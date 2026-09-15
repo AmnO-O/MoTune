@@ -185,11 +185,14 @@ def run_warmup(cfg: Config, logger: logging.Logger, device,
                     cfg.warmup_mlm_epochs, loss)
 
     # 8. Gộp LoRA trọng số và lưu Snapshot
+    # Chỉ lưu backbone LM (lm.*) — KHÔNG lưu scorer heads: head_in phụ thuộc
+    # config (num_bins, use_lm_features, use_proto_cos, pools) nên snapshot
+    # phải portable giữa các config. Heads nhỏ sẽ init mới ở phase train.
     merge_lora(model, adapters)
     out = Path(output_dir) / 'models' / 'warmup_merged.pt'
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), out)
-    logger.info('warmup LoRA merged + snapshot saved: %s', out)
+    torch.save(model.lm.state_dict(), out)
+    logger.info('warmup LoRA merged + backbone snapshot saved: %s', out)
 
     return {'warmup_epochs': cfg.warmup_mlm_epochs}
 

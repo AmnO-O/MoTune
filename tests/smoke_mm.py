@@ -666,6 +666,10 @@ def check_fixes() -> None:
           'build_model wires use_proto_cos from config')
     check('self._prototype_cos(' in model_src2,
           'forward appends cos(use, prototype) features when use_proto_cos')
+    check("torch.save(model.lm.state_dict(), out)" in pipe_src,
+          'warmup snapshot is backbone-only (portable across head configs)')
+    check("k.startswith('mod_regressor')" in model_src2,
+          'build_model tolerates legacy full-model warmup snapshots')
     tr_src = (ROOT / 'mm' / 'trainer.py').read_text(encoding='utf-8')
     check('from_layer=self.cfg.lora_from_layer' in tr_src,
           'trainer passes lora_from_layer to apply_lora')
