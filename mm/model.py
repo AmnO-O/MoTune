@@ -467,7 +467,8 @@ class MMBertRegressor(nn.Module):
                  context_pool: str = 'mean+cls', head_pool: str = 'attn',
                  head_hidden: int = 128,                  use_lm_features: bool = False,
                  use_proto_cos: bool = False,
-                 span_layers: Optional[Sequence[int]] = None):
+                 span_layers: Optional[Sequence[int]] = None,
+                 context_layers: Optional[Sequence[int]] = None):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
@@ -482,6 +483,14 @@ class MMBertRegressor(nn.Module):
         # _features on the first forward, so __init__ only needs the raw knob.
         self.span_layers = tuple(int(i) for i in (span_layers or ()))
         self._span_hidden = None
+
+        # Whole-sentence context pooling. Empty/None = LAST layer (deepest +
+        # global for mmBERT/ModernBERT; the old behaviour). A concrete tuple
+        # (hidden_states indices, `-1` = last) mean-pools those layers instead
+        # (e.g. (10, 16, 22) = upper global layers of mmBERT-base). Resolved
+        # lazily in _features so __init__ only needs the raw knob.
+        self.context_layers = tuple(int(i) for i in (context_layers or ()))
+        self._context_hidden = None
 
         self.lm = AutoModelForMaskedLM.from_pretrained(backbone, tie_word_embeddings=False)
         # Cached reference to the base transformer for the no-logits forward
@@ -632,14 +641,29 @@ class MMBertRegressor(nn.Module):
 
         mod_emb = self.mod_pool(span_hidden, batch['mod_span_mask'])
         head_emb = self.head_role_pool(span_hidden, batch['head_span_mask'])
-        mean_emb = _masked_mean(hidden, batch['attention_mask'])
+        # Context embeddings: `context_layers=None` keeps the LAST layer
+        # exactly as before (`hidden` may carry the final LayerNorm on the
+        # no-LM path). A concrete tuple mean-pools the resolved hidden-state
+        # indices instead (e.g. multiple GLOBAL attention layers of mmBERT).
+        if self.context_layers:
+            if self._context_hidden is None:
+                hid_all = outputs.hidden_states
+                n_layers = len(hid_all)
+                self._context_hidden = tuple(
+                    int(i) % n_layers for i in self.context_layers)
+            hid_all = outputs.hidden_states
+            context_hidden = torch.mean(
+                torch.stack([hid_all[i] for i in self._context_hidden]), dim=0)
+        else:
+            context_hidden = hidden
+        mean_emb = _masked_mean(context_hidden, batch['attention_mask'])
 
         if self.context_pool == 'cls':
-            context_emb = hidden[:, 0]
+            context_emb = context_hidden[:, 0]
         elif self.context_pool == 'mean':
             context_emb = mean_emb
         else:
-            context_emb = torch.cat([mean_emb, hidden[:, 0]], dim=1)
+            context_emb = torch.cat([mean_emb, context_hidden[:, 0]], dim=1)
 
         seq_len = batch['attention_mask'].sum(dim=1).clamp(min=1.0).float()
         mod_len = (batch['mod_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
@@ -738,6 +762,7 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertRe
         context_pool=cfg.context_pool, head_pool=cfg.head_pool,
         head_hidden=cfg.head_hidden, use_lm_features=cfg.use_lm_features,
         use_proto_cos=cfg.use_proto_cos, span_layers=cfg.span_layers,
+        context_layers=cfg.context_layers,
     )
     if load_from is not None:
         load_from = Path(load_from)

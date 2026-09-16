@@ -42,8 +42,10 @@ outputs.hidden_states: tuple gồm (N+1) phần tử
 - `mod_emb   = mod_pool(span_hidden, mod_span_mask)   → [B,H]`
 - `head_emb  = head_role_pool(span_hidden, head_span_mask) → [B,H]`
 
-### b) Nhánh context — đọc LỚP CUỐI (`hidden` = hidden_states[-1]) (model.py:637-642)
-- `mean_emb = _masked_mean(hidden, attention_mask) → [B,H]`
+### b) Nhánh context — đọc LỚP CUỐI (`hidden` = hidden_states[-1]) (model.py:650-666)
+- Mặc định `context_layers=None`: context = **lớp cuối** (global + sâu nhất cho mmBERT/ModernBERT — block 21).
+- Nếu chỉ định `context_layers=(10,16,22)`: mean-pool 3 hidden-states đó (global attention của mmBERT-base: block 9/15/21) trước khi pool context.
+- `mean_emb = _masked_mean(context_hidden, attention_mask) → [B,H]`
 - `context_emb = CLS[cls] / mean[mean] / cat(mean,CLS)[mean+cls] → [B, context_dim]`
   - `mean+cls` (mặc định): `[B, 2H]` = `[B,1536]`
 

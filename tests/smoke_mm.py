@@ -674,6 +674,19 @@ def check_fixes() -> None:
     check('from_layer=self.cfg.lora_from_layer' in tr_src,
           'trainer passes lora_from_layer to apply_lora')
 
+    # 4b) context_layers knob: config -> build_model -> mean-pooled context
+    check(getattr(cfg, 'context_layers', None) is None,
+          'config exposes context_layers defaulting to None (= last layer)')
+    check('context_layers=cfg.context_layers' in model_src2,
+          'build_model wires context_layers from config')
+    check("self._context_hidden = None" in model_src2
+          and "if self.context_layers:" in model_src2,
+          '_features mean-pools explicit context_layers behind the default last-layer path')
+    from mm.config import coerce_value
+    check(coerce_value('context_layers', '10,16,22') == ['10', '16', '22']
+          and coerce_value('span_layers', '-1') == ['-1'],
+          'CLI --set coerces Tuple knobs into list form (span_layers too)')
+
     # 5) Verify MLM decoder lookup fix: _encoder_hidden_size + correct _mlm_projection
     check('def _encoder_hidden_size(' in model_src2,
           '_encoder_hidden_size function defined in model.py')

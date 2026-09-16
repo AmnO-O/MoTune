@@ -59,6 +59,13 @@ class Config:
     # ONLY cosmeticity-prototype cos is computed from these span embeddings, so
     # changing this does NOT touch the self-supervised MLM objective.
     span_layers: Optional[Tuple[int, ...]] = None
+    # Context-pool layers for the whole-sentence context (context_emb). `None`
+    # = LAST layer (deepest + global for mmBERT/ModernBERT) — current behaviour.
+    # A concrete tuple (hidden_states indices, `-1` = last) mean-pools those
+    # layers instead, e.g. (10, 16, 22) = the 3 upper global attention layers of
+    # mmBERT-base (blocks 9/15/21). Mean-pooling keeps dim H, so head_in is
+    # unchanged. LM logits always stay on the LAST layer regardless.
+    context_layers: Optional[Tuple[int, ...]] = None
     # output head: 'reg' = scalar regression; 'softmax' = ordinal bins -> E[Y];
     # 'gauss' = predict (mu, sigma) of a Gaussian (value + uncertainty),
     # sigma via the logits/MLM channel so the shared self-supervised loop is
@@ -358,7 +365,7 @@ def coerce_value(name: str, raw: Any, cfg: type = Config) -> Any:
     if not isinstance(raw, str):
         return raw
     type_ = f.type
-    if 'List' in type_ or 'list' in type_:
+    if 'List' in type_ or 'list' in type_ or 'Tuple' in type_ or 'tuple' in type_:
         return [x.strip() for x in raw.split(',') if x.strip()]
     if type_ == 'int':
         return int(raw)
