@@ -654,6 +654,15 @@ class MMBertRegressor(nn.Module):
             hid_all = outputs.hidden_states
             context_hidden = torch.mean(
                 torch.stack([hid_all[i] for i in self._context_hidden]), dim=0)
+            # Raw pre-final-norm hidden states are several times LARGER per
+            # token than the post-norm last layer the Gauss head expects; the
+            # mean then saturates the head's (un-normalised) Tanh bottleneck,
+            # killing gradients. Re-run the backbone final LayerNorm so the
+            # pooled context stays at unit scale, like the default path.
+            norm = getattr(self.base_model, 'final_norm', None) \
+                or getattr(getattr(self.base_model, 'encoder', None), 'final_norm', None)
+            if norm is not None:
+                context_hidden = norm(context_hidden)
         else:
             context_hidden = hidden
         mean_emb = _masked_mean(context_hidden, batch['attention_mask'])

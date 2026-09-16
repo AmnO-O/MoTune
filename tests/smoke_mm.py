@@ -682,6 +682,9 @@ def check_fixes() -> None:
     check("self._context_hidden = None" in model_src2
           and "if self.context_layers:" in model_src2,
           '_features mean-pools explicit context_layers behind the default last-layer path')
+    check("final_norm', None)" in model_src2
+          and "norm(context_hidden)" in model_src2,
+          'context_layers path re-normalises the pooled pre-norm context to head-input scale')
     from mm.config import coerce_value
     check(coerce_value('context_layers', '10,16,22') == ['10', '16', '22']
           and coerce_value('span_layers', '-1') == ['-1'],
