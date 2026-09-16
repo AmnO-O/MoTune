@@ -210,7 +210,21 @@ class GaussLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 logits: Optional[torch.Tensor] = None,
                 std: Optional[torch.Tensor] = None,
-                compound_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+                compound_ids: Optional[torch.Tensor] = None,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if mask is not None:
+            mask = mask.to(pred.device)
+            if not mask.any():
+                anchor = pred.sum() * 0.0
+                if logits is not None:
+                    anchor = anchor + logits.sum() * 0.0
+                return anchor
+            pred = pred[mask]
+            target = target[mask]
+            logits = logits[mask] if logits is not None else None
+            std = std[mask] if std is not None else None
+            compound_ids = compound_ids[mask] if compound_ids is not None else None
+
         mu = pred.float()
         sigma_p = logits.float() if logits is not None else torch.full_like(mu, self.bin_sigma)
         if self.use_label_std and std is not None:

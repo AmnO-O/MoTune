@@ -41,21 +41,6 @@ def track_optimizer_steps(optimizer) -> None:
         optimizer._cmp_step_counter = None
 
 
-def _supervised_term(criterion, pred, target, logits, std, cid, allowed):
-    # Compute anchor BEFORE any indexing so requires_grad is preserved.
-    # Boolean indexing on an empty result drops requires_grad in PyTorch;
-    # anchoring to the full pred.sum()*0 ensures .backward() works even
-    # when all rows are filtered (backbone frozen, only heads trainable).
-    _zero = pred.sum() * 0.0
-    if allowed is not None:
-        pred = pred[allowed]
-        target = target[allowed]
-        logits = logits[allowed] if logits is not None else None
-        std = std[allowed] if std is not None else None
-        cid = cid[allowed] if cid is not None else None
-        if pred.numel() == 0:
-            return _zero
-    return criterion(pred, target, logits, std, compound_ids=cid)
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
                 grad_clip=1.0, accum_steps=1, report=None,
                 consist_weight=0.0, consist_mode='pull', consist_temp=0.1,
@@ -107,12 +92,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             else:
                 mod_pred, head_pred = model(batch)
 
-            loss = _supervised_term(
-                criterion, mod_pred, batch['mod_avg'], mod_logits,
-                batch['mod_std'], batch['compound_id'], allowed,
-            ) + _supervised_term(
-                criterion, head_pred, batch['head_avg'], head_logits,
-                batch['head_std'], batch['compound_id'], allowed,
+            loss = criterion(
+                mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
+                compound_ids=batch['compound_id'], mask=allowed,
+            ) + criterion(
+                head_pred, batch['head_avg'], head_logits, batch['head_std'],
+                compound_ids=batch['compound_id'], mask=allowed,
             )
 
             consist_val = None

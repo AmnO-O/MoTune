@@ -112,10 +112,10 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
          mod_logits, head_logits) = model(batch, with_logits=True, with_reps=True)
         allowed = batch['has_label'] & batch['has_mod'] & batch['has_head'] & ~batch['degenerate']
         loss = (
-            criterion(mod_pred[allowed], batch['mod_avg'][allowed], mod_logits[allowed],
-                      batch['mod_std'][allowed], compound_ids=batch['compound_id'][allowed])
-            + criterion(head_pred[allowed], batch['head_avg'][allowed], head_logits[allowed],
-                        batch['head_std'][allowed], compound_ids=batch['compound_id'][allowed])
+            criterion(mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
+                      compound_ids=batch['compound_id'], mask=allowed)
+            + criterion(head_pred, batch['head_avg'], head_logits, batch['head_std'],
+                        compound_ids=batch['compound_id'], mask=allowed)
         )
     scaler.scale(loss).backward()
     logger.info('[smoke] gauss forward + backward OK (loss %.4f)', loss.item())

@@ -385,6 +385,12 @@ def check_fixes() -> None:
     check("if '.linear.' in name:" in train_src,
           'unfreeze_top_layers skips LoRA-wrapped base weights')
 
+    # 4b) label/empty masking lives in the criterion, not a train.py helper
+    check('def _supervised_term' not in train_src,
+          '_supervised_term removed; GaussLoss.forward owns the allowed-mask')
+    check('mask=allowed' in train_src,
+          'train_epoch calls GaussLoss with mask=allowed (no pre-indexing)')
+
     try:
         import torch as _torch
         from src import losses as G
@@ -426,6 +432,13 @@ def check_fixes() -> None:
         dfl = G.GaussLoss(std_alpha=0.0)
         loss = dfl(pred, tgt, logits=_torch.ones(16), compound_ids=c)
         check(bool(_torch.isfinite(loss)), 'GaussLoss forward finite')
+
+        # empty-mask: returns 0.0 with grad connected (no NaN, no graph break)
+        pg = _torch.randn(16, requires_grad=True)
+        z = dfl(pg, tgt, logits=_torch.ones(16), compound_ids=c,
+                mask=_torch.zeros(16, dtype=_torch.bool))
+        check(bool(z.item() == 0.0) and z.requires_grad,
+              'GaussLoss(mask=all-False) returns grad-connected zero')
     except ImportError:
         print('  [SKIP] torch not installed; GaussHead / gauss_kl numerical checks skipped')
 
