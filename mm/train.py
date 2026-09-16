@@ -367,7 +367,9 @@ def unfreeze_top_layers(model, from_layer: int) -> None:
 
     for idx, layer in enumerate(layers):
         if idx >= from_layer:
-            for param in layer.parameters():
+            for name, param in layer.named_parameters():
+                if '.linear.' in name:
+                    continue   # base weight of a LoRAAdapter stays frozen
                 param.requires_grad = True
 
     norm = getattr(base, 'final_norm', None)

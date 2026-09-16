@@ -241,6 +241,13 @@ class LoRAAdapter(nn.Module):
     def __init__(self, linear: nn.Linear, r: int, alpha: int, dropout: float):
         super().__init__()
         self.linear = linear
+        # Hard invariant: the base weight is NEVER trainable once wrapped
+        # (docstring: "Freeze-base"). Some callers (e.g. unfreeze_top_layers)
+        # walk the layer tree and flip requires_grad=True on everything, which
+        # would double-train base+adapter — the wrap points re-freeze below.
+        linear.weight.requires_grad = False
+        if linear.bias is not None:
+            linear.bias.requires_grad = False
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.a = nn.Linear(linear.in_features, r, bias=False)
         self.b = nn.Linear(r, linear.out_features, bias=False)
@@ -366,6 +373,9 @@ def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,
                         _walk(child, full)
                     continue
                 if _linear_is(child) and _matches(full):
+                    child.weight.requires_grad = False
+                    if child.bias is not None:
+                        child.bias.requires_grad = False
                     setattr(module, name, LoRAAdapter(child, rank, alpha, dropout))
                     adapters.append(getattr(module, name))
                     paths.append(full)
@@ -468,7 +478,11 @@ class MMBertRegressor(nn.Module):
                  head_hidden: int = 128,                  use_lm_features: bool = False,
                  use_proto_cos: bool = False,
                  span_layers: Optional[Sequence[int]] = None,
-                 context_layers: Optional[Sequence[int]] = None):
+                 context_layers: Optional[Sequence[int]] = None,
+                 gauss_dedicated: bool = False,
+                 gauss_ctx_mod: Optional[Sequence[int]] = None,
+                 gauss_ctx_head: Optional[Sequence[int]] = None,
+                 gauss_ctx_pv: Optional[Sequence[int]] = None):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
@@ -492,6 +506,17 @@ class MMBertRegressor(nn.Module):
         self.context_layers = tuple(int(i) for i in (context_layers or ()))
         self._context_hidden = None
 
+        # Per-role dedicated context: each gauss head reads the whole-sentence
+        # context at its own hidden-state layer(s) instead of the last one.
+        # Word spans stay at mid-5; feature width unchanged.
+        self.gauss_dedicated = gauss_dedicated
+        self.gauss_ctx_mod  = tuple(int(i) for i in (gauss_ctx_mod  or ()))
+        self.gauss_ctx_head = tuple(int(i) for i in (gauss_ctx_head or ()))
+        self.gauss_ctx_pv   = tuple(int(i) for i in (gauss_ctx_pv   or ()))
+        self._ctx_mod_hidden  = None   # resolved indices, cached per epoch
+        self._ctx_head_hidden = None
+        self._ctx_pv_hidden   = None
+
         self.lm = AutoModelForMaskedLM.from_pretrained(backbone, tie_word_embeddings=False)
         # Cached reference to the base transformer for the no-logits forward
         # path. Deliberately NOT registered as a child module: registering the
@@ -504,9 +529,10 @@ class MMBertRegressor(nn.Module):
         self.head_in = hidden_size * 2 + context_dim + 2      # 2 spans + 2 lens + context
         if use_lm_features:
             self.head_in += 4                                  # avg_logp + entropy x mod/head
-        # NOTE: proto-cos is NOT added to head_in; each output branch instead
-        # gets ONLY its own word's cos(use, prototype) appended at the front,
-        # so mod_out never sees head's literalness and vice-versa.
+        # Each output branch gets ONLY its own word's cos(use, prototype)
+        # tacked on (torch.cat, last axis), so mod_out never sees head's
+        # literalness and vice-versa. That extra column IS part of head_in.
+        self.head_in += 1 if use_proto_cos else 0
 
         self.mod_pool = SpanPool(hidden_size, head_pool)
         self.head_role_pool = SpanPool(hidden_size, head_pool)
@@ -543,17 +569,24 @@ class MMBertRegressor(nn.Module):
         if not span.any():
             return torch.zeros(input_ids.size(0), 4, device=input_ids.device)
         ids = ids.masked_fill(span, mask_id)
-        logp = self.lm(input_ids=ids, attention_mask=attention_mask).logits.float()
-        logp = F.log_softmax(logp, dim=-1)                        # (B, L, V)
-        p = logp.exp()
+        logits = self.lm(input_ids=ids, attention_mask=attention_mask).logits  # (B, L, V)
 
         def _stats(mask: torch.Tensor) -> torch.Tensor:
+            B = input_ids.size(0)
+            rows = torch.nonzero(mask)                    # (N, 2): (batch, seq)
+            if rows.numel() == 0:
+                return torch.zeros(B, 2, device=input_ids.device)
+            b, l = rows[:, 0], rows[:, 1]
+            # log_softmax ONLY at the ~few span positions: a full (B, L, V)
+            # log-prob + exp table is tens of GB with a large-Vocab backbone.
+            pos_logp = F.log_softmax(logits[b, l].float(), dim=-1)            # (N, V)
+            tok_logp = torch.gather(
+                pos_logp, -1, input_ids[b, l].unsqueeze(-1)).squeeze(-1)      # (N,)
+            ent = -(pos_logp.exp() * pos_logp).sum(-1)                        # (N,)
+            avg = torch.zeros(B, device=input_ids.device).index_add_(0, b, tok_logp)
+            ent_sum = torch.zeros(B, device=input_ids.device).index_add_(0, b, ent)
             n = mask.long().sum(-1).clamp(min=1)
-            idx = input_ids[:, None, :].expand_as(ids)
-            tok_logp = torch.gather(logp, -1, idx.unsqueeze(-1)).squeeze(-1)
-            avg = (tok_logp * mask.float()).sum(-1) / n           # (B,)
-            ent = -(p * logp * mask.float().unsqueeze(-1)).sum(-1).sum(-1) / n
-            return torch.stack([avg, ent], dim=-1)                # (B, 2)
+            return torch.stack([avg / n, ent_sum / n], dim=-1)                # (B, 2)
 
         return torch.cat([_stats(mod_mask), _stats(head_mask)], dim=-1)
 
@@ -565,6 +598,10 @@ class MMBertRegressor(nn.Module):
         span branch would keep serving the pre-epoch snapshot).
         """
         self._span_hidden = None
+        self._context_hidden = None
+        self._ctx_mod_hidden = None
+        self._ctx_head_hidden = None
+        self._ctx_pv_hidden = None
 
     # ------------------------------------------------------------------ #
     def _prototype_cos(self, input_ids: torch.Tensor, span_mask: torch.Tensor,
@@ -577,17 +614,53 @@ class MMBertRegressor(nn.Module):
         in "ivory tower"). Rows with no span contribute 0.
         """
         weight = self.lm.get_input_embeddings().weight
-        tok = weight.index_select(0, input_ids.reshape(-1)).reshape(
-            input_ids.size(0), input_ids.size(1), -1)
+        tok = F.embedding(input_ids, weight)
         n = span_mask.long().sum(-1).clamp(min=1).unsqueeze(-1)
         proto = (tok * span_mask.float().unsqueeze(-1)).sum(1) / n
-        cos = F.cosine_similarity(use_emb.float(), proto.float(), dim=-1)
-        cos = torch.where(span_mask.any(-1), cos, torch.zeros_like(cos))
+        # Rows with no span produce a zero vector; cosine_similarity would
+        # then divide by norm 0 -> NaN. torch.where fixes the FORWARD value
+        # but NaN still flows into the backward graph (0 * NaN = NaN), so
+        # substitute ones BEFORE the cosine and select afterwards.
+        has_span = span_mask.any(-1, keepdim=True)
+        proto_safe = torch.where(has_span, proto, torch.ones_like(proto))
+        cos = F.cosine_similarity(use_emb.float(), proto_safe.float(), dim=-1)
+        cos = torch.where(has_span.squeeze(-1), cos, torch.zeros_like(cos))
         return cos.type_as(use_emb).unsqueeze(-1)
 
     def _pool(self, hidden: torch.Tensor, mask: torch.Tensor,
               pool: SpanPool) -> torch.Tensor:
         return pool(hidden, mask)
+
+    def _context_emb(self, hidden: torch.Tensor, batch) -> torch.Tensor:
+        """Pool a [B, S, H] hidden tensor into the whole-sentence context
+        embedding (mean and/or [CLS]) and mask at the pool mode."""
+        mean_emb = _masked_mean(hidden, batch['attention_mask'])
+        if self.context_pool == 'cls':
+            return hidden[:, 0]
+        if self.context_pool == 'mean':
+            return mean_emb
+        return torch.cat([mean_emb, hidden[:, 0]], dim=1)
+
+    def _role_context(self, layers, hid_all, batch) -> torch.Tensor:
+        """Whole-sentence context pooled at explicit hidden-state indices.
+        Raw pre-norm hidden states are larger in magnitude than the post-norm
+        last layer the heads expect, so the mean is re-normalised by the
+        backbone final LayerNorm (same fix as the context_layers path)."""
+        hidden = torch.mean(torch.stack([hid_all[i] for i in layers]), dim=0)
+        norm = getattr(self.base_model, 'final_norm', None) \
+            or getattr(getattr(self.base_model, 'encoder', None), 'final_norm', None)
+        if norm is not None:
+            hidden = norm(hidden)
+        return self._context_emb(hidden, batch)
+
+    def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,
+                            context_emb, batch, lm_stats=None) -> torch.Tensor:
+        """Gauss-head feature bundle: mid-5 spans + 2 lens + (role-specific)
+        context + optional LM stats. Same width as the default shared soup."""
+        feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
+        if lm_stats is not None:
+            feats.append(lm_stats)
+        return torch.cat(feats, dim=1)
 
     def _features(self, batch, need_lm: bool, with_mlm_logits: bool = False):
         """Encoder forward + shared span/context feature building.
@@ -665,43 +738,69 @@ class MMBertRegressor(nn.Module):
                 context_hidden = norm(context_hidden)
         else:
             context_hidden = hidden
-        mean_emb = _masked_mean(context_hidden, batch['attention_mask'])
-
-        if self.context_pool == 'cls':
-            context_emb = context_hidden[:, 0]
-        elif self.context_pool == 'mean':
-            context_emb = mean_emb
-        else:
-            context_emb = torch.cat([mean_emb, context_hidden[:, 0]], dim=1)
+        context_emb = self._context_emb(context_hidden, batch)
 
         seq_len = batch['attention_mask'].sum(dim=1).clamp(min=1.0).float()
         mod_len = (batch['mod_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
         head_len = (batch['head_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
 
         feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
+        lm_stats = None
         if self.use_lm_features:
-            feats.append(self._lm_span_stats(
+            lm_stats = self._lm_span_stats(
                 batch['input_ids'], batch['attention_mask'],
-                batch['mod_span_mask'], batch['head_span_mask']))
+                batch['mod_span_mask'], batch['head_span_mask'])
+            feats.append(lm_stats)
         features = torch.cat(feats, dim=1)
-        return mod_emb, head_emb, features, logits
+        mod_feat = head_feat = None
+        if self.gauss_dedicated:
+            hid_all = outputs.hidden_states
+            n_layers = len(hid_all)
+            if self._ctx_mod_hidden is None:
+                self._ctx_mod_hidden = tuple(
+                    int(i) % n_layers for i in (self.gauss_ctx_mod or (-1,)))
+            if self._ctx_head_hidden is None:
+                self._ctx_head_hidden = tuple(
+                    int(i) % n_layers for i in (self.gauss_ctx_head or (-1,)))
+            ctx_mod = self._role_context(self._ctx_mod_hidden, hid_all, batch)
+            ctx_head = self._role_context(self._ctx_head_hidden, hid_all, batch)
+            pv = batch.get('is_pv')
+            has_pv = bool(self.gauss_ctx_pv) and pv is not None
+            if has_pv:
+                if self._ctx_pv_hidden is None:
+                    self._ctx_pv_hidden = tuple(
+                        int(i) % n_layers for i in self.gauss_ctx_pv)
+                ctx_pv = self._role_context(self._ctx_pv_hidden, hid_all, batch)
+                use_pv = pv.bool().unsqueeze(-1)
+                ctx_mod = torch.where(use_pv, ctx_pv, ctx_mod)
+                ctx_head = torch.where(use_pv, ctx_pv, ctx_head)
+            mod_feat = self._compose_gauss_feat(
+                mod_emb, head_emb, mod_len, head_len, ctx_mod, batch,
+                lm_stats=lm_stats)
+            head_feat = self._compose_gauss_feat(
+                mod_emb, head_emb, mod_len, head_len, ctx_head, batch,
+                lm_stats=lm_stats)
+        return mod_emb, head_emb, features, logits, mod_feat, head_feat
 
     def _forward_gauss(self, batch, with_logits: bool = False, with_reps: bool = False,
                        with_lm: bool = False):
         """head_mode='gauss': predict N(mu, sigma^2) per span, sigma via the
         logits channel so the shared training loop works unchanged."""
         need_lm = self.use_lm_features or with_lm
-        mod_emb, head_emb, features, _ = self._features(batch, need_lm, with_mlm_logits=False)
+        mod_emb, head_emb, features, _, mod_feat, head_feat = self._features(
+            batch, need_lm, with_mlm_logits=False)
+        if mod_feat is None:
+            mod_feat = head_feat = features
         if self.use_proto_cos:
             cos_mod = self._prototype_cos(
                 batch['input_ids'], batch['mod_span_mask'], mod_emb)
             cos_head = self._prototype_cos(
                 batch['input_ids'], batch['head_span_mask'], head_emb)
-            mod_mu, mod_sigma = self.mod_gauss(torch.cat([features, cos_mod], dim=1))
-            head_mu, head_sigma = self.head_gauss(torch.cat([features, cos_head], dim=1))
+            mod_mu, mod_sigma = self.mod_gauss(torch.cat([mod_feat, cos_mod], dim=1))
+            head_mu, head_sigma = self.head_gauss(torch.cat([head_feat, cos_head], dim=1))
         else:
-            mod_mu, mod_sigma = self.mod_gauss(features)
-            head_mu, head_sigma = self.head_gauss(features)
+            mod_mu, mod_sigma = self.mod_gauss(mod_feat)
+            head_mu, head_sigma = self.head_gauss(head_feat)
         mod_pred = mod_mu.clamp(SCORE_MIN, SCORE_MAX)
         head_pred = head_mu.clamp(SCORE_MIN, SCORE_MAX)
         if with_reps and with_logits:
@@ -718,8 +817,8 @@ class MMBertRegressor(nn.Module):
             return self._forward_gauss(batch, with_logits, with_reps, with_lm)
 
         need_lm = (with_logits and self.head_mode != 'softmax') or self.use_lm_features
-        mod_emb, head_emb, features, logits = self._features(batch, need_lm,
-                                                             with_mlm_logits=with_logits)
+        mod_emb, head_emb, features, logits, _, _ = self._features(batch, need_lm,
+                                                                   with_mlm_logits=with_logits)
 
         # mod_out/head_out are separate MLPs, so each only sees its OWN word's
         # literalness signal (cos with the static prototype), not the other's.
@@ -772,6 +871,8 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertRe
         head_hidden=cfg.head_hidden, use_lm_features=cfg.use_lm_features,
         use_proto_cos=cfg.use_proto_cos, span_layers=cfg.span_layers,
         context_layers=cfg.context_layers,
+        gauss_dedicated=cfg.gauss_dedicated, gauss_ctx_mod=cfg.gauss_ctx_mod,
+        gauss_ctx_head=cfg.gauss_ctx_head, gauss_ctx_pv=cfg.gauss_ctx_pv,
     )
     if load_from is not None:
         load_from = Path(load_from)

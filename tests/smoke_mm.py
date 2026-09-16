@@ -690,6 +690,53 @@ def check_fixes() -> None:
           and coerce_value('span_layers', '-1') == ['-1'],
           'CLI --set coerces Tuple knobs into list form (span_layers too)')
 
+    # 4c) dedicated gauss heads: per-role CONTEXT layers, spans stay mid-5
+    check(getattr(cfg, 'gauss_dedicated', False) is False
+          and getattr(cfg, 'gauss_ctx_mod', None) is None
+          and getattr(cfg, 'gauss_ctx_head', None) is None
+          and getattr(cfg, 'gauss_ctx_pv', None) is None,
+          'config exposes gauss_dedicated + gauss_ctx_{mod,head,pv} defaults off')
+    check('gauss_dedicated=cfg.gauss_dedicated' in model_src2
+          and 'gauss_ctx_pv=cfg.gauss_ctx_pv' in model_src2,
+          'build_model wires gauss_dedicated/gauss_ctx_* from config')
+    check('def _role_context(' in model_src2
+          and 'def _compose_gauss_feat(' in model_src2,
+          '_features builds per-role context bundles (_role_context/_compose_gauss_feat)')
+    check("batch.get('is_pv')" in model_src2
+          and 'torch.where(use_pv, ctx_pv' in model_src2,
+          'en-pv rows routed to gauss_ctx_pv via torch.where')
+    check("'is_pv': torch.tensor(str(r.get('lang', '')) == 'en-pv'" in
+          (ROOT / 'mm' / 'data.py').read_text(encoding='utf-8'),
+          'CompDataset encodes is_pv from the row language (en-pv)')
+    check(coerce_value('gauss_ctx_head', '20') == ['20']
+          and coerce_value('gauss_ctx_pv', '22') == ['22'],
+          'CLI --set coerces gauss_ctx_* into list form')
+    # 4d) proto-cos dimension + lm-stats + embedding-lookup fixes
+    check('self.head_in += 1 if use_proto_cos else 0' in model_src2,
+          'head_in counts the appended cos column (+1 when use_proto_cos)')
+    check('def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,'
+          in model_src2
+          and 'lm_stats=None' in model_src2 and 'lm_stats=lm_stats' in model_src2,
+          '_compose_gauss_feat takes the PRE-COMPUTED lm_stats (single forward)')
+    check(model_src2.count('self._lm_span_stats(') == 1,
+          '_lm_span_stats called exactly once per _features (no duplicated MLM passes)')
+    check('tok = F.embedding(input_ids, weight)' in model_src2,
+          '_prototype_cos uses F.embedding (not manual index_select)')
+    # 4e) NaN-safe prototype cosine + span-sliced LM stats + LoRA base freeze
+    check('proto_safe = torch.where(has_span, proto, torch.ones_like(proto))' in model_src2
+          and 'cos = torch.where(has_span.squeeze(-1), cos, torch.zeros_like(cos))' in model_src2,
+          '_prototype_cos substitutes ones BEFORE the cosine (no NaN in backward)')
+    check('pos_logp = F.log_softmax(logits[b, l].float(), dim=-1)' in model_src2
+          and 'p = logp.exp()' not in model_src2,
+          '_lm_span_stats log_softmax slices only span positions (no BxLxV table)')
+    check('linear.weight.requires_grad = False' in model_src2
+          and 'if linear.bias is not None:\n            linear.bias.requires_grad = False' in model_src2,
+          'LoRAAdapter freezes its base weight/bias on wrap')
+    train_src = (ROOT / 'mm' / 'train.py').read_text(encoding='utf-8')
+    check("if '.linear.' in name:" in train_src
+          and "continue   # base weight of a LoRAAdapter stays frozen" in train_src,
+          'unfreeze_top_layers skips LoRA-wrapped base weights')
+
     # 5) Verify MLM decoder lookup fix: _encoder_hidden_size + correct _mlm_projection
     check('def _encoder_hidden_size(' in model_src2,
           '_encoder_hidden_size function defined in model.py')

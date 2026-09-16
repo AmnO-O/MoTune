@@ -280,6 +280,7 @@ class CompDataset(_DatasetBase):
             'mod_std': torch.tensor(float(r['mod_std']), dtype=torch.float),
             'head_std': torch.tensor(float(r['head_std']), dtype=torch.float),
             'row_id': torch.tensor(int(r.get('row_id', 0)), dtype=torch.long),
+            'is_pv': torch.tensor(str(r.get('lang', '')) == 'en-pv', dtype=torch.bool),
         }
 
     def _report(self) -> None:

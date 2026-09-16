@@ -66,6 +66,18 @@ class Config:
     # mmBERT-base (blocks 9/15/21). Mean-pooling keeps dim H, so head_in is
     # unchanged. LM logits always stay on the LAST layer regardless.
     context_layers: Optional[Tuple[int, ...]] = None
+    # Per-role dedicated context for the gauss heads: when gauss_dedicated is
+    # true, the mod gauss head reads the whole-sentence context at its OWN
+    # hidden-state index (`gauss_ctx_mod`) instead of the last layer (e.g.
+    # 19 = block 18 global), and the head gauss head at `gauss_ctx_head` (e.g.
+    # 20 = block 19 local). en-pv rows use `gauss_ctx_pv` (e.g. 22 = last).
+    # Word spans (`mod_emb` / `head_emb`) still come from mid-5 span_layers;
+    # only the context feeding each head moves. Default off = current shared-
+    # features behaviour. Feature width unchanged.
+    gauss_dedicated: bool = False
+    gauss_ctx_mod: Optional[Tuple[int, ...]] = None    # context layer(s) for modifier gauss head
+    gauss_ctx_head: Optional[Tuple[int, ...]] = None   # context layer(s) for head gauss head
+    gauss_ctx_pv: Optional[Tuple[int, ...]] = None     # en-pv rows override (e.g. 22)
     # output head: 'reg' = scalar regression; 'softmax' = ordinal bins -> E[Y];
     # 'gauss' = predict (mu, sigma) of a Gaussian (value + uncertainty),
     # sigma via the logits/MLM channel so the shared self-supervised loop is
