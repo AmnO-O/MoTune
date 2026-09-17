@@ -62,12 +62,16 @@ def check_config() -> None:
           and not hasattr(defaults, 'warmup_mlm_epochs')
           and not hasattr(defaults, 'lambda_consist')
           and not hasattr(defaults, 'consist_mode')
-          and not hasattr(defaults, 'phase1_schedule'),
-          'no head_mode / num_bins / warmup / consist / phase1_schedule knobs remain')
+          and not hasattr(defaults, 'phase1_schedule')
+          and not hasattr(defaults, 'gauss_dedicated')
+          and not hasattr(defaults, 'span_layers')
+          and not hasattr(defaults, 'context_layers')
+          and not hasattr(defaults, 'aux_data_paths'),
+          'legacy model, fallback-pooling, and auxiliary-data knobs are absent')
 
     bad = [
         ('lambda_rank=-1', lambda: Config.defaults().update(lambda_rank=-1)),
-        ('head_pool=bogus', lambda: Config.defaults().update(head_pool='bogus')),
+        ('removed head_pool', lambda: Config.defaults().update(head_pool='mean')),
         ('removed lambda_dist', lambda: Config.defaults().update(lambda_dist=1)),
         ('removed lambda_compound', lambda: Config.defaults().update(lambda_compound=1)),
         ('mode=train5', lambda: Config.defaults().update(mode='train5')),
@@ -83,9 +87,9 @@ def check_config() -> None:
         except ValueError:
             check(True, f'[reject] {label}')
 
-    ok = Config.defaults().update(head_pool='mean')
+    ok = Config.defaults().update(freeze_epochs=2)
     ok.validate()
-    check(ok.head_pool == 'mean' and ok.total_epochs == ok.freeze_epochs + ok.lora_epochs,
+    check(ok.freeze_epochs == 2 and ok.total_epochs == ok.freeze_epochs + ok.lora_epochs,
           'valid gauss config accepted, total_epochs derived')
 
     # JSON round-trip
@@ -108,7 +112,6 @@ def check_config() -> None:
     # --set coercion
     check(coerce_value('freeze_epochs', '3') == 3, 'coerce int')
     check(coerce_value('use_label_std', 'false') is False, 'coerce bool')
-    check(coerce_value('span_layers', '-1') == ['-1'], 'coerce Tuple knob')
     check(coerce_value('gauss_ctx_head', '19,20') == ['19', '20'], 'coerce gauss_ctx_*')
     check(coerce_value('backbone', 'x/y') == 'x/y', 'str passes through')
     check(coerce_value('not_a_field', '1') == '1', 'unknown key passes through (validated later)')
@@ -122,7 +125,7 @@ def check_cli() -> None:
     from src.config import Config
 
     tmp_cfg = Path(tempfile.gettempdir()) / 'src_cli_smoke.json'
-    tmp_cfg.write_text('{"head_pool": "mean", "freeze_epochs": 5}', encoding='utf-8')
+    tmp_cfg.write_text('{"freeze_epochs": 5}', encoding='utf-8')
 
     args = SimpleNamespace(
         config=str(tmp_cfg),
@@ -140,7 +143,6 @@ def check_cli() -> None:
     check(parsed.set == ['freeze_epochs=2', 'lora_epochs=6', 'use_label_std=false'],
           'repeated --set collected')
     merged = cli._build_config(parsed)
-    check(merged.head_pool == 'mean', 'config file applied on top of defaults')
     check(merged.freeze_epochs == 2 and merged.lora_epochs == 6
           and merged.total_epochs == 8 and merged.use_label_std is False,
           'CLI --set ints/bools map onto Config')
@@ -332,7 +334,11 @@ def check_folds() -> None:
     print('=== 6. FOLDS + GROUP SAMPLER (real TSVs, no torch) ===')
     sys.path.insert(0, str(ROOT))
     from src.data import _df_to_rows, read_tsv
-    from src.folds import CompoundGroupSampler, assign_folds
+    from src.folds import CompoundGroupSampler, StratifiedKFold, assign_folds
+
+    if StratifiedKFold is None:
+        check(True, 'fold assignment skipped (scikit-learn unavailable)')
+        return
 
     rows = _df_to_rows(read_tsv('dataset/en-nn-train.tsv'), 'en-nn', 'en')
     for r in rows:
@@ -401,8 +407,10 @@ def check_fixes() -> None:
     check('def margin_rank_loss' in loss_src and 'def compound_center_loss' not in loss_src
           and 'def compound_consistency_loss' not in loss_src,
           'src/losses.py retains ranking only; centre/consistency losses are absent')
-    check('def _role_context(' in model_src and 'def _compose_gauss_feat(' in model_src,
-          '_features builds per-role context bundles (_role_context/_compose_gauss_feat)')
+    check('def _role_context(' not in model_src and 'def _compose_gauss_feat(' in model_src,
+          '_features builds only dedicated per-role feature bundles')
+    check('pv_mod_exit_emb, pv_head_exit_emb = mod_exit_emb, head_exit_emb' not in model_src,
+          'PV literalness features stay on the PV exit layers')
 
     # 3) proxy for the role-feature width: proto-cos dimension + plain-AutoModel
     check('self.head_in += 1' in model_src,

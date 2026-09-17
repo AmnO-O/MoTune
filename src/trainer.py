@@ -207,7 +207,6 @@ class Trainer:
             rank_margin_mode=self.cfg.rank_margin_mode,
             ccc_var_floor=self.cfg.ccc_var_floor,
             bin_sigma=self.cfg.bin_sigma, use_label_std=self.cfg.use_label_std,
-            std_alpha=self.cfg.loss_std_alpha,
         ).to(self.device)
 
         best_rho, best_epoch, no_improve_epochs = -float('inf'), -1, 0
@@ -223,12 +222,6 @@ class Trainer:
             if self._train_sampler is not None:
                 self._train_sampler.set_epoch(epoch)
 
-            # Re-pool the mid-5 span cache whenever the backbone can have
-            # moved since the previous epoch (LoRA phase-1 unfreezing steps
-            # the LM every batch). Frozen-backbone runs pay a trivial one-off
-            # recompute and stay correct either way.
-            model.reset_span_cache()
-                
             if epoch == self.cfg.freeze_epochs and self.cfg.freeze_epochs > 0:
                 self.logger.info(
                     '>>> Entering Phase 2 (unfreezing LoRA%s) at epoch %d <<<',

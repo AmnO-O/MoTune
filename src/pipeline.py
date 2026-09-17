@@ -28,12 +28,8 @@ def _rmse(y_true, y_pred) -> float:
 
 
 def _load_all(cfg: Config, logger: logging.Logger) -> List[Dict]:
-    from src.data import load_aux, load_labeled
-    rows = load_labeled(cfg)
-    if cfg.aux_data_paths:
-        aux_rows = load_aux(cfg)
-        rows.extend(aux_rows)
-    return rows
+    from src.data import load_labeled
+    return load_labeled(cfg)
 
 
 def _tokenizer(cfg: Config, logger: logging.Logger):

@@ -2,7 +2,6 @@
   "mode": "train80",
   "backbone": "jhu-clsp/mmBERT-base",
   "max_context_length": 256,
-  "gauss_dedicated": true,
   "gauss_ctx_mod": [19],
   "gauss_ctx_head": [20],
   "gauss_ctx_pv": [21, 22],

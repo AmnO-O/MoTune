@@ -15,13 +15,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 Mode = Literal['train80']
-ContextPool = Literal['mean', 'cls', 'mean+cls']
-HeadPool = Literal['mean', 'attn']
 RankMarginMode = Literal['clamp', 'dynamic']
 
 _MODES = ('train80',)
-_CONTEXT_POOLS = ('mean', 'cls', 'mean+cls')
-_HEAD_POOLS = ('mean', 'attn')
 _RANK_MARGIN_MODES = ('clamp', 'dynamic')
 
 
@@ -32,35 +28,16 @@ class Config:
     # === run ===
     mode: Mode = 'train80'
     seed: int = 42
-    # CUDA_LAUNCH_BLOCKING + TORCH_USE_CUDA_DSA (slow, debug only): pinpoints
-    # the exact kernel behind an async device-side assert.
-    debug_cuda: bool = False
 
     # === model ===
     backbone: str = 'jhu-clsp/mmBERT-base'
     hidden_size: int = 768
-    # span pooling: 'mean' = mean-pool over span tokens; 'attn' = learned
-    # attention pool (recommended: a compound is usually 1-2 tokens)
-    head_pool: HeadPool = 'attn'
-    context_pool: ContextPool = 'mean+cls'
-    # Span-pool layers for the literalness branch (mod_emb/head_emb). `None`
-    # = auto mid-5 (mean of 5 layers around half-depth; falls back to last
-    # layer for backbones with <= 8 blocks). `(-1,)` = keep last layer.
-    # Context + LM signals still use the LAST layer either way.
-    span_layers: Optional[Tuple[int, ...]] = None
-    # Context-pool layers for the whole-sentence context (context_emb). `None`
-    # = LAST layer (deepest + global for mmBERT/ModernBERT). A concrete tuple
-    # (hidden_states indices, `-1` = last) mean-pools those layers instead,
-    # e.g. (10, 16, 22) = the 3 upper global attention layers of mmBERT-base
-    # (blocks 9/15/21). Mean-pooling keeps dim H, so head_in is unchanged.
-    context_layers: Optional[Tuple[int, ...]] = None
-    # Intermediate Gaussian exits.  hidden_states[0] is the embedding output,
-    # so 19/20/21,22 select transformer blocks 18/19/20,21.  The PV exit is a
-    # single overall-composition head fed by both Base and Particle spans.
-    gauss_dedicated: bool = True
-    gauss_ctx_mod: Optional[Tuple[int, ...]] = (19,)       # modifier exit: block 18
-    gauss_ctx_head: Optional[Tuple[int, ...]] = (20,)      # head exit: block 19
-    gauss_ctx_pv: Optional[Tuple[int, ...]] = (21, 22)     # PV exit: blocks 20--21
+    # Every output uses a dedicated intermediate exit. hidden_states[0] is the
+    # embedding output, so 19/20/21,22 select transformer blocks 18/19/20,21.
+    # The PV exit predicts one overall distribution from Base and Particle.
+    gauss_ctx_mod: Tuple[int, ...] = (19,)       # modifier exit: block 18
+    gauss_ctx_head: Tuple[int, ...] = (20,)      # head exit: block 19
+    gauss_ctx_pv: Tuple[int, ...] = (21, 22)     # PV exit: blocks 20--21
     head_hidden: int = 128
     dropout: float = 0.2
     # literality feature (ALWAYS ON, no knob): cosine between the contextualised
@@ -75,11 +52,7 @@ class Config:
     output_dir: Optional[str] = None
     max_context_length: int = 256
 
-    # Legacy fallback (dùng khi train đơn lẻ 1 file)
-    train_file: str = 'en-nn-train.tsv'
-    trial_file: str = 'en-nn-trial.tsv'
-
-    # Multi-task Train Datasets (EN / DE, NN + PV)
+    # Train datasets (EN / DE, NN + PV)
     en_nn_train: str = 'en-nn-train.tsv'
     de_nn_train: str = 'de-nn-train.tsv'
     en_pv_train: str = 'en-pv-train.tsv'
@@ -95,9 +68,6 @@ class Config:
     de_nn_trial: str = 'de-nn-trial.tsv'
     en_pv_trial: str = 'en-pv-trial.tsv'
     de_pv_trial: str = 'de-pv-trial.tsv'
-
-    # label-free rows appended to the scoring loader (consistency signal only)
-    aux_data_paths: List[str] = field(default_factory=list)
 
     # === scoring phases (encoder frozen, then LoRA) ===
     freeze_epochs: int = 3
@@ -129,7 +99,6 @@ class Config:
     # === losses ===
     ccc_weight: float = 0.7
     ccc_var_floor: float = 0.05
-    loss_std_alpha: float = 0.0
     lambda_rank: float = 0.5
     rank_margin: float = 0.5
     rank_margin_mode: RankMarginMode = 'dynamic'
@@ -137,7 +106,6 @@ class Config:
     use_label_std: bool = True
 
     # === split ===
-    n_splits: int = 5
     test_size: float = 0.2
 
     # ------------------------------------------------------------------ #
@@ -161,6 +129,10 @@ class Config:
         if extra and strict:
             raise ValueError(f'Unknown config keys: {sorted(extra)}')
         safe = {k: v for k, v in values.items() if k in known and v is not None}
+        tuple_fields = {f.name for f in fields(cls) if 'Tuple' in str(f.type)}
+        for name in tuple_fields:
+            if isinstance(safe.get(name), list):
+                safe[name] = tuple(safe[name])
         return replace(cls.defaults(), **safe)
 
     @classmethod
@@ -207,10 +179,6 @@ class Config:
 
         if self.mode not in _MODES:
             errors.append(f'mode must be one of {_MODES}, got {self.mode!r}')
-        if self.head_pool not in _HEAD_POOLS:
-            errors.append(f'head_pool must be one of {_HEAD_POOLS}, got {self.head_pool!r}')
-        if self.context_pool not in _CONTEXT_POOLS:
-            errors.append(f'context_pool must be one of {_CONTEXT_POOLS}, got {self.context_pool!r}')
         if self.rank_margin_mode not in _RANK_MARGIN_MODES:
             errors.append(
                 f'rank_margin_mode must be one of {_RANK_MARGIN_MODES}, got {self.rank_margin_mode!r}'
@@ -249,8 +217,6 @@ class Config:
             errors.append(f'lambda_rank must be >= 0, got {self.lambda_rank}')
         if self.rank_margin <= 0:
             errors.append(f'rank_margin must be > 0, got {self.rank_margin}')
-        if self.loss_std_alpha < 0:
-            errors.append(f'loss_std_alpha must be >= 0, got {self.loss_std_alpha}')
         if self.ccc_var_floor < 0:
             errors.append(f'ccc_var_floor must be >= 0, got {self.ccc_var_floor}')
         if self.bin_sigma <= 0:
@@ -261,8 +227,6 @@ class Config:
             errors.append(f'amp_growth_interval must be >= 1, got {self.amp_growth_interval}')
         if not 0 < self.test_size < 1:
             errors.append(f'test_size must be in (0, 1), got {self.test_size}')
-        if self.n_splits < 2:
-            errors.append(f'n_splits must be >= 2, got {self.n_splits}')
 
         if errors:
             raise ValueError('Invalid configuration:\n  ' + '\n  '.join(errors))

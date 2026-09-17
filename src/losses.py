@@ -105,8 +105,7 @@ class GaussLoss(nn.Module):
     def __init__(self, ccc_weight: float = 0.7,
                  lambda_rank: float = 0.5, rank_margin: float = 0.5,
                  rank_margin_mode: str = 'dynamic', ccc_var_floor: float = 0.05,
-                 bin_sigma: float = 0.5, use_label_std: bool = True,
-                 std_alpha: float = 0.0):
+                 bin_sigma: float = 0.5, use_label_std: bool = True):
         super().__init__()
         self.ccc_weight = ccc_weight
         self.lambda_rank = lambda_rank
@@ -115,13 +114,7 @@ class GaussLoss(nn.Module):
         self.ccc_var_floor = ccc_var_floor
         self.bin_sigma = bin_sigma
         self.use_label_std = use_label_std
-        self.std_alpha = std_alpha
         self.requires_logits = True
-
-    def _weights(self, pred: torch.Tensor, std: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.std_alpha <= 0 or std is None:
-            return torch.ones_like(pred)
-        return 1.0 / (1.0 + self.std_alpha * torch.nan_to_num(std.float(), nan=0.0))
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 logits: Optional[torch.Tensor] = None,
@@ -150,8 +143,7 @@ class GaussLoss(nn.Module):
 
         loss = gauss_kl(mu, sigma_p, target, sigma_t)
         if self.ccc_weight > 0:
-            w = self._weights(mu, std)
-            loss = loss + self.ccc_weight * ccc_loss(mu, target, w, self.ccc_var_floor)
+            loss = loss + self.ccc_weight * ccc_loss(mu, target, var_floor=self.ccc_var_floor)
         if self.lambda_rank > 0:
             loss = loss + self.lambda_rank * margin_rank_loss(
                 mu, target, margin=self.rank_margin,

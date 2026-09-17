@@ -113,7 +113,7 @@ def _df_to_rows(df: pd.DataFrame, tag: str, lang: str) -> List[Dict]:
 # --------------------------------------------------------------------------- #
 # top-level loaders
 # --------------------------------------------------------------------------- #
-def _load_files(cfg, file_attrs: List[str], fallback_attr: str) -> List[Dict]:
+def _load_files(cfg, file_attrs: List[str]) -> List[Dict]:
     """Helper nạp và gộp nhiều file TSV (EN/DE, NN/PV) theo cấu hình Config."""
     data_dir, _ = _resolve(cfg)
     
@@ -122,12 +122,6 @@ def _load_files(cfg, file_attrs: List[str], fallback_attr: str) -> List[Dict]:
         fname = getattr(cfg, attr, None)
         if fname and fname.strip() and fname not in files_to_load:
             files_to_load.append(fname)
-
-    # Fallback về thuộc tính đơn lẻ cũ nếu không chỉ định multi-task
-    if not files_to_load:
-        fallback = getattr(cfg, fallback_attr, None)
-        if fallback and fallback.strip():
-            files_to_load.append(fallback)
 
     all_rows: List[Dict] = []
     for fname in files_to_load:
@@ -154,30 +148,9 @@ def _load_files(cfg, file_attrs: List[str], fallback_attr: str) -> List[Dict]:
 
 
 def load_labeled(cfg) -> List[Dict]:
-    """Load dữ liệu Train đa ngữ/đa dạng (EN/DE, NN/PV)."""
+    """Load all configured NN and PV training datasets."""
     train_attrs = ['en_nn_train', 'de_nn_train', 'en_pv_train', 'de_pv_train']
-    return _load_files(cfg, train_attrs, 'train_file')
-
-
-def load_aux(cfg) -> List[Dict]:
-    """Label-free consistency rows (aux_data_paths); used for representation only."""
-    data_dir, _ = _resolve(cfg)
-    rows: List[Dict] = []
-    for name in cfg.aux_data_paths:
-        path = data_dir / name
-        if not path.exists():
-            logger.warning('aux_data_path missing, skipping: %s', path)
-            continue
-        aux = _df_to_rows(read_tsv(path), name, _auto_lang(name))
-        for r in aux:
-            r.update({
-                'has_label': False,
-                'mod_avg': float('nan'), 'head_avg': float('nan'),
-                'mod_std': float('nan'), 'head_std': float('nan'),
-            })
-        rows += aux
-        logger.info('%s: %d aux rows', name, len(aux))
-    return rows
+    return _load_files(cfg, train_attrs)
 
 
 def _find_trial_path(fname: str, data_dir: Path) -> Optional[Path]:
@@ -200,9 +173,8 @@ def load_trial(cfg) -> Dict[str, List[Dict]]:
     """Load the per-lineage TRIAL (or Test) files -> {key: rows}.
 
     ``key`` is one of ``en-nn`` / ``en-pv`` / ``de-nn`` / ``de-pv``, read from the
-    four ``*_trial`` config attrs; falls back to the single ``trial_file`` attr if
-    those are empty. Rows keep the file's row order and get a per-lineage
-    ``compound_id`` (paths don't participate in train-time splits at inference).
+    four ``*_trial`` config attrs. Rows keep the file's row order and get a
+    per-lineage ``compound_id`` (paths don't participate in train-time splits).
     """
     data_dir, _ = _resolve(cfg)
     lineage_attrs = (
@@ -226,19 +198,6 @@ def load_trial(cfg) -> Dict[str, List[Dict]]:
         out[key] = rows
         logger.info('%s trial: %d rows from %s', key, len(rows), path)
 
-    fallback = (getattr(cfg, 'trial_file', '') or '').strip()
-    if not out and fallback:
-        path = _find_trial_path(fallback, data_dir)
-        if path is not None and path.is_file():
-            rows = _df_to_rows(read_tsv(path), fallback, _auto_lang(fallback))
-            pv = rows[0]['is_pv'] if rows else False
-            lang = rows[0]['lang'] if rows else 'en'
-            key = f'{lang}-{"pv" if pv else "nn"}'
-            codes, _ = pd.factorize(pd.Series(
-                [f"{r['lang']}_{r['compound']}" for r in rows]))
-            for r, c in zip(rows, codes):
-                r['compound_id'] = int(c)
-            out[key] = rows
     return out
 
 

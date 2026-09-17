@@ -6,8 +6,8 @@ that were its only consumer). No marker tokens and therefore no embedding
 resize. No ordinal/regression heads exist in this package; both modifier and
 head noun are scored by ``GaussHead`` instances predicting ``(mu, sigma)``.
 
-Head input: mod/head span embeddings (+ optional learned attention pooling)
-+ span-length fractions + context (mean and/or CLS), plus a per-word
+Head input: mod/head span embeddings (learned attention pooling) + span-length
+fractions + mean-and-CLS context, plus a per-word
 literality ``cos(use, prototype)`` scalar (no cross-talk between the two
 words).
 
@@ -60,18 +60,14 @@ class AttentionPool(nn.Module):
 
 
 class SpanPool(nn.Module):
-    """Pools a span; 'mean' or 'attn'. Un-addressable spans fall back to mean
-    over the whole sentence so the head never sees a zero vector."""
+    """Learned attention pooling for an addressed constituent span."""
 
-    def __init__(self, hidden: int, mode: str = 'attn'):
+    def __init__(self, hidden: int):
         super().__init__()
-        self.mode = mode
-        self.attn = AttentionPool(hidden) if mode == 'attn' else None
+        self.attn = AttentionPool(hidden)
 
     def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        if self.mode == 'attn':
-            return self.attn(hidden, mask)
-        return _masked_mean(hidden, mask)
+        return self.attn(hidden, mask)
 
 
 # --------------------------------------------------------------------------- #
@@ -297,44 +293,18 @@ class MMBertModel(nn.Module):
     """
 
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
-                 context_pool: str = 'mean+cls', head_pool: str = 'attn',
                  head_hidden: int = 128,
-                 span_layers: Optional[Sequence[int]] = None,
-                 context_layers: Optional[Sequence[int]] = None,
-                 gauss_dedicated: bool = False,
                  gauss_ctx_mod: Optional[Sequence[int]] = None,
                  gauss_ctx_head: Optional[Sequence[int]] = None,
                  gauss_ctx_pv: Optional[Sequence[int]] = None):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
-        self.context_pool = context_pool
-        self.head_pool = head_pool
-        # MID-layer span pooling. Empty/None = auto mid-5; a concrete tuple
-        # (e.g. (-1,)) pins exact layers. Resolved lazily in _features on the
-        # first forward, so __init__ only needs the raw knob.
-        self.span_layers = tuple(int(i) for i in (span_layers or ()))
-        self._span_hidden = None
-
-        # Whole-sentence context pooling. Empty/None = LAST layer (deepest +
-        # global for mmBERT/ModernBERT; the old behaviour). A concrete tuple
-        # (hidden_states indices, `-1` = last) mean-pools those layers instead
-        # (e.g. (10, 16, 22) = upper global layers of mmBERT-base). Resolved
-        # lazily in _features so __init__ only needs the raw knob.
-        self.context_layers = tuple(int(i) for i in (context_layers or ()))
-        self._context_hidden = None
-
-        # Intermediate exits.  Hidden-state index 0 is the embedding output,
-        # so indices 19/20/21,22 correspond to transformer blocks 18/19/20,21.
-        # The PV exit is an overall-composition head: it consumes BOTH the base
-        # and particle spans and is supervised only by PV Avg/Std.
-        self.gauss_dedicated = gauss_dedicated
-        self.gauss_ctx_mod  = tuple(int(i) for i in (gauss_ctx_mod  or ()))
-        self.gauss_ctx_head = tuple(int(i) for i in (gauss_ctx_head or ()))
-        self.gauss_ctx_pv   = tuple(int(i) for i in (gauss_ctx_pv   or ()))
-        self._ctx_mod_hidden  = None   # resolved indices, cached per epoch
-        self._ctx_head_hidden = None
-        self._ctx_pv_hidden   = None
+        # Hidden-state index 0 is the embedding output, so indices 19/20/21,22
+        # correspond to transformer blocks 18/19/20,21.
+        self.gauss_ctx_mod = tuple(int(i) for i in (gauss_ctx_mod or (19,)))
+        self.gauss_ctx_head = tuple(int(i) for i in (gauss_ctx_head or (20,)))
+        self.gauss_ctx_pv = tuple(int(i) for i in (gauss_ctx_pv or (21, 22)))
 
         self.lm = AutoModel.from_pretrained(backbone)
         # Alias to the encoder (there is no wrapper head anymore), kept so the
@@ -344,32 +314,18 @@ class MMBertModel(nn.Module):
         # updates, 2x ckpt size, strict-load failures, and LoRA applied twice).
         object.__setattr__(self, 'base_model', self.lm)
 
-        context_dim = hidden_size if context_pool in ('mean', 'cls') else 2 * hidden_size
-        # 2 spans + 2 lens + context + 1 literalness cos
-        self.head_in = hidden_size * 2 + context_dim + 2
+        # 2 spans + 2 length fractions + mean-and-CLS context + literalness.
+        self.head_in = hidden_size * 4 + 2
         # Each output branch gets ONLY its own word's cos(use, prototype)
         # tacked on (torch.cat, last axis), so mod_out never sees head's
         # literalness and vice-versa. That extra column IS part of head_in.
         self.head_in += 1
 
-        self.mod_pool = SpanPool(hidden_size, head_pool)
-        self.head_role_pool = SpanPool(hidden_size, head_pool)
+        self.mod_pool = SpanPool(hidden_size)
+        self.head_role_pool = SpanPool(hidden_size)
         self.mod_gauss = GaussHead(self.head_in, head_hidden, dropout)
         self.head_gauss = GaussHead(self.head_in, head_hidden, dropout)
         self.pv_gauss = GaussHead(self.head_in, head_hidden, dropout)
-
-    # ------------------------------------------------------------------ #
-    def reset_span_cache(self) -> None:
-        """Drop the lazily-cached layer indices.
-
-        Called once per training epoch so LoRA-updated backbone weights are
-        re-pooled on the first forward of the epoch.
-        """
-        self._span_hidden = None
-        self._context_hidden = None
-        self._ctx_mod_hidden = None
-        self._ctx_head_hidden = None
-        self._ctx_pv_hidden = None
 
     # ------------------------------------------------------------------ #
     def _prototype_cos(self, input_ids: torch.Tensor, span_mask: torch.Tensor,
@@ -397,27 +353,9 @@ class MMBertModel(nn.Module):
         return cos.type_as(use_emb).unsqueeze(-1)
 
     def _context_emb(self, hidden: torch.Tensor, batch) -> torch.Tensor:
-        """Pool a [B, S, H] hidden tensor into the whole-sentence context
-        embedding (mean and/or [CLS]) and mask at the pool mode."""
-        if self.context_pool == 'cls':
-            return hidden[:, 0]
-
+        """Mean-and-CLS whole-sentence context for a dedicated exit."""
         mean_emb = _masked_mean(hidden, batch['attention_mask'])
-        if self.context_pool == 'mean':
-            return mean_emb
         return torch.cat([mean_emb, hidden[:, 0]], dim=1)
-
-    def _role_context(self, layers, hid_all, batch) -> torch.Tensor:
-        """Whole-sentence context pooled at explicit hidden-state indices.
-        Raw pre-norm hidden states are larger in magnitude than the post-norm
-        last layer the heads expect, so the mean is re-normalised by the
-        backbone final LayerNorm (same fix as the context_layers path)."""
-        hidden = torch.mean(torch.stack([hid_all[i] for i in layers]), dim=0)
-        norm = getattr(self.base_model, 'final_norm', None) \
-            or getattr(getattr(self.base_model, 'encoder', None), 'final_norm', None)
-        if norm is not None:
-            hidden = norm(hidden)
-        return self._context_emb(hidden, batch)
 
     def _role_hidden(self, layers, hid_all) -> torch.Tensor:
         """Mean selected hidden states and put them on the final-norm scale."""
@@ -428,139 +366,47 @@ class MMBertModel(nn.Module):
 
     def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,
                             context_emb) -> torch.Tensor:
-        """Gauss-head feature bundle: mid-5 spans + 2 lens + (role-specific)
-        context. Same width as the default shared soup."""
+        """Feature bundle: two spans, two lengths, and role-specific context."""
         return torch.cat([mod_emb, head_emb, mod_len, head_len, context_emb], dim=1)
 
     def _features(self, batch):
-        """Encoder forward + shared span/context feature building.
-
-        Returns ``(mod_emb, head_emb, features, mod_feat, head_feat)``;
-        ``mod_feat``/``head_feat`` are the per-role bundles when
-        ``gauss_dedicated`` is on (``None`` otherwise).
-        """
+        """Build one feature bundle per dedicated Gaussian exit."""
         outputs = self.lm(
             input_ids=batch['input_ids'],
             attention_mask=batch['attention_mask'],
             output_hidden_states=True,
         )
-        hidden = outputs.last_hidden_state
-
-        # Span embeddings come from a MID-pool of layers. Early/mid layers keep
-        # the span's literal (word-identity) signal; late layers over-contextualize
-        # and blur it (BERT mixing layer). `span_layers=None` auto-selects 5 layers
-        # around half-depth; `(-1,)` = last layer (the old behaviour / A-B base).
-        # Context + LM signals always stay on the LAST layer. Cache only the
-        # resolved layer INDICES (not the tensor itself — tensors are shaped
-        # [B, seq_len, H] and seq_len varies between batches, so caching the
-        # tensor causes a shape mismatch on the second batch).
-        if self._span_hidden is None:
-            hid_all = outputs.hidden_states
-            layers = self.span_layers
-            n_layers = len(hid_all)
-            if not layers:
-                if n_layers > 8:
-                    mid = n_layers // 2
-                    layers = tuple(range(mid - 2, mid + 3))
-                else:
-                    layers = (-1,)
-            # Resolve negative indices once and store as a plain tuple of ints
-            self._span_hidden = tuple(int(i) % n_layers for i in layers)
-        # Always recompute the mean hidden tensor from the CURRENT batch
         hid_all = outputs.hidden_states
         n_layers = len(hid_all)
-        span_hidden = torch.mean(
-            torch.stack([hid_all[i] for i in self._span_hidden]), dim=0)
-
-        mod_emb = self.mod_pool(span_hidden, batch['mod_span_mask'])
-        head_emb = self.head_role_pool(span_hidden, batch['head_span_mask'])
-        # Context embeddings: `context_layers=None` keeps the LAST layer
-        # exactly as before (`hidden` may carry the final LayerNorm on the
-        # no-LM path). A concrete tuple mean-pools the resolved hidden-state
-        # indices instead (e.g. multiple GLOBAL attention layers of mmBERT).
-        if self.context_layers:
-            if self._context_hidden is None:
-                hid_all = outputs.hidden_states
-                n_layers = len(hid_all)
-                self._context_hidden = tuple(
-                    int(i) % n_layers for i in self.context_layers)
-            hid_all = outputs.hidden_states
-            context_hidden = torch.mean(
-                torch.stack([hid_all[i] for i in self._context_hidden]), dim=0)
-            # Raw pre-final-norm hidden states are several times LARGER per
-            # token than the post-norm last layer the Gauss head expects; the
-            # mean then saturates the head's (un-normalised) Tanh bottleneck,
-            # killing gradients. Re-run the backbone final LayerNorm so the
-            # pooled context stays at unit scale, like the default path.
-            norm = getattr(self.base_model, 'final_norm', None) \
-                or getattr(getattr(self.base_model, 'encoder', None), 'final_norm', None)
-            if norm is not None:
-                context_hidden = norm(context_hidden)
-        else:
-            context_hidden = hidden
-        context_emb = self._context_emb(context_hidden, batch)
-
         seq_len = batch['attention_mask'].sum(dim=1).clamp(min=1.0).float()
         mod_len = (batch['mod_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
         head_len = (batch['head_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
+        mod_hidden = self._role_hidden(
+            tuple(i % n_layers for i in self.gauss_ctx_mod), hid_all)
+        head_hidden = self._role_hidden(
+            tuple(i % n_layers for i in self.gauss_ctx_head), hid_all)
+        pv_hidden = self._role_hidden(
+            tuple(i % n_layers for i in self.gauss_ctx_pv), hid_all)
+        mod_exit_emb = self.mod_pool(mod_hidden, batch['mod_span_mask'])
+        head_exit_emb = self.head_role_pool(head_hidden, batch['head_span_mask'])
+        pv_mod_emb = self.mod_pool(pv_hidden, batch['mod_span_mask'])
+        pv_head_emb = self.head_role_pool(pv_hidden, batch['head_span_mask'])
 
-        feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
-        features = torch.cat(feats, dim=1)
-        mod_feat = head_feat = pv_feat = None
-        mod_exit_emb, head_exit_emb = mod_emb, head_emb
-        pv_mod_exit_emb, pv_head_exit_emb = mod_emb, head_emb
-        if self.gauss_dedicated:
-            hid_all = outputs.hidden_states
-            n_layers = len(hid_all)
-            if self._ctx_mod_hidden is None:
-                self._ctx_mod_hidden = tuple(
-                    int(i) % n_layers for i in (self.gauss_ctx_mod or (-1,)))
-            if self._ctx_head_hidden is None:
-                self._ctx_head_hidden = tuple(
-                    int(i) % n_layers for i in (self.gauss_ctx_head or (-1,)))
-            if self._ctx_pv_hidden is None:
-                self._ctx_pv_hidden = tuple(
-                    int(i) % n_layers for i in (self.gauss_ctx_pv or (-1,)))
-                
-            mod_hidden = self._role_hidden(self._ctx_mod_hidden, hid_all)
-            head_hidden = self._role_hidden(self._ctx_head_hidden, hid_all)
-            pv_hidden = self._role_hidden(self._ctx_pv_hidden, hid_all)
-
-            mod_exit_emb = self.mod_pool(mod_hidden, batch['mod_span_mask'])
-            head_exit_emb = self.head_role_pool(head_hidden, batch['head_span_mask'])
-
-            pv_mod_emb = self.mod_pool(pv_hidden, batch['mod_span_mask'])
-            pv_head_emb = self.head_role_pool(pv_hidden, batch['head_span_mask'])
-            pv_mod_exit_emb, pv_head_exit_emb = pv_mod_emb, pv_head_emb
-            pv_mod_exit_emb, pv_head_exit_emb = mod_exit_emb, head_exit_emb
-            
-
-            ctx_mod = self._context_emb(mod_hidden, batch)
-            ctx_head = self._context_emb(head_hidden, batch)
-            ctx_pv = self._context_emb(pv_hidden, batch)
-
-            mod_feat = self._compose_gauss_feat(
-                mod_exit_emb, self.head_role_pool(mod_hidden, batch['head_span_mask']),
-                mod_len, head_len, ctx_mod)
-            
-            head_feat = self._compose_gauss_feat(
-                self.mod_pool(head_hidden, batch['mod_span_mask']), head_exit_emb,
-                mod_len, head_len, ctx_head)
-            
-            pv_feat = self._compose_gauss_feat(
-                pv_mod_emb, pv_head_emb, mod_len, head_len, ctx_pv)
-            
-        return (mod_emb, head_emb, features, mod_feat, head_feat, pv_feat,
-                mod_exit_emb, head_exit_emb, pv_mod_exit_emb, pv_head_exit_emb)
+        mod_feat = self._compose_gauss_feat(
+            mod_exit_emb, self.head_role_pool(mod_hidden, batch['head_span_mask']),
+            mod_len, head_len, self._context_emb(mod_hidden, batch))
+        head_feat = self._compose_gauss_feat(
+            self.mod_pool(head_hidden, batch['mod_span_mask']), head_exit_emb,
+            mod_len, head_len, self._context_emb(head_hidden, batch))
+        pv_feat = self._compose_gauss_feat(
+            pv_mod_emb, pv_head_emb, mod_len, head_len,
+            self._context_emb(pv_hidden, batch))
+        return mod_feat, head_feat, pv_feat, mod_exit_emb, head_exit_emb, pv_mod_emb, pv_head_emb
 
     def _forward_gauss(self, batch, with_logits: bool = False, with_pv: bool = False):
         """Predict N(mu, sigma^2) per span; sigma travels the "logits" channel."""
-        (mod_emb, head_emb, features, mod_feat, head_feat, pv_feat,
-         mod_exit_emb, head_exit_emb, pv_mod_exit_emb, pv_head_exit_emb) = self._features(batch)
-        if mod_feat is None:
-            mod_feat = head_feat = features
-        if pv_feat is None:
-            pv_feat = features
+        (mod_feat, head_feat, pv_feat, mod_exit_emb, head_exit_emb,
+         pv_mod_exit_emb, pv_head_exit_emb) = self._features(batch)
         cos_mod = self._prototype_cos(
             batch['input_ids'], batch['mod_span_mask'], mod_exit_emb)
         cos_head = self._prototype_cos(
@@ -601,11 +447,8 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertMo
     """
     model = MMBertModel(
         cfg.backbone, hidden_size=cfg.hidden_size, dropout=cfg.dropout,
-        context_pool=cfg.context_pool, head_pool=cfg.head_pool,
         head_hidden=cfg.head_hidden,
-        span_layers=cfg.span_layers,
-        context_layers=cfg.context_layers,
-        gauss_dedicated=cfg.gauss_dedicated, gauss_ctx_mod=cfg.gauss_ctx_mod,
+        gauss_ctx_mod=cfg.gauss_ctx_mod,
         gauss_ctx_head=cfg.gauss_ctx_head, gauss_ctx_pv=cfg.gauss_ctx_pv,
     )
     if load_from is not None:
