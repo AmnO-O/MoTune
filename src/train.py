@@ -78,12 +78,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
             requires_logits = getattr(criterion, 'requires_logits', False)
 
-            mod_logits = head_logits = None
+            mod_logits = head_logits = pv_logits = None
 
             if requires_logits:
-                mod_pred, head_pred, mod_logits, head_logits = model(batch, with_logits=True)
+                (mod_pred, head_pred, pv_pred, mod_logits, head_logits, pv_logits) = model(
+                    batch, with_logits=True, with_pv=True)
             else:
-                mod_pred, head_pred = model(batch)
+                mod_pred, head_pred, pv_pred = model(batch, with_pv=True)
 
             # NN loss (mask=allowed on NN rows)
             mod_loss = criterion(
@@ -95,31 +96,32 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 compound_ids=batch['compound_id'], mask=allowed_nn,
             )
 
-            # PV loss (both mod and head predict Avg; mask=allowed on PV rows)
-            pv_mod_loss = criterion(
-                mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
+            # PV has only an overall Avg/Std label.  Its dedicated composition
+            # exit consumes both Base and Particle spans; mod/head exits do not
+            # receive PV supervision.
+            pv_loss = criterion(
+                pv_pred, batch['mod_avg'], pv_logits, batch['mod_std'],
                 compound_ids=batch['compound_id'], mask=allowed_pv,
             )
-            pv_head_loss = criterion(
-                head_pred, batch['head_avg'], head_logits, batch['head_std'],
-                compound_ids=batch['compound_id'], mask=allowed_pv,
-            )
-            pv_loss = 0.5 * (pv_mod_loss + pv_head_loss)
 
             loss = mod_loss + head_loss + pv_loss
 
             if compound_weight > 0:
-                center_ids = batch['compound_id'].clone()
-                center_ids[~allowed] = -1          # aux/unaligned/degenerate out
+                center_ids_nn = batch['compound_id'].clone()
+                center_ids_nn[~allowed_nn] = -1
+                center_ids_pv = batch['compound_id'].clone()
+                center_ids_pv[~allowed_pv] = -1
                 center = compound_center_loss(
-                    mod_pred, batch['mod_avg'], center_ids,
+                    mod_pred, batch['mod_avg'], center_ids_nn,
                 ) + compound_center_loss(
-                    head_pred, batch['head_avg'], center_ids,
+                    head_pred, batch['head_avg'], center_ids_nn,
+                ) + compound_center_loss(
+                    pv_pred, batch['mod_avg'], center_ids_pv,
                 )
                 loss = loss + compound_weight * center
 
             if not loss.requires_grad:
-                loss = loss + (mod_pred.sum() + head_pred.sum()) * 0.0
+                loss = loss + (mod_pred.sum() + head_pred.sum() + pv_pred.sum()) * 0.0
 
             loss = loss / accum_steps
 
@@ -195,7 +197,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
 
 
-def evaluate(model, dataloader, device, return_all: bool = False):
+def evaluate(model, dataloader, device, return_all: bool = False,
+             return_pv: bool = False):
     """Predictions + gold labels.
 
     If return_all=True: returns (all_mod, all_head, all_mod_y, all_head_y, label_mask)
@@ -204,7 +207,7 @@ def evaluate(model, dataloader, device, return_all: bool = False):
     or (mod, head).
     """
     model.eval()
-    all_mod, all_head = [], []
+    all_mod, all_head, all_pv = [], [], []
     all_mod_y, all_head_y = [], []
     masks, has_mask = [], False
     device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
@@ -214,10 +217,15 @@ def evaluate(model, dataloader, device, return_all: bool = False):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             
             with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
-                mod_pred, head_pred = model(batch)
+                if return_pv:
+                    mod_pred, head_pred, pv_pred = model(batch, with_pv=True)
+                else:
+                    mod_pred, head_pred = model(batch)
 
             all_mod.append(mod_pred.detach().cpu().numpy().reshape(-1))
             all_head.append(head_pred.detach().cpu().numpy().reshape(-1))
+            if return_pv:
+                all_pv.append(pv_pred.detach().cpu().numpy().reshape(-1))
 
             lab = batch.get('has_label')
             if lab is not None:
@@ -236,11 +244,14 @@ def evaluate(model, dataloader, device, return_all: bool = False):
 
     mod = np.concatenate(all_mod) if all_mod else np.array([])
     head = np.concatenate(all_head) if all_head else np.array([])
+    pv = np.concatenate(all_pv) if all_pv else np.array([])
     mod_y = np.concatenate(all_mod_y) if all_mod_y else np.array([])
     head_y = np.concatenate(all_head_y) if all_head_y else np.array([])
     mask = np.concatenate(masks) if has_mask else np.zeros(len(mod), dtype=bool)
 
     if return_all:
+        if return_pv:
+            return mod, head, pv, mod_y, head_y, mask
         return mod, head, mod_y, head_y, mask
 
     if has_mask and mask.any():

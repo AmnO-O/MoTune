@@ -113,8 +113,8 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     def _pred_heads(self, model) -> List[nn.Module]:
-        """The two Gaussian (mu, sigma) output-head modules."""
-        return [model.mod_gauss, model.head_gauss]
+        """The NN modifier/head exits and the overall PV composition exit."""
+        return [model.mod_gauss, model.head_gauss, model.pv_gauss]
 
     # ------------------------------------------------------------------ #
     def _param_groups(self, model, adapters, phase: int):
@@ -265,8 +265,8 @@ class Trainer:
             else:
                 tr_rho_m = tr_rho_h = 0.0
 
-            val_mod, val_head, val_mod_y, val_head_y, val_mask = evaluate(
-                model, val_loader, self.device, return_all=True)
+            val_mod, val_head, val_pv, val_mod_y, val_head_y, val_mask = evaluate(
+                model, val_loader, self.device, return_all=True, return_pv=True)
 
             is_pv_mask = np.array([bool(r.get('is_pv', False)) for r in self._val_rows])
             nn_mask = val_mask & (~is_pv_mask)
@@ -275,9 +275,7 @@ class Trainer:
             rho_mod = _safe_rho(val_mod_y[nn_mask], val_mod[nn_mask]) if nn_mask.any() else 0.0
             rho_head = _safe_rho(val_head_y[nn_mask], val_head[nn_mask]) if nn_mask.any() else 0.0
 
-            # For PV: expression score = 0.5 * (val_mod + val_head) against gold Avg
-            val_pv_pred = 0.5 * (val_mod + val_head)
-            rho_pv = _safe_rho(val_mod_y[pv_mask], val_pv_pred[pv_mask]) if pv_mask.any() else 0.0
+            rho_pv = _safe_rho(val_mod_y[pv_mask], val_pv[pv_mask]) if pv_mask.any() else 0.0
 
             if pv_mask.any() and nn_mask.any():
                 rho_mean = (rho_mod + rho_head + rho_pv) / 3.0

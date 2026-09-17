@@ -145,6 +145,17 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
     scaler.scale(loss).backward()
     logger.info('[smoke] gauss forward + backward OK (loss %.4f)', loss.item())
 
+    # 4a-PV. The overall PV exit must be usable independently of the NN exits:
+    # it consumes the Base/Particle span pair and its loss must reach pv_gauss.
+    opt.zero_grad()
+    with torch.amp.autocast(device_type, enabled=(device.type == 'cuda')):
+        _, _, pv_pred, _, _, _ = model(batch, with_logits=True, with_pv=True)
+        pv_loss = pv_pred.square().mean()
+    scaler.scale(pv_loss).backward()
+    pv_grads = [p.grad for p in model.pv_gauss.parameters() if p.grad is not None]
+    assert pv_grads and all(torch.isfinite(g).all() for g in pv_grads)
+    logger.info('[smoke] PV exit forward + backward OK (loss %.4f)', pv_loss.item())
+
     # 4b. single-batch evaluate
     with torch.amp.autocast(device_type, enabled=(device.type == 'cuda')):
         model(batch, with_logits=True)

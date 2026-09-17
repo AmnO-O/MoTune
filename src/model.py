@@ -324,9 +324,10 @@ class MMBertModel(nn.Module):
         self.context_layers = tuple(int(i) for i in (context_layers or ()))
         self._context_hidden = None
 
-        # Per-role dedicated context: each gauss head reads the whole-sentence
-        # context at its own hidden-state layer(s) instead of the last one.
-        # Word spans stay at mid-5; feature width unchanged.
+        # Intermediate exits.  Hidden-state index 0 is the embedding output,
+        # so indices 19/20/21,22 correspond to transformer blocks 18/19/20,21.
+        # The PV exit is an overall-composition head: it consumes BOTH the base
+        # and particle spans and is supervised only by PV Avg/Std.
         self.gauss_dedicated = gauss_dedicated
         self.gauss_ctx_mod  = tuple(int(i) for i in (gauss_ctx_mod  or ()))
         self.gauss_ctx_head = tuple(int(i) for i in (gauss_ctx_head or ()))
@@ -355,6 +356,7 @@ class MMBertModel(nn.Module):
         self.head_role_pool = SpanPool(hidden_size, head_pool)
         self.mod_gauss = GaussHead(self.head_in, head_hidden, dropout)
         self.head_gauss = GaussHead(self.head_in, head_hidden, dropout)
+        self.pv_gauss = GaussHead(self.head_in, head_hidden, dropout)
 
     # ------------------------------------------------------------------ #
     def reset_span_cache(self) -> None:
@@ -416,6 +418,13 @@ class MMBertModel(nn.Module):
         if norm is not None:
             hidden = norm(hidden)
         return self._context_emb(hidden, batch)
+
+    def _role_hidden(self, layers, hid_all) -> torch.Tensor:
+        """Mean selected hidden states and put them on the final-norm scale."""
+        hidden = torch.mean(torch.stack([hid_all[i] for i in layers]), dim=0)
+        norm = getattr(self.base_model, 'final_norm', None) \
+            or getattr(getattr(self.base_model, 'encoder', None), 'final_norm', None)
+        return norm(hidden) if norm is not None else hidden
 
     def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,
                             context_emb) -> torch.Tensor:
@@ -497,7 +506,9 @@ class MMBertModel(nn.Module):
 
         feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
         features = torch.cat(feats, dim=1)
-        mod_feat = head_feat = None
+        mod_feat = head_feat = pv_feat = None
+        mod_exit_emb, head_exit_emb = mod_emb, head_emb
+        pv_mod_exit_emb, pv_head_exit_emb = mod_emb, head_emb
         if self.gauss_dedicated:
             hid_all = outputs.hidden_states
             n_layers = len(hid_all)
@@ -507,51 +518,69 @@ class MMBertModel(nn.Module):
             if self._ctx_head_hidden is None:
                 self._ctx_head_hidden = tuple(
                     int(i) % n_layers for i in (self.gauss_ctx_head or (-1,)))
-            ctx_mod = self._role_context(self._ctx_mod_hidden, hid_all, batch)
-            ctx_head = self._role_context(self._ctx_head_hidden, hid_all, batch)
-            pv = batch.get('is_pv')
-            has_pv = bool(self.gauss_ctx_pv) and pv is not None
-            if has_pv:
-                if self._ctx_pv_hidden is None:
-                    self._ctx_pv_hidden = tuple(
-                        int(i) % n_layers for i in self.gauss_ctx_pv)
-                ctx_pv = self._role_context(self._ctx_pv_hidden, hid_all, batch)
-                use_pv = pv.bool().unsqueeze(-1)
-                ctx_mod = torch.where(use_pv, ctx_pv, ctx_mod)
-                ctx_head = torch.where(use_pv, ctx_pv, ctx_head)
+            if self._ctx_pv_hidden is None:
+                self._ctx_pv_hidden = tuple(
+                    int(i) % n_layers for i in (self.gauss_ctx_pv or (-1,)))
+            mod_hidden = self._role_hidden(self._ctx_mod_hidden, hid_all)
+            head_hidden = self._role_hidden(self._ctx_head_hidden, hid_all)
+            pv_hidden = self._role_hidden(self._ctx_pv_hidden, hid_all)
+            mod_exit_emb = self.mod_pool(mod_hidden, batch['mod_span_mask'])
+            head_exit_emb = self.head_role_pool(head_hidden, batch['head_span_mask'])
+            pv_mod_emb = self.mod_pool(pv_hidden, batch['mod_span_mask'])
+            pv_head_emb = self.head_role_pool(pv_hidden, batch['head_span_mask'])
+            pv_mod_exit_emb, pv_head_exit_emb = pv_mod_emb, pv_head_emb
+            ctx_mod = self._context_emb(mod_hidden, batch)
+            ctx_head = self._context_emb(head_hidden, batch)
+            ctx_pv = self._context_emb(pv_hidden, batch)
             mod_feat = self._compose_gauss_feat(
-                mod_emb, head_emb, mod_len, head_len, ctx_mod)
+                mod_exit_emb, self.head_role_pool(mod_hidden, batch['head_span_mask']),
+                mod_len, head_len, ctx_mod)
             head_feat = self._compose_gauss_feat(
-                mod_emb, head_emb, mod_len, head_len, ctx_head)
-        return mod_emb, head_emb, features, mod_feat, head_feat
+                self.mod_pool(head_hidden, batch['mod_span_mask']), head_exit_emb,
+                mod_len, head_len, ctx_head)
+            pv_feat = self._compose_gauss_feat(
+                pv_mod_emb, pv_head_emb, mod_len, head_len, ctx_pv)
+        return (mod_emb, head_emb, features, mod_feat, head_feat, pv_feat,
+                mod_exit_emb, head_exit_emb, pv_mod_exit_emb, pv_head_exit_emb)
 
-    def _forward_gauss(self, batch, with_logits: bool = False):
+    def _forward_gauss(self, batch, with_logits: bool = False, with_pv: bool = False):
         """Predict N(mu, sigma^2) per span; sigma travels the "logits" channel."""
-        mod_emb, head_emb, features, mod_feat, head_feat = self._features(batch)
+        (mod_emb, head_emb, features, mod_feat, head_feat, pv_feat,
+         mod_exit_emb, head_exit_emb, pv_mod_exit_emb, pv_head_exit_emb) = self._features(batch)
         if mod_feat is None:
             mod_feat = head_feat = features
+        if pv_feat is None:
+            pv_feat = features
         cos_mod = self._prototype_cos(
-            batch['input_ids'], batch['mod_span_mask'], mod_emb)
+            batch['input_ids'], batch['mod_span_mask'], mod_exit_emb)
         cos_head = self._prototype_cos(
-            batch['input_ids'], batch['head_span_mask'], head_emb)
+            batch['input_ids'], batch['head_span_mask'], head_exit_emb)
+        cos_pv = 0.5 * (self._prototype_cos(
+            batch['input_ids'], batch['mod_span_mask'], pv_mod_exit_emb) + self._prototype_cos(
+            batch['input_ids'], batch['head_span_mask'], pv_head_exit_emb))
         mod_mu, mod_sigma = self.mod_gauss(torch.cat([mod_feat, cos_mod], dim=1))
         head_mu, head_sigma = self.head_gauss(torch.cat([head_feat, cos_head], dim=1))
+        pv_mu, pv_sigma = self.pv_gauss(torch.cat([pv_feat, cos_pv], dim=1))
         # Clamp only where a bounded score is reported (eval/inference). During
         # training the raw mu flows into the losses: clamp has zero gradient
         # outside [SCORE_MIN, SCORE_MAX], so an out-of-range output would be
         # pinned at the boundary with no (mu - target) pull-back. The KL/CCC
         # terms are the correct regulator for range drift while training.
         if self.training:
-            mod_pred, head_pred = mod_mu, head_mu
+            mod_pred, head_pred, pv_pred = mod_mu, head_mu, pv_mu
         else:
             mod_pred = mod_mu.clamp(SCORE_MIN, SCORE_MAX)
             head_pred = head_mu.clamp(SCORE_MIN, SCORE_MAX)
+            pv_pred = pv_mu.clamp(SCORE_MIN, SCORE_MAX)
         if with_logits:
-            return mod_pred, head_pred, mod_sigma, head_sigma
+            return (mod_pred, head_pred, pv_pred, mod_sigma, head_sigma, pv_sigma) if with_pv \
+                else (mod_pred, head_pred, mod_sigma, head_sigma)
+        if with_pv:
+            return mod_pred, head_pred, pv_pred
         return mod_pred, head_pred
 
-    def forward(self, batch, with_logits: bool = False):
-        return self._forward_gauss(batch, with_logits)
+    def forward(self, batch, with_logits: bool = False, with_pv: bool = False):
+        return self._forward_gauss(batch, with_logits, with_pv)
 
 
 def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertModel:

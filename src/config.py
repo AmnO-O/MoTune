@@ -54,17 +54,13 @@ class Config:
     # e.g. (10, 16, 22) = the 3 upper global attention layers of mmBERT-base
     # (blocks 9/15/21). Mean-pooling keeps dim H, so head_in is unchanged.
     context_layers: Optional[Tuple[int, ...]] = None
-    # Per-role dedicated context for the gauss heads: when gauss_dedicated is
-    # true, the mod gauss head reads the whole-sentence context at its OWN
-    # hidden-state index (`gauss_ctx_mod`) instead of the last layer (e.g.
-    # 19 = block 18 global), and the head gauss head at `gauss_ctx_head` (e.g.
-    # 20 = block 19 local). en-pv rows use `gauss_ctx_pv` (e.g. 22 = last).
-    # Word spans (`mod_emb` / `head_emb`) still come from mid-5 span_layers;
-    # only the context feeding each head moves. Feature width unchanged.
-    gauss_dedicated: bool = False
-    gauss_ctx_mod: Optional[Tuple[int, ...]] = None    # context layer(s) for modifier gauss head
-    gauss_ctx_head: Optional[Tuple[int, ...]] = None   # context layer(s) for head gauss head
-    gauss_ctx_pv: Optional[Tuple[int, ...]] = None     # en-pv rows override (e.g. 22)
+    # Intermediate Gaussian exits.  hidden_states[0] is the embedding output,
+    # so 19/20/21,22 select transformer blocks 18/19/20,21.  The PV exit is a
+    # single overall-composition head fed by both Base and Particle spans.
+    gauss_dedicated: bool = True
+    gauss_ctx_mod: Optional[Tuple[int, ...]] = (19,)       # modifier exit: block 18
+    gauss_ctx_head: Optional[Tuple[int, ...]] = (20,)      # head exit: block 19
+    gauss_ctx_pv: Optional[Tuple[int, ...]] = (21, 22)     # PV exit: blocks 20--21
     head_hidden: int = 128
     dropout: float = 0.2
     # literality feature (ALWAYS ON, no knob): cosine between the contextualised
