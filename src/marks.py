@@ -114,8 +114,20 @@ def _alternate_forms(base: str) -> Tuple[str, ...]:
     if not t:
         return ()
     out: List[str] = [t]
-    for ir in _IRREGULAR.get(t, ()):
-        out.append(ir)
+
+    irreg = _IRREGULAR.get(t)
+    if irreg:
+        # Known irregulars: keep only their actual surfaces plus the regular
+        # third-person -s/-es (always valid: takes/writes/breaks/goes). The
+        # -ed/-ing/-d/doubling/y rules only produce non-words here (be -> bing,
+        # bed), so they are skipped to keep the candidate set lean and avoid a
+        # "bed ... out" false positive for mod=be.
+        out.extend(irreg)
+        if t.endswith(("s", "x", "z", "ch", "sh", "o")):
+            out.append(t + "es")             # go -> goes, echo -> echoes
+        else:
+            out.append(t + "s")
+        return tuple(dict.fromkeys(out))
 
     last = t[-1]
     def doubles() -> bool:
@@ -123,8 +135,8 @@ def _alternate_forms(base: str) -> Tuple[str, ...]:
         return (len(t) >= 3 and last not in "aeiouwyx"
                 and t[-2] in "aeiou" and t[-3] not in "aeiou")
 
-    if last in "sxz" or t.endswith(("ch", "sh")):
-        out.append(t + "es")                   # watch -> watches
+    if last in "sxz" or t.endswith(("ch", "sh", "o")):
+        out.append(t + "es")                   # watch -> watches, echo -> echoes
     else:
         out.append(t + "s")                    # line -> lines
     if last == "e" and t.endswith("ie"):
@@ -242,18 +254,19 @@ def _match_fused(text_n: str, mod: str, head: str) -> Optional[Tuple[Tuple[int, 
 
 
 def _match_spaced(text_n: str, mod: str, head: str) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
-    """Spaced compound: ``mod WHITESPACE head`` (+ head inflection)."""
+    """Spaced compound: ``mod SEP head`` (+ head inflection), where SEP is
+    whitespace or a hyphen ("night watch" / "night-watch")."""
     t_mod, t_head = normalize(mod), normalize(head)
     if not t_mod or not t_head:
         return None
-    pattern = re.escape(t_mod) + r"\s+" + re.escape(t_head) + _INFL_RE + _END_BOUNDARY
+    pattern = re.escape(t_mod) + r"[ \t-]+" + re.escape(t_head) + _INFL_RE + _END_BOUNDARY
     m = re.search(_START_BOUNDARY + pattern, text_n)
     if not m:
         return None
     s0 = m.start()
     mid = s0 + len(t_mod)
-    ws = re.match(r"\s+", text_n[mid:])
-    head_start = mid + (ws.end() if ws else 0)
+    sep = re.match(r"[ \t-]+", text_n[mid:])
+    head_start = mid + (sep.end() if sep else 0)
     return ((s0, mid), (head_start, m.end()))
 
 
