@@ -102,12 +102,13 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
                           std_alpha=cfg.loss_std_alpha, ccc_var_floor=cfg.ccc_var_floor)
     assert criterion.requires_logits
     opt = AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg.head_lr)
+    opt.zero_grad()
     scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
     sched = get_linear_schedule_with_warmup(opt, num_warmup_steps=1, num_training_steps=3)
-    diag: Dict[str, Any] = {}
     batch = next(iter(loader))
     batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-    with torch.amp.autocast('cuda' if device.type == 'cuda' else 'cpu'):
+    device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+    with torch.amp.autocast(device_type, enabled=(device.type == 'cuda')):
         mod_pred, head_pred, mod_logits, head_logits = model(batch, with_logits=True)
         allowed = batch['has_label'] & batch['has_mod'] & batch['has_head'] & ~batch['degenerate']
         loss = (
@@ -120,7 +121,7 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
     logger.info('[smoke] gauss forward + backward OK (loss %.4f)', loss.item())
 
     # 4b. single-batch evaluate
-    with torch.amp.autocast('cuda' if device.type == 'cuda' else 'cpu'):
+    with torch.amp.autocast(device_type, enabled=(device.type == 'cuda')):
         model(batch, with_logits=True)
     mod_h, head_h = evaluate(model, loader, device)
     logger.info('[smoke] evaluate OK (mod_shape=%s, head_shape=%s)',

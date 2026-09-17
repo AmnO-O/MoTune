@@ -71,7 +71,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         allowed = (batch['has_label'] & batch['has_mod'] & batch['has_head']
                    & ~batch['degenerate'])
 
-        with torch.amp.autocast(device_type):
+        with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
             requires_logits = getattr(criterion, 'requires_logits', False)
 
             mod_logits = head_logits = None
