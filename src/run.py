@@ -148,7 +148,7 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
     # 4b. single-batch evaluate
     with torch.amp.autocast(device_type, enabled=(device.type == 'cuda')):
         model(batch, with_logits=True)
-    mod_h, head_h = evaluate(model, loader, device)
+    mod_h, head_h, *_ = evaluate(model, loader, device)
     logger.info('[smoke] evaluate OK (mod_shape=%s, head_shape=%s)',
                 mod_h.shape, head_h.shape)
 
