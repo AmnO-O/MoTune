@@ -180,6 +180,52 @@ def load_aux(cfg) -> List[Dict]:
     return rows
 
 
+def load_trial(cfg) -> Dict[str, List[Dict]]:
+    """Load the per-lineage TRIAL (or Test) files -> {key: rows}.
+
+    ``key`` is one of ``en-nn`` / ``en-pv`` / ``de-nn`` / ``de-pv``, read from the
+    four ``*_trial`` config attrs; falls back to the single ``trial_file`` attr if
+    those are empty. Rows keep the file's row order and get a per-lineage
+    ``compound_id`` (paths don't participate in train-time splits at inference).
+    """
+    data_dir, _ = _resolve(cfg)
+    lineage_attrs = (
+        ('en-nn', 'en_nn_trial'), ('en-pv', 'en_pv_trial'),
+        ('de-nn', 'de_nn_trial'), ('de-pv', 'de_pv_trial'),
+    )
+    out: Dict[str, List[Dict]] = {}
+    for key, attr in lineage_attrs:
+        fname = (getattr(cfg, attr, '') or '').strip()
+        if not fname:
+            continue
+        path = data_dir / fname
+        if not path.exists():
+            logger.warning('%s file missing, skipping: %s', key, path)
+            continue
+        rows = _df_to_rows(read_tsv(path), fname, _auto_lang(fname))
+        codes, _ = pd.factorize(pd.Series(
+            [f"{r['lang']}_{r['compound']}" for r in rows]))
+        for r, c in zip(rows, codes):
+            r['compound_id'] = int(c)
+        out[key] = rows
+        logger.info('%s trial: %d rows', key, len(rows))
+
+    fallback = (getattr(cfg, 'trial_file', '') or '').strip()
+    if not out and fallback:
+        path = data_dir / fallback
+        if path.exists():
+            rows = _df_to_rows(read_tsv(path), fallback, _auto_lang(fallback))
+            pv = rows[0]['is_pv'] if rows else False
+            lang = rows[0]['lang'] if rows else 'en'
+            key = f'{lang}-{"pv" if pv else "nn"}'
+            codes, _ = pd.factorize(pd.Series(
+                [f"{r['lang']}_{r['compound']}" for r in rows]))
+            for r, c in zip(rows, codes):
+                r['compound_id'] = int(c)
+            out[key] = rows
+    return out
+
+
 def _resolve(cfg):
     from .utils import resolve_paths
     return resolve_paths(cfg)
