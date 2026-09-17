@@ -43,9 +43,9 @@ _INFL_RE = "(?:" + "|".join(re.escape(s) for s in _INFLECTION) + ")?"
 _FUGEN = r"(?:s|es|en|er|n|e|ens|-)?"
 # Any Unicode letter or combining mark, minus digits/underscore (covers umlauts,
 # ß, accented/é, Vietnamese letters), so word-boundary lookarounds are portable.
-_WORD = r"^\W\d_"
-_START_BOUNDARY = f"(?<![{_WORD}])"
-_END_BOUNDARY = f"(?![{_WORD}])"
+_LETTER = r"[^\W\d_]"
+_START_BOUNDARY = f"(?<!{_LETTER})"
+_END_BOUNDARY = f"(?!{_LETTER})"
 
 # Suppletive English verb surfaces for PV rows (walk/drop/step etc. are covered
 # by the regular e-drop / consonant-doubling alternates below, so only the truly
@@ -119,17 +119,22 @@ def _alternate_forms(base: str) -> Tuple[str, ...]:
 
     last = t[-1]
     def doubles() -> bool:
-        return (len(t) >= 3 and last not in "aeiouy"
+        # w and x never double in English (draw -> drew, fix -> fixed).
+        return (len(t) >= 3 and last not in "aeiouwyx"
                 and t[-2] in "aeiou" and t[-3] not in "aeiou")
 
     if last in "sxz" or t.endswith(("ch", "sh")):
         out.append(t + "es")                   # watch -> watches
     else:
         out.append(t + "s")                    # line -> lines
-    e_stem = t[:-1] if last == "e" else t
-    out.append(e_stem + "ing")                 # move -> moving; step stays stepped-path
+    if last == "e" and t.endswith("ie"):
+        out.append(t[:-2] + "ying")            # tie -> tying (not "tiing")
+    elif last == "e":
+        out.append(t[:-1] + "ing")             # move -> moving
+    else:
+        out.append(t + "ing")
     if last == "e":
-        out.append(t + "d")                    # line -> lined
+        out.append(t + "d")                    # tie -> tied, line -> lined
     elif doubles():
         out.append(t + last + "ed")            # step -> stepped
         out.append(t + last + "ing")           # step -> stepping
@@ -262,21 +267,22 @@ def _match_independent(text_n: str, mod: str, head: str,
     the base form never appears verbatim.
     """
     t_head = re.escape(normalize(head))
+    head_pat = re.compile(_START_BOUNDARY + t_head + _INFL_RE + _END_BOUNDARY)
     for alt in _alternate_forms(mod):
-        pat = _START_BOUNDARY + re.escape(alt) + _END_BOUNDARY
+        pat = re.compile(_START_BOUNDARY + re.escape(alt) + _END_BOUNDARY)
         pos = 0
         while True:
-            m_mod = re.search(pat, text_n[pos:])
+            # .search(text_n, pos) (NOT text_n[pos:]) keeps the lookbehind able
+            # to inspect characters before ``pos``, so a candidate alternate is
+            # not falsely matched mid-word directly after a previous occurrence.
+            m_mod = pat.search(text_n, pos)
             if not m_mod:
                 break
-            s0 = pos + m_mod.start()
-            e0 = pos + m_mod.end()
-            m_head = re.search(
-                _START_BOUNDARY + t_head + _INFL_RE + _END_BOUNDARY, text_n[e0:])
+            e0 = m_mod.end()
+            m_head = head_pat.search(text_n, e0)
             if m_head:
-                s = e0 + m_head.start()
-                e = e0 + m_head.end()
-                return ((s0, e0), (s, e))
+                return ((m_mod.start(), m_mod.end()),
+                        (m_head.start(), m_head.end()))
             pos = e0
     return None
 
