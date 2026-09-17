@@ -16,8 +16,11 @@ import json
 import logging
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List
+
+import torch
 
 from src.config import Config, coerce_value
 from src.utils import get_logger, set_seed, get_device, resolve_paths
@@ -51,15 +54,34 @@ def _build_config(args) -> Config:
 
 
 def _lock_device(device_str: str | None) -> str:
+    """Resolve the device string, validating CUDA availability.
+
+    ``--device auto`` uses the first available accelerator; an explicit
+    ``--device cuda[:N]`` on a CPU-only torch build (or with too few GPUs)
+    falls back to ``cpu`` with a warning instead of crashing at ``.to()``.
+    """
     if device_str and device_str != 'auto':
-        return device_str
-    dev = get_device()
-    return str(dev) if dev else 'cpu'
+        chosen = device_str
+    else:
+        dev = get_device()
+        chosen = str(dev) if dev else 'cpu'
+    if chosen.startswith('cuda'):
+        if not torch.cuda.is_available():
+            warnings.warn(
+                f'CUDA requested ({chosen}) but torch has no usable CUDA; using cpu')
+            return 'cpu'
+        if chosen != 'cuda':
+            idx = int(chosen.split(':')[1])
+            if idx >= torch.cuda.device_count():
+                warnings.warn(
+                    f'CUDA device {idx} requested but only '
+                    f'{torch.cuda.device_count()} GPU(s) visible; using cuda:0')
+                return 'cuda'
+    return chosen
 
 
 def _smoke(logger: logging.Logger, device_str: str) -> None:
     """Quick pipeline sanity check (frozen backbone, 1 batch)."""
-    import torch
     from torch.amp import GradScaler
     from torch.optim import AdamW
     from torch.utils.data import DataLoader
@@ -169,7 +191,6 @@ def main() -> None:
         _smoke(logger, device_str)
         return
 
-    import torch
     device = torch.device(device_str)
     set_seed(cfg.seed)
 

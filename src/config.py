@@ -83,11 +83,15 @@ class Config:
     train_file: str = 'en-nn-train.tsv'
     trial_file: str = 'en-nn-trial.tsv'
 
-    # Multi-task Train Datasets (EN / DE)
+    # Multi-task Train Datasets (EN / DE, NN + PV)
     en_nn_train: str = 'en-nn-train.tsv'
     de_nn_train: str = 'de-nn-train.tsv'
-    en_pv_train: str = ''
-    de_pv_train: str = ''
+    en_pv_train: str = 'en-pv-train.tsv'
+    de_pv_train: str = ''          # German PV: particle is embedded inside other
+    #                                words and the split form is rare in this
+    #                                corpus (standalone particle in <1% of rows),
+    #                                so supervised alignment is not recoverable.
+    #                                Enable explicitly with --set de_pv_train=de-pv-train.tsv.
 
     # Multi-task Trial Datasets (EN / DE)
     en_nn_trial: str = 'en-nn-trial.tsv'

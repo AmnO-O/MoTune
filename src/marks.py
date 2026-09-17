@@ -47,6 +47,106 @@ _WORD = r"^\W\d_"
 _START_BOUNDARY = f"(?<![{_WORD}])"
 _END_BOUNDARY = f"(?![{_WORD}])"
 
+# Suppletive English verb surfaces for PV rows (walk/drop/step etc. are covered
+# by the regular e-drop / consonant-doubling alternates below, so only the truly
+# irregular bases live here). Base first so exact matches win.
+_IRREGULAR = {
+    "be": ("is", "are", "was", "were", "been", "being", "am"),
+    "blow": ("blew", "blown", "blowing"),
+    "break": ("broke", "broken", "breaking"),
+    "bring": ("brought", "bringing"),
+    "build": ("built", "building"),
+    "burn": ("burnt", "burned", "burning"),
+    "catch": ("caught", "catching"),
+    "come": ("came", "coming"),
+    "cut": ("cut", "cutting"),
+    "dig": ("dug", "digging"),
+    "draw": ("drew", "drawn", "drawing"),
+    "drive": ("drove", "driven", "driving"),
+    "fall": ("fell", "fallen", "falling"),
+    "fight": ("fought", "fighting"),
+    "find": ("found", "finding"),
+    "fly": ("flew", "flown", "flying"),
+    "get": ("got", "gotten", "getting"),
+    "give": ("gave", "given", "giving"),
+    "go": ("went", "gone", "going"),
+    "hang": ("hung", "hanging"),
+    "hold": ("held", "holding"),
+    "keep": ("kept", "keeping"),
+    "lay": ("laid", "laid", "laying"),
+    "lead": ("led", "leading"),
+    "leave": ("left", "leaving"),
+    "let": ("let", "letting"),
+    "lie": ("lay", "lain", "lying"),
+    "make": ("made", "making"),
+    "meet": ("met", "meeting"),
+    "pay": ("paid", "paying"),
+    "run": ("ran", "running"),
+    "seek": ("sought", "seeking"),
+    "sell": ("sold", "selling"),
+    "send": ("sent", "sending"),
+    "shake": ("shook", "shaken", "shaking"),
+    "shoot": ("shot", "shooting"),
+    "sit": ("sat", "sitting"),
+    "speak": ("spoke", "spoken", "speaking"),
+    "strike": ("struck", "striking"),
+    "take": ("took", "taken", "taking"),
+    "tear": ("tore", "torn", "tearing"),
+    "throw": ("threw", "thrown", "throwing"),
+    "wake": ("woke", "woken", "waking"),
+    "wear": ("wore", "worn", "wearing"),
+    "wind": ("wound", "winding"),
+    "write": ("wrote", "written", "writing"),
+}
+
+
+def _alternate_forms(base: str) -> Tuple[str, ...]:
+    """Surface candidates for ``base`` (base first, then inflections).
+
+    Covers the regular English verb endings -- ``-s/-es``, ``-ed/-d``,
+    ``-ing`` with the ``e``-drop ("move" -> "moving"), consonant doubling
+    ("step" -> "stepping") and ``y -> -ies/-ied`` rules -- plus the suppletive
+    ``_IRREGULAR`` set. Used only by the independent (head-anywhere) fallback,
+    so NN compounds that already matched via compound/fused/spaced are
+    unaffected.
+    """
+    t = normalize(base)
+    if not t:
+        return ()
+    out: List[str] = [t]
+    for ir in _IRREGULAR.get(t, ()):
+        out.append(ir)
+
+    last = t[-1]
+    def doubles() -> bool:
+        return (len(t) >= 3 and last not in "aeiouy"
+                and t[-2] in "aeiou" and t[-3] not in "aeiou")
+
+    if last in "sxz" or t.endswith(("ch", "sh")):
+        out.append(t + "es")                   # watch -> watches
+    else:
+        out.append(t + "s")                    # line -> lines
+    e_stem = t[:-1] if last == "e" else t
+    out.append(e_stem + "ing")                 # move -> moving; step stays stepped-path
+    if last == "e":
+        out.append(t + "d")                    # line -> lined
+    elif doubles():
+        out.append(t + last + "ed")            # step -> stepped
+        out.append(t + last + "ing")           # step -> stepping
+        if t.endswith(("p", "t")):
+            out.append(t + last + "s")         # drops -> not used; keep simple
+    else:
+        out.append(t + "ed")
+        if last == "y" and len(t) >= 2 and t[-2] not in "aeiou":
+            stem = t[:-1]                      # try -> tries / tied
+            out.append(stem + "ies")
+            out.append(stem + "ied")
+    dedup: List[str] = []
+    for s in out:
+        if s and s not in dedup:
+            dedup.append(s)
+    return tuple(dedup)
+
 
 def normalize(s: str) -> str:
     # `.lower()` (NOT casefold): casefold expands German 'ß' -> 'ss' (1->2
@@ -154,21 +254,31 @@ def _match_spaced(text_n: str, mod: str, head: str) -> Optional[Tuple[Tuple[int,
 
 def _match_independent(text_n: str, mod: str, head: str,
                        ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
-    """Modifier (may be inflected) and head anywhere in the sentence, head after modifier."""
-    m_mod = re.search(
-        _START_BOUNDARY + re.escape(normalize(mod)) + _INFL_RE + _END_BOUNDARY, text_n
-    )
-    if not m_mod:
-        return None
-    m_head = re.search(
-        _START_BOUNDARY + re.escape(normalize(head)) + _INFL_RE + _END_BOUNDARY,
-        text_n[m_mod.end():],
-    )
-    if not m_head:
-        return None
-    s = m_head.start() + m_mod.end()
-    e = m_head.end() + m_mod.end()
-    return ((m_mod.start(), m_mod.end()), (s, e))
+    """Modifier (any surface alternate) and head anywhere in the sentence.
+
+    Tries each surface form of ``mod`` (base, regular inflections, irregular
+    verbs) and for each *occurrence* searches for the head strictly after it,
+    so split phrasal verbs ("struck ... down", "stepped down") align even when
+    the base form never appears verbatim.
+    """
+    t_head = re.escape(normalize(head))
+    for alt in _alternate_forms(mod):
+        pat = _START_BOUNDARY + re.escape(alt) + _END_BOUNDARY
+        pos = 0
+        while True:
+            m_mod = re.search(pat, text_n[pos:])
+            if not m_mod:
+                break
+            s0 = pos + m_mod.start()
+            e0 = pos + m_mod.end()
+            m_head = re.search(
+                _START_BOUNDARY + t_head + _INFL_RE + _END_BOUNDARY, text_n[e0:])
+            if m_head:
+                s = e0 + m_head.start()
+                e = e0 + m_head.end()
+                return ((s0, e0), (s, e))
+            pos = e0
+    return None
 
 
 def find_spans(text: str, offsets: Iterable[Tuple[int, int]],

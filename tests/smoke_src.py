@@ -282,6 +282,18 @@ def check_data() -> None:
     check(gfound / gn > 0.2,
           f'de-nn synthetic-offset alignment {gfound}/{gn} ({100*gfound/gn:.0f}%)')
 
+    rows_pv = _df_to_rows(read_tsv('dataset/en-pv-train.tsv'), 'en-pv', 'en')
+    check(len(rows_pv) == 1557 and rows_pv[0]['is_pv'],
+          f'en-pv: {len(rows_pv)} rows parsed (is_pv flag)')
+    pv_n = min(len(rows_pv), 500)
+    pv_ok = sum(
+        1 for r in rows_pv[:pv_n]
+        if find_spans(r['context'], synth_offsets(r['context']),
+                      r['mod'], r['head'], r.get('compound', '')).found
+    )
+    check(pv_ok / pv_n > 0.8,
+          f'en-pv irregular/doubled-verb alignment {pv_ok}/{pv_n} ({100*pv_ok/pv_n:.0f}%)')
+
     # MLM warmup data pieces must be gone
     data_src = (ROOT / 'src' / 'data.py').read_text(encoding='utf-8')
     check('def MlmDataset' not in data_src and 'def collate_mlm' not in data_src
