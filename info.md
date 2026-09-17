@@ -63,3 +63,14 @@ Single zip archive containing `[language]-[task]-pred.tsv` files.
 
 - **No header.**
 - Each line: `ContextID`, followed by tab-separated predictions (modifier + head for noun compounds; single score for particle verbs).
+
+
+
+
+Noun compound example	Mod	Head
+she propelled herself into the firing line in taking the stance she did	0.6	0.7
+our flea market will feature some of the most creative individuals	0.0	4.7
+Particle verb example	Overall
+it’s gonna get very cold so pull up your leggings	4.8
+I will probably wind up as a Web Haunter […] blogging for eternity	0.2
+
