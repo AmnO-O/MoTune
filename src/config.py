@@ -87,17 +87,19 @@ class Config:
     en_nn_train: str = 'en-nn-train.tsv'
     de_nn_train: str = 'de-nn-train.tsv'
     en_pv_train: str = 'en-pv-train.tsv'
-    de_pv_train: str = ''          # German PV: particle is embedded inside other
-    #                                words and the split form is rare in this
-    #                                corpus (standalone particle in <1% of rows),
-    #                                so supervised alignment is not recoverable.
-    #                                Enable explicitly with --set de_pv_train=de-pv-train.tsv.
+    de_pv_train: str = 'de-pv-train.tsv'          # German PV joins the mix by default.
+    #                                Caveat: the particle is embedded inside other
+    #                                words and the split verb form is rare in this
+    #                                corpus (standalone particle in <1% of rows), so
+    #                                only ~3.8% of de-pv rows are span-alignable and
+    #                                reach supervised losses; the rest is auto-masked
+    #                                (representation-only). Turn off with --set de_pv_train=.
 
     # Multi-task Trial Datasets (EN / DE)
     en_nn_trial: str = 'en-nn-trial.tsv'
     de_nn_trial: str = 'de-nn-trial.tsv'
-    en_pv_trial: str = ''
-    de_pv_trial: str = ''
+    en_pv_trial: str = 'en-pv-trial.tsv'
+    de_pv_trial: str = 'de-pv-trial.tsv'
 
     # label-free rows appended to the scoring loader (consistency signal only)
     aux_data_paths: List[str] = field(default_factory=list)
