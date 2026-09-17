@@ -180,6 +180,22 @@ def load_aux(cfg) -> List[Dict]:
     return rows
 
 
+def _find_trial_path(fname: str, data_dir: Path) -> Optional[Path]:
+    """Find a trial file in trial/ (sibling of dataset/ on Kaggle or root) or data_dir."""
+    candidates = [
+        data_dir / fname,
+        data_dir / 'trial' / fname,
+        data_dir.parent / 'trial' / fname,
+        data_dir.parent / fname,
+        Path('trial') / fname,
+        Path('dataset') / fname,
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
 def load_trial(cfg) -> Dict[str, List[Dict]]:
     """Load the per-lineage TRIAL (or Test) files -> {key: rows}.
 
@@ -198,9 +214,9 @@ def load_trial(cfg) -> Dict[str, List[Dict]]:
         fname = (getattr(cfg, attr, '') or '').strip()
         if not fname:
             continue
-        path = data_dir / fname
-        if not path.exists():
-            logger.warning('%s file missing, skipping: %s', key, path)
+        path = _find_trial_path(fname, data_dir)
+        if path is None:
+            logger.warning('%s file missing, skipping: %s', key, fname)
             continue
         rows = _df_to_rows(read_tsv(path), fname, _auto_lang(fname))
         codes, _ = pd.factorize(pd.Series(
@@ -208,12 +224,12 @@ def load_trial(cfg) -> Dict[str, List[Dict]]:
         for r, c in zip(rows, codes):
             r['compound_id'] = int(c)
         out[key] = rows
-        logger.info('%s trial: %d rows', key, len(rows))
+        logger.info('%s trial: %d rows from %s', key, len(rows), path)
 
     fallback = (getattr(cfg, 'trial_file', '') or '').strip()
     if not out and fallback:
-        path = data_dir / fallback
-        if path.exists():
+        path = _find_trial_path(fallback, data_dir)
+        if path is not None and path.is_file():
             rows = _df_to_rows(read_tsv(path), fallback, _auto_lang(fallback))
             pv = rows[0]['is_pv'] if rows else False
             lang = rows[0]['lang'] if rows else 'en'

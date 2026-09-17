@@ -72,6 +72,7 @@ def run_train80(cfg: Config, logger: logging.Logger, device,
         'mode': cfg.mode,
         'val_rho_mod': round(result.rho_mod, 5),
         'val_rho_head': round(result.rho_head, 5),
+        'val_rho_pv': round(result.rho_pv, 5),
         'val_rho_mean': round(result.rho_mean, 5),
         'val_rmse_mod': round(_rmse(val_my, val_mp), 5) if len(val_my) > 0 else float('nan'),
         'val_rmse_head': round(_rmse(val_hy, val_hp), 5) if len(val_hy) > 0 else float('nan'),
@@ -83,5 +84,7 @@ def run_train80(cfg: Config, logger: logging.Logger, device,
     logger.info('=== RESULTS (best epoch %s) ===', metrics['best_epoch'])
     logger.info('Val Mod  ρ %.4f / RMSE %.4f', metrics['val_rho_mod'], metrics['val_rmse_mod'])
     logger.info('Val Head ρ %.4f / RMSE %.4f', metrics['val_rho_head'], metrics['val_rmse_head'])
+    if result.rho_pv > 0:
+        logger.info('Val PV   ρ %.4f', metrics['val_rho_pv'])
     logger.info('Val Mean ρ %.4f', metrics['val_rho_mean'])
     return metrics

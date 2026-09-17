@@ -109,7 +109,7 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
     logger.info('[smoke] marks OK')
 
     # 2. data
-    rows = load_labeled(cfg)[:12]
+    rows = load_labeled(cfg)[:60]
     tok = cfg.build_tokenizer()
     ds = CompDataset(rows, tok, max_len=64)
     folds = assign_folds(rows, 3, cfg.seed)

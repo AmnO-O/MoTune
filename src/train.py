@@ -54,6 +54,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
     model.train()
     total_loss = 0.0
+    mod_loss_sum = head_loss_sum = pv_loss_sum = 0.0
     optimizer.zero_grad()
     device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
 
@@ -70,6 +71,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
         allowed = (batch['has_label'] & batch['has_mod'] & batch['has_head']
                    & ~batch['degenerate'])
+        is_pv = batch.get('is_pv', torch.zeros_like(allowed))
+        allowed_nn = allowed & (~is_pv)
+        allowed_pv = allowed & is_pv
 
         with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
             requires_logits = getattr(criterion, 'requires_logits', False)
@@ -81,13 +85,28 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             else:
                 mod_pred, head_pred = model(batch)
 
-            loss = criterion(
+            # NN loss (mask=allowed on NN rows)
+            mod_loss = criterion(
                 mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
-                compound_ids=batch['compound_id'], mask=allowed,
-            ) + criterion(
-                head_pred, batch['head_avg'], head_logits, batch['head_std'],
-                compound_ids=batch['compound_id'], mask=allowed,
+                compound_ids=batch['compound_id'], mask=allowed_nn,
             )
+            head_loss = criterion(
+                head_pred, batch['head_avg'], head_logits, batch['head_std'],
+                compound_ids=batch['compound_id'], mask=allowed_nn,
+            )
+
+            # PV loss (both mod and head predict Avg; mask=allowed on PV rows)
+            pv_mod_loss = criterion(
+                mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
+                compound_ids=batch['compound_id'], mask=allowed_pv,
+            )
+            pv_head_loss = criterion(
+                head_pred, batch['head_avg'], head_logits, batch['head_std'],
+                compound_ids=batch['compound_id'], mask=allowed_pv,
+            )
+            pv_loss = 0.5 * (pv_mod_loss + pv_head_loss)
+
+            loss = mod_loss + head_loss + pv_loss
 
             if compound_weight > 0:
                 center_ids = batch['compound_id'].clone()
@@ -147,12 +166,23 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
         v = loss.item() * accum_steps
         total_loss += v if math.isfinite(v) else 0.0
+        mv = mod_loss.item() * accum_steps
+        hv = head_loss.item() * accum_steps
+        pvv = pv_loss.item() * accum_steps
+        mod_loss_sum += mv if math.isfinite(mv) else 0.0
+        head_loss_sum += hv if math.isfinite(hv) else 0.0
+        pv_loss_sum += pvv if math.isfinite(pvv) else 0.0
 
     if report is not None:
         report.update({
             'opt_steps': opt_steps, 'skipped': skipped,
             'grad_norm': last_grad_norm,
             'scale': last_scale, 'lr': last_lr,
+            'nn_mod_loss': mod_loss_sum / n_micro,
+            'nn_head_loss': head_loss_sum / n_micro,
+            'pv_loss': pv_loss_sum / n_micro,
+            'mod_loss': mod_loss_sum / n_micro,
+            'head_loss': head_loss_sum / n_micro,
         })
         if tr_mod_preds:
             m_p = torch.cat(tr_mod_preds).numpy()
@@ -162,6 +192,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             al = torch.cat(tr_allowed).numpy()
             report['train_preds'] = (m_p, h_p, m_y, h_y, al)
     return total_loss / n_micro
+
 
 
 def evaluate(model, dataloader, device, return_all: bool = False):

@@ -388,8 +388,9 @@ class MMBertModel(nn.Module):
         # but NaN still flows into the backward graph (0 * NaN = NaN), so
         # substitute ones BEFORE the cosine and select afterwards.
         has_span = span_mask.any(-1, keepdim=True)
+        use_safe = torch.where(has_span, use_emb, torch.ones_like(use_emb))
         proto_safe = torch.where(has_span, proto, torch.ones_like(proto))
-        cos = F.cosine_similarity(use_emb.float(), proto_safe.float(), dim=-1)
+        cos = F.cosine_similarity(use_safe.float(), proto_safe.float(), dim=-1)
         cos = torch.where(has_span.squeeze(-1), cos, torch.zeros_like(cos))
         return cos.type_as(use_emb).unsqueeze(-1)
 

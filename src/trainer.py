@@ -49,6 +49,7 @@ class FoldResult:
     best_head_pred: np.ndarray
     best_mod_label: np.ndarray
     best_head_label: np.ndarray
+    rho_pv: float = 0.0
 
 
 class Trainer:
@@ -57,10 +58,12 @@ class Trainer:
         self.device = torch.device(device)
         self.logger = logger
         self.output_dir = Path(output_dir)
+        self._val_rows: List[Dict] = []
 
     # ------------------------------------------------------------------ #
     def _build_loaders(self, train_rows, val_rows, tokenizer):
         self.logger.info("Building Datasets & Tokenizing %d train / %d val rows...", len(train_rows), len(val_rows))
+        self._val_rows = list(val_rows)
         train_ds = CompDataset(train_rows, tokenizer, max_len=self.cfg.max_context_length)
         val_ds = CompDataset(val_rows, tokenizer, max_len=self.cfg.max_context_length)
         
@@ -264,23 +267,56 @@ class Trainer:
 
             val_mod, val_head, val_mod_y, val_head_y, val_mask = evaluate(
                 model, val_loader, self.device, return_all=True)
-            rho_mod = _safe_rho(val_mod_y[val_mask], val_mod[val_mask]) if val_mask.any() else 0.0
-            rho_head = _safe_rho(val_head_y[val_mask], val_head[val_mask]) if val_mask.any() else 0.0
-            rho_mean = (rho_mod + rho_head) / 2.0
+
+            is_pv_mask = np.array([bool(r.get('is_pv', False)) for r in self._val_rows])
+            nn_mask = val_mask & (~is_pv_mask)
+            pv_mask = val_mask & is_pv_mask
+
+            rho_mod = _safe_rho(val_mod_y[nn_mask], val_mod[nn_mask]) if nn_mask.any() else 0.0
+            rho_head = _safe_rho(val_head_y[nn_mask], val_head[nn_mask]) if nn_mask.any() else 0.0
+
+            # For PV: expression score = 0.5 * (val_mod + val_head) against gold Avg
+            val_pv_pred = 0.5 * (val_mod + val_head)
+            rho_pv = _safe_rho(val_mod_y[pv_mask], val_pv_pred[pv_mask]) if pv_mask.any() else 0.0
+
+            if pv_mask.any() and nn_mask.any():
+                rho_mean = (rho_mod + rho_head + rho_pv) / 3.0
+            elif pv_mask.any():
+                rho_mean = rho_pv
+            else:
+                rho_mean = (rho_mod + rho_head) / 2.0
 
             ovf_str = ''
-            self.logger.info(
-                'Epoch %d/%d [%s] | Loss %.4f | Train ρ %.4f | Val Mod ρ %.4f | Val Head ρ %.4f'
-                ' | Val Mean ρ %.4f | steps %d (skip %d) | scale %.1f | lr %.2e',
-                epoch + 1, self.cfg.total_epochs, phase, train_loss,
-                (tr_rho_m + tr_rho_h) / 2, rho_mod, rho_head, rho_mean,
-                diag['opt_steps'], diag['skipped'], diag['scale'], diag['lr'])
+            if pv_mask.any():
+                self.logger.info(
+                    'Epoch %d/%d [%s] | Loss %.4f (nn_m %.4f / nn_h %.4f / pv %.4f) | Train ρ %.4f | '
+                    'Val Mod ρ %.4f | Val Head ρ %.4f | Val PV ρ %.4f | Val Mean ρ %.4f | '
+                    'steps %d (skip %d) | scale %.1f | lr %.2e',
+                    epoch + 1, self.cfg.total_epochs, phase, train_loss,
+                    diag.get('nn_mod_loss', diag['mod_loss']),
+                    diag.get('nn_head_loss', diag['head_loss']),
+                    diag.get('pv_loss', 0.0),
+                    (tr_rho_m + tr_rho_h) / 2, rho_mod, rho_head, rho_pv, rho_mean,
+                    diag['opt_steps'], diag['skipped'], diag['scale'], diag['lr'])
+            else:
+                self.logger.info(
+                    'Epoch %d/%d [%s] | Loss %.4f (mod %.4f / head %.4f) | Train ρ %.4f | '
+                    'Val Mod ρ %.4f | Val Head ρ %.4f | Val Mean ρ %.4f | '
+                    'steps %d (skip %d) | scale %.1f | lr %.2e',
+                    epoch + 1, self.cfg.total_epochs, phase, train_loss,
+                    diag['mod_loss'], diag['head_loss'],
+                    (tr_rho_m + tr_rho_h) / 2, rho_mod, rho_head, rho_mean,
+                    diag['opt_steps'], diag['skipped'], diag['scale'], diag['lr'])
 
             history.append({
                 'epoch': epoch + 1, 'phase': phase,
                 'loss': round(float(train_loss), 5),
+                'loss_mod': round(float(diag.get('nn_mod_loss', diag['mod_loss'])), 5),
+                'loss_head': round(float(diag.get('nn_head_loss', diag['head_loss'])), 5),
+                'loss_pv': round(float(diag.get('pv_loss', 0.0)), 5),
                 'train_rho_mean': round((tr_rho_m + tr_rho_h) / 2, 5),
                 'rho_mod': round(rho_mod, 5), 'rho_head': round(rho_head, 5),
+                'rho_pv': round(rho_pv, 5),
                 'rho_mean': round(rho_mean, 5),
                 'opt_steps': diag['opt_steps'], 'skipped': diag['skipped'],
                 'grad_norm': round(diag['grad_norm'], 4),
@@ -294,7 +330,7 @@ class Trainer:
                     'head': val_head[val_mask].copy() if val_mask.any() else np.array([]),
                     'mod_y': val_mod_y[val_mask].copy() if val_mask.any() else np.array([]),
                     'head_y': val_head_y[val_mask].copy() if val_mask.any() else np.array([]),
-                    'rho_mod': rho_mod, 'rho_head': rho_head,
+                    'rho_mod': rho_mod, 'rho_head': rho_head, 'rho_pv': rho_pv,
                 }
                 torch.save(model.state_dict(), ckpt_path)
             else:
@@ -317,13 +353,15 @@ class Trainer:
 
         best_rho_mod = best['rho_mod']
         best_rho_head = best['rho_head']
-        best_rho_mean = (best_rho_mod + best_rho_head) / 2.0
-        self.logger.info('Split %s finished | best Mean ρ %.4f at epoch %d',
-                         'n/a' if fold is None else fold, best_rho_mean, best_epoch)
+        best_rho_pv = best.get('rho_pv', 0.0)
+        best_rho_mean = best_rho
+        self.logger.info('Split %s finished | best Mean ρ %.4f (Mod %.4f / Head %.4f / PV %.4f) at epoch %d',
+                         'n/a' if fold is None else fold, best_rho_mean, best_rho_mod, best_rho_head, best_rho_pv, best_epoch)
 
         return FoldResult(
             fold=fold, rho_mod=best_rho_mod, rho_head=best_rho_head,
             rho_mean=best_rho_mean, best_epoch=best_epoch, ckpt_path=str(ckpt_path),
             history=history, best_mod_pred=best['mod'], best_head_pred=best['head'],
             best_mod_label=best['mod_y'], best_head_label=best['head_y'],
+            rho_pv=best_rho_pv,
         )
