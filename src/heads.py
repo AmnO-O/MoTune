@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-SIGMA_FLOOR = 0.05
+SIGMA_FLOOR = 0.04
 
 
 class GaussHead(nn.Module):

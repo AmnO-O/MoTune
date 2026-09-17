@@ -63,11 +63,10 @@ def run_train80(cfg: Config, logger: logging.Logger, device,
     result = trainer.fit(train_rows, val_rows, tokenizer, fold=None,
                          ckpt_name='best.pt')
 
-    labeled_val = [i for i, r in enumerate(val_rows) if r['has_label']]
     val_my = result.best_mod_label
     val_hy = result.best_head_label
-    val_mp = result.best_mod_pred[labeled_val] if len(result.best_mod_pred) == len(val_rows) else result.best_mod_pred
-    val_hp = result.best_head_pred[labeled_val] if len(result.best_head_pred) == len(val_rows) else result.best_head_pred
+    val_mp = result.best_mod_pred
+    val_hp = result.best_head_pred
 
     metrics = {
         'mode': cfg.mode,

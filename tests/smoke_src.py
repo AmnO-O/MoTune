@@ -57,11 +57,14 @@ def check_config() -> None:
     check(defaults.mode == 'train80', 'only train80 mode exists')
     check(defaults.lambda_dist == 1.0 and defaults.ccc_weight == 0.7,
           'lambda_dist (renamed ce_weight) + a single ccc_weight default')
-    check(defaults.use_proto_cos is False,
-          'use_proto_cos defaults to False (off so it can be A/B\'d)')
+    check(not hasattr(defaults, 'use_proto_cos'),
+          'use_proto_cos knob removed (proto-cos always on, head_in += 1)')
     check(not hasattr(defaults, 'head_mode') and not hasattr(defaults, 'num_bins')
-          and not hasattr(defaults, 'warmup_mlm_epochs'),
-          'no head_mode / num_bins / warmup knobs remain')
+          and not hasattr(defaults, 'warmup_mlm_epochs')
+          and not hasattr(defaults, 'lambda_consist')
+          and not hasattr(defaults, 'consist_mode')
+          and not hasattr(defaults, 'phase1_schedule'),
+          'no head_mode / num_bins / warmup / consist / phase1_schedule knobs remain')
 
     bad = [
         ('lambda_rank=-1', lambda: Config.defaults().update(lambda_rank=-1)),
@@ -356,27 +359,27 @@ def check_fixes() -> None:
     check('class GaussLoss' in loss_src and 'def gauss_kl' in loss_src
           and 'self.requires_logits = True' in loss_src,
           'src/losses.py defines gauss_kl + GaussLoss (sigma via logits channel)')
-    check('def margin_rank_loss' in loss_src and 'def compound_consistency_loss' in loss_src
-          and 'def compound_center_loss' in loss_src,
-          'shared rank/consistency/center losses merged into src/losses.py')
+    check('def margin_rank_loss' in loss_src and 'def compound_center_loss' in loss_src
+          and 'def compound_consistency_loss' not in loss_src,
+          'rank/center losses merged into src/losses.py; consistency dropped')
     check('def _role_context(' in model_src and 'def _compose_gauss_feat(' in model_src,
           '_features builds per-role context bundles (_role_context/_compose_gauss_feat)')
 
-    # 3) proxy for the role-feature width: proto-cos dimension + lm-stats fix
-    check('self.head_in += 1 if use_proto_cos else 0' in model_src,
-          'head_in counts the appended cos column (+1 when use_proto_cos)')
+    # 3) proxy for the role-feature width: proto-cos dimension + plain-AutoModel
+    check('self.head_in += 1' in model_src,
+          'head_in counts the appended cos column (proto-cos always on)')
+    check('from transformers import AutoModel' in model_src
+          and 'AutoModelForMaskedLM' not in model_src
+          and '_lm_span_stats' not in model_src
+          and 'use_lm_features' not in model_src,
+          'backbone is a plain AutoModel; LM-predictability stats dropped (no [MASK])')
     check('def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,'
-          in model_src and 'lm_stats=None' in model_src and 'lm_stats=lm_stats' in model_src,
-          '_compose_gauss_feat takes the PRE-COMPUTED lm_stats (single forward)')
-    check(model_src.count('self._lm_span_stats(') == 1,
-          '_lm_span_stats called exactly once per _features (no duplicated MLM passes)')
+          in model_src and 'lm_stats' not in model_src,
+          '_compose_gauss_feat takes 5 args only (no lm_stats plumbing)')
     check('tok = F.embedding(input_ids, weight)' in model_src,
           '_prototype_cos uses F.embedding (not manual index_select)')
     check('proto_safe = torch.where(has_span, proto, torch.ones_like(proto))' in model_src,
           '_prototype_cos substitutes ones BEFORE the cosine (no NaN in backward)')
-    check('pos_logp = F.log_softmax(logits[b, l].float(), dim=-1)' in model_src
-          and 'p = logp.exp()' not in model_src,
-          '_lm_span_stats log_softmax slices only span positions (no BxLxV table)')
 
     # 4) LoRA base-freeze invariant
     check('linear.weight.requires_grad = False' in model_src

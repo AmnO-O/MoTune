@@ -3,7 +3,7 @@
 Merged from the old ``losses.py`` + ``losses_gauss.py`` (the reg/softmax
 ``CombinedLoss`` and its soft-target bin machinery are gone): the Gaussian
 distribution loss ``KL(N(mu_p, sigma_p^2) || N(y, sigma_t^2))`` plus the shared
-pairwise-ranking, label-free consistency and compound-center terms.
+pairwise-ranking and compound-center terms.
 """
 
 from __future__ import annotations
@@ -13,6 +13,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# floor of predicted sigma in gauss_kl matches the GaussHead floor (heads.py)
+_SIGMA_FLOOR = 0.05
 
 
 # --------------------------------------------------------------------------- #
@@ -53,54 +56,6 @@ def margin_rank_loss(
     dynamic_margin = torch.clamp(target_diff[mask], max=margin) if mode == 'clamp' \
         else target_diff[mask]
     return F.relu(dynamic_margin - pred_diff[mask]).mean()
-
-
-# --------------------------------------------------------------------------- #
-# label-free consistency
-# --------------------------------------------------------------------------- #
-def compound_consistency_loss(
-    mod_emb: torch.Tensor,
-    head_emb: torch.Tensor,
-    compound_ids: torch.Tensor,
-    mode: str = 'pull',
-    temp: float = 0.1,
-) -> torch.Tensor:
-    """Self-supervised loss pulling reps of the SAME compound together.
-
-    'pull': distance to the compound's own centroid (gradient detached, so the
-    loss cannot cheat by shrinking norms). 'infonce': InfoNCE positives within
-    the batch. Rows with compound_id == -1 are excluded.
-    """
-    rep = torch.cat([mod_emb, head_emb], dim=-1).float()
-    ids = compound_ids.to(rep.device)
-    keep = ids >= 0
-    if not keep.any():
-        return rep.sum() * 0.0   # graph-connected zero; .backward() works in frozen phase
-    ids, rep = ids[keep], rep[keep]
-
-    if mode == 'pull':
-        uniq, inv = torch.unique(ids, return_inverse=True)
-        ncomp = uniq.shape[0]
-        onehot = F.one_hot(inv, ncomp).float()
-        counts = onehot.sum(0).clamp(min=1.0)
-        centers = (onehot.t() @ rep) / counts.unsqueeze(1)
-        var = ((rep - centers[inv].detach()) ** 2).sum(-1)
-        return var.mean()
-
-    n = rep.shape[0]
-    if n < 2:
-        return rep.sum() * 0.0   # graph-connected zero
-    rep = F.normalize(rep, dim=-1)
-    logits = rep @ rep.t() / temp
-    same = (ids[:, None] == ids[None, :]).float()
-    pos = same - torch.eye(n, device=rep.device, dtype=rep.dtype)
-    has_pos = pos.sum(-1) > 0
-    if not has_pos.any():
-        return rep.sum() * 0.0   # graph-connected zero
-    num_pos = pos.sum(-1).clamp(min=1.0)
-    log_p = F.log_softmax(logits, dim=-1)
-    loss_per_row = (pos * log_p).sum(-1) / num_pos
-    return -loss_per_row[has_pos].mean()
 
 
 # --------------------------------------------------------------------------- #
@@ -146,9 +101,9 @@ def gauss_kl(mu_p: torch.Tensor, sigma_p: torch.Tensor,
              target: torch.Tensor, sigma_t: torch.Tensor) -> torch.Tensor:
     """Closed-form KL(N(mu_p, sigma_p^2) || N(target, sigma_t^2)), element-wise mean."""
     mu_p = mu_p.float()
-    sigma_p = sigma_p.float().clamp(min=1e-3)
+    sigma_p = sigma_p.float().clamp(min=_SIGMA_FLOOR)
     target = target.float()
-    sigma_t = sigma_t.float().clamp(min=1e-3)
+    sigma_t = sigma_t.float().clamp(min=_SIGMA_FLOOR)
     expect = (sigma_p ** 2 + (mu_p - target) ** 2) / (2 * sigma_t ** 2)
     return ((sigma_t / sigma_p).log() + expect - 0.5).mean()
 
@@ -166,7 +121,7 @@ def ccc_loss(pred: torch.Tensor, target: torch.Tensor,
     target = target.float()
     if w is None:
         w = torch.ones_like(pred)
-    ws = w.sum(dim=0)
+    ws = w.sum(dim=0).clamp(min=1e-8)
     pm = (pred * w).sum(0) / ws
     tm = (target * w).sum(0) / ws
     pv = ((pred - pm) ** 2 * w).sum(0) / ws

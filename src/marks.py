@@ -41,7 +41,9 @@ _INFLECTION = (
 )
 _INFL_RE = "(?:" + "|".join(re.escape(s) for s in _INFLECTION) + ")?"
 _FUGEN = r"(?:s|es|en|er|n|e|ens|-)?"
-_WORD = "A-Za-z\u00C0-\u024F"
+# Any Unicode letter or combining mark, minus digits/underscore (covers umlauts,
+# ß, accented/é, Vietnamese letters), so word-boundary lookarounds are portable.
+_WORD = r"^\W\d_"
 _START_BOUNDARY = f"(?<![{_WORD}])"
 _END_BOUNDARY = f"(?![{_WORD}])"
 
@@ -75,16 +77,25 @@ class SpanResult:
         return self.mod.degenerate or self.head.degenerate
 
 
-def _char_to_token(offsets: List[Tuple[int, int]], c_end: int) -> Optional[int]:
-    """Token containing char ``c_end-1`` (tokens are contiguous; specials (0,0) skipped)."""
+def _char_to_token(offsets: List[Tuple[int, int]], c_pos: int) -> Optional[int]:
+    """Token whose character range contains char ``c_pos`` (specials (0,0) skipped).
+
+    Falls back to the first token that starts after ``c_pos`` (whitespace gap),
+    then to the last real token when ``c_pos`` is past the end. Ranges from a
+    wordpiece ``offset_mapping`` are contiguous, so containment is exact.
+    """
     best: Optional[int] = None
     for i, (s, e) in enumerate(offsets):
         if (s, e) == (0, 0):
             continue
-        if s < c_end:
+        if s <= c_pos < e:
+            return i
+        if best is None and s > c_pos:
             best = i
-        else:
-            break
+    if best is None:
+        for i, (s, e) in enumerate(offsets):
+            if (s, e) != (0, 0):
+                best = i
     return best
 
 
@@ -143,9 +154,9 @@ def _match_spaced(text_n: str, mod: str, head: str) -> Optional[Tuple[Tuple[int,
 
 def _match_independent(text_n: str, mod: str, head: str,
                        ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
-    """Modifier and head anywhere in the sentence, head after modifier."""
+    """Modifier (may be inflected) and head anywhere in the sentence, head after modifier."""
     m_mod = re.search(
-        _START_BOUNDARY + re.escape(normalize(mod)) + _END_BOUNDARY, text_n
+        _START_BOUNDARY + re.escape(normalize(mod)) + _INFL_RE + _END_BOUNDARY, text_n
     )
     if not m_mod:
         return None
@@ -184,9 +195,9 @@ def find_spans(text: str, offsets: Iterable[Tuple[int, int]],
 
     def tok_span(cs: Tuple[int, int]) -> Optional[Span]:
         s, e = cs
-        ts = _char_to_token(offsets, s + 1)   # token containing char s
-        te = _char_to_token(offsets, e)       # token containing char e-1
-        if ts is None or te is None or te < ts:
+        ts = _char_to_token(offsets, s)       # token containing char s (start)
+        te = _char_to_token(offsets, e - 1)   # token containing char e-1 (end)
+        if s >= e or ts is None or te is None or te < ts:
             return None
         return Span(ts, te + 1)
 

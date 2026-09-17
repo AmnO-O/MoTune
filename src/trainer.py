@@ -16,19 +16,24 @@ from scipy.stats import spearmanr
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler
-from transformers import get_constant_schedule_with_warmup, get_linear_schedule_with_warmup
+from transformers import get_constant_schedule, get_linear_schedule_with_warmup
 
 from src.config import Config
 from src.data import CompDataset, collate_comp
 from src.folds import CompoundGroupSampler
 from src.losses import GaussLoss
-from src.model import apply_lora, build_model, lora_parameters, _backbone_embeddings
+from src.model import apply_lora, build_model, lora_parameters
 from src.train import evaluate, track_optimizer_steps, train_epoch, unfreeze_top_layers
 
 
 def _safe_rho(y: np.ndarray, p: np.ndarray) -> float:
     r = float(spearmanr(y, p).statistic) if len(y) > 1 else 0.0
     return 0.0 if r != r else r
+
+
+def _embeddings(model) -> nn.Module:
+    """Input-embedding module of the plain AutoModel backbone."""
+    return model.lm.get_input_embeddings()
 
 
 @dataclass
@@ -49,7 +54,7 @@ class FoldResult:
 class Trainer:
     def __init__(self, cfg: Config, device, logger: logging.Logger, output_dir: Path):
         self.cfg = cfg
-        self.device = device
+        self.device = torch.device(device)
         self.logger = logger
         self.output_dir = Path(output_dir)
 
@@ -110,7 +115,7 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     def _param_groups(self, model, adapters, phase: int):
-        emb = list(_backbone_embeddings(model).parameters())
+        emb = list(_embeddings(model).parameters())
         heads = self._pred_heads(model)
         head = []
         for m in heads:
@@ -140,7 +145,7 @@ class Trainer:
             for p in m.parameters():
                 p.requires_grad = True
         if self.cfg.embedding_lr > 0:
-            for p in _backbone_embeddings(model).parameters():
+            for p in _embeddings(model).parameters():
                 p.requires_grad = True
         for p in lora_parameters(adapters):
             p.requires_grad = False
@@ -156,13 +161,11 @@ class Trainer:
         groups = self._param_groups(model, adapters, phase)
         optimizer = AdamW(groups)
         track_optimizer_steps(optimizer)
-        if phase == 1 and self.cfg.phase1_schedule == 'constant':
-            scheduler = get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=int(steps * self.cfg.warmup_ratio))
+        if phase == 1:
+            scheduler = get_constant_schedule(optimizer)
         else:
             scheduler = get_linear_schedule_with_warmup(
-                optimizer, num_warmup_steps=int(steps * self.cfg.warmup_ratio),
-                num_training_steps=steps)
+                optimizer, num_warmup_steps=0, num_training_steps=steps)
         return optimizer, scheduler
 
     # ------------------------------------------------------------------ #
@@ -248,9 +251,6 @@ class Trainer:
                 model, train_loader, optimizer, scheduler, criterion, scaler,
                 self.device, grad_clip=self.cfg.grad_clip,
                 accum_steps=self.cfg.accum_steps, report=diag,
-                consist_weight=self.cfg.lambda_consist,
-                consist_mode=self.cfg.consist_mode,
-                consist_temp=self.cfg.consist_temp,
                 compound_weight=self.cfg.lambda_compound,
             )
 
@@ -268,14 +268,13 @@ class Trainer:
             rho_head = _safe_rho(val_head_y[val_mask], val_head[val_mask]) if val_mask.any() else 0.0
             rho_mean = (rho_mod + rho_head) / 2.0
 
-            ovf = diag.get('overflow', {})
-            ovf_str = (' [' + ' '.join(f'ovf-{k}={v}' for k, v in sorted(ovf.items())) + ']') if ovf else ''
+            ovf_str = ''
             self.logger.info(
                 'Epoch %d/%d [%s] | Loss %.4f | Train ρ %.4f | Val Mod ρ %.4f | Val Head ρ %.4f'
-                ' | Val Mean ρ %.4f | steps %d (skip %d)%s | scale %.1f | lr %.2e',
+                ' | Val Mean ρ %.4f | steps %d (skip %d) | scale %.1f | lr %.2e',
                 epoch + 1, self.cfg.total_epochs, phase, train_loss,
                 (tr_rho_m + tr_rho_h) / 2, rho_mod, rho_head, rho_mean,
-                diag['opt_steps'], diag['skipped'], ovf_str, diag['scale'], diag['lr'])
+                diag['opt_steps'], diag['skipped'], diag['scale'], diag['lr'])
 
             history.append({
                 'epoch': epoch + 1, 'phase': phase,
@@ -291,7 +290,8 @@ class Trainer:
             if rho_mean > best_rho:
                 best_rho, best_epoch, no_improve_epochs = rho_mean, epoch + 1, 0
                 best = {
-                    'mod': val_mod.copy(), 'head': val_head.copy(),
+                    'mod': val_mod[val_mask].copy() if val_mask.any() else np.array([]),
+                    'head': val_head[val_mask].copy() if val_mask.any() else np.array([]),
                     'mod_y': val_mod_y[val_mask].copy() if val_mask.any() else np.array([]),
                     'head_y': val_head_y[val_mask].copy() if val_mask.any() else np.array([]),
                     'rho_mod': rho_mod, 'rho_head': rho_head,

@@ -108,8 +108,7 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
     batch = next(iter(loader))
     batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
     with torch.amp.autocast('cuda' if device.type == 'cuda' else 'cpu'):
-        (mod_pred, head_pred, mod_emb, head_emb,
-         mod_logits, head_logits) = model(batch, with_logits=True, with_reps=True)
+        mod_pred, head_pred, mod_logits, head_logits = model(batch, with_logits=True)
         allowed = batch['has_label'] & batch['has_mod'] & batch['has_head'] & ~batch['degenerate']
         loss = (
             criterion(mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
@@ -127,16 +126,15 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
     logger.info('[smoke] evaluate OK (mod_shape=%s, head_shape=%s)',
                 mod_h.shape, head_h.shape)
 
-    # 5. context 6-tuple
+    # 5. eval-mode clamp + finite prediction check
+    model.eval()
     with torch.no_grad():
-        (mod_pred2, head_pred2, mod_emb2, head_emb2,
-         mod_logits2, head_logits2) = model(batch, with_logits=True, with_reps=True)
-    n_feat = mod_logits2.shape[1] if mod_logits2 is not None else 0
-    has_ctx = mod_emb2 is not None
-    assert has_ctx or n_feat > 0, 'use_context was enabled but no role features produced'
-    logger.info('[smoke] context 6-tuple OK (lm_stats=%d, role_feats=%s, emb=%s)',
-                n_feat, mod_logits2.shape if mod_logits2 is not None else None,
-                mod_emb2.shape if mod_emb2 is not None else None)
+        mod_pred2, head_pred2 = model(batch)
+    assert tuple(mod_pred2.shape) == (batch['input_ids'].shape[0], 1)
+    assert tuple(head_pred2.shape) == (batch['input_ids'].shape[0], 1)
+    assert torch.isfinite(mod_pred2).all() and torch.isfinite(head_pred2).all()
+    logger.info('[smoke] eval-mode clamp OK (mod_pred=%s, head_pred=%s)',
+                tuple(mod_pred2.shape), tuple(head_pred2.shape))
 
     logger.info('=== SMOKE PASSED ===')
 

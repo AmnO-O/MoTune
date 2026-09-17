@@ -2,22 +2,21 @@
 
   * ``allowed`` row mask = has_label & has_mod & has_head & ~degenerate, so
     unaligned (missing span) and German-collapsed (mod==head token) rows are
-    never fed to span-based supervised / consistency / center terms.
+    never fed to span-based supervised / center terms.
   * per-batch compound-centroid MSE (``compound_center_loss``) added with
     ``lambda_compound`` weight.
-  * ``unfreeze_top_layers`` walks the MLM wrapper's base model generically and
-    skips ``.linear.`` paths so LoRA base weights stay frozen.
+  * ``unfreeze_top_layers`` walks the encoder generically and skips
+    ``.linear.`` paths so LoRA base weights stay frozen.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 
-from .losses import compound_center_loss, compound_consistency_loss
+from .losses import compound_center_loss
 from .utils import get_logger
 
 logger = get_logger('src.train')
@@ -43,7 +42,6 @@ def track_optimizer_steps(optimizer) -> None:
 
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
                 grad_clip=1.0, accum_steps=1, report=None,
-                consist_weight=0.0, consist_mode='pull', consist_temp=0.1,
                 compound_weight=0.0):
     """One scoring epoch with AMP + gradient accumulation + clipping.
 
@@ -56,13 +54,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
     model.train()
     total_loss = 0.0
-    consist_sum, n_consist = 0.0, 0
     optimizer.zero_grad()
     device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
 
     opt_steps = skipped = 0
     last_grad_norm = last_scale = last_lr = float('nan')
-    overflow: Dict[str, int] = {}
     n_micro = len(dataloader)
 
     tr_mod_preds, tr_head_preds = [], []
@@ -77,18 +73,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
 
         with torch.amp.autocast(device_type):
             requires_logits = getattr(criterion, 'requires_logits', False)
-            use_reps = consist_weight > 0
-            
-            mod_logits = head_logits = None
-            mod_emb = head_emb = None
 
-            if requires_logits and use_reps:
-                (mod_pred, head_pred, mod_emb, head_emb,
-                 mod_logits, head_logits) = model(batch, with_logits=True, with_reps=True)
-            elif requires_logits:
+            mod_logits = head_logits = None
+
+            if requires_logits:
                 mod_pred, head_pred, mod_logits, head_logits = model(batch, with_logits=True)
-            elif use_reps:
-                mod_pred, head_pred, mod_emb, head_emb = model(batch, with_reps=True)
             else:
                 mod_pred, head_pred = model(batch)
 
@@ -99,15 +88,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 head_pred, batch['head_avg'], head_logits, batch['head_std'],
                 compound_ids=batch['compound_id'], mask=allowed,
             )
-
-            consist_val = None
-            if use_reps and mod_emb is not None:
-                cid = batch['compound_id'].clone()
-                cid[~allowed] = -1
-                consist = compound_consistency_loss(
-                    mod_emb, head_emb, cid, mode=consist_mode, temp=consist_temp)
-                loss = loss + consist_weight * consist
-                consist_val = consist.item() if torch.isfinite(consist) else float('nan')
 
             if compound_weight > 0:
                 center_ids = batch['compound_id'].clone()
@@ -165,10 +145,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             last_scale = float(scaler.get_scale())
             last_lr = float(scheduler.get_last_lr()[0])
 
-        if consist_val is not None:
-            consist_sum += consist_val
-            n_consist += 1
-
         v = loss.item() * accum_steps
         total_loss += v if math.isfinite(v) else 0.0
 
@@ -176,10 +152,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         report.update({
             'opt_steps': opt_steps, 'skipped': skipped,
             'grad_norm': last_grad_norm,
-            'overflow': overflow, 'scale': last_scale, 'lr': last_lr,
+            'scale': last_scale, 'lr': last_lr,
         })
-        if n_consist:
-            report['consist'] = consist_sum / n_consist
         if tr_mod_preds:
             m_p = torch.cat(tr_mod_preds).numpy()
             h_p = torch.cat(tr_head_preds).numpy()
@@ -218,6 +192,8 @@ def evaluate(model, dataloader, device, return_all: bool = False):
             if lab is not None:
                 has_mask = True
                 masks.append(lab.cpu().numpy().astype(bool).reshape(-1))
+            else:
+                masks.append(np.zeros(int(mod_pred.numel()), dtype=bool))
 
             # Xử lý an toàn nếu batch không chứa ground truth targets (ví dụ tập Test)
             if 'mod_avg' in batch and 'head_avg' in batch:

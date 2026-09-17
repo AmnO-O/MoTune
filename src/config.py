@@ -18,15 +18,11 @@ Mode = Literal['train80']
 ContextPool = Literal['mean', 'cls', 'mean+cls']
 HeadPool = Literal['mean', 'attn']
 RankMarginMode = Literal['clamp', 'dynamic']
-ConsistMode = Literal['pull', 'infonce']
-Phase1Schedule = Literal['constant', 'linear']
 
 _MODES = ('train80',)
 _CONTEXT_POOLS = ('mean', 'cls', 'mean+cls')
 _HEAD_POOLS = ('mean', 'attn')
 _RANK_MARGIN_MODES = ('clamp', 'dynamic')
-_CONSIST_MODES = ('pull', 'infonce')
-_PHASE1_SCHEDULES = ('constant', 'linear')
 
 
 @dataclass
@@ -71,16 +67,12 @@ class Config:
     gauss_ctx_pv: Optional[Tuple[int, ...]] = None     # en-pv rows override (e.g. 22)
     head_hidden: int = 128
     dropout: float = 0.2
-    # attach LM-predictability features (avg log P + span entropy of the span
-    # tokens under the pretrained MLM head) to the head input. 0 = off.
-    use_lm_features: bool = False
-    # literality feature: cosine between the contextualised USE embedding of a
-    # constituent span and the static prototype (base/lemma) embedding row of
-    # its own tokens. High = word keeps its literal meaning in context (e.g.
-    # "market" in "flea market"); low = drift/lexicalised (e.g. "tower" in
-    # "ivory tower"). Off by default so it can be A/B'd against the cosine-free
-    # baseline.
-    use_proto_cos: bool = False
+    # literality feature (ALWAYS ON, no knob): cosine between the contextualised
+    # USE embedding of a constituent span and the static prototype (base/lemma)
+    # embedding row of its own tokens. High = word keeps its literal meaning in
+    # context (e.g. "market" in "flea market"); low = drift/lexicalised (e.g.
+    # "tower" in "ivory tower"). The cos column is appended to the head input
+    # unconditionally in build_model (head_in += 1).
 
     # === data / paths (filenames are resolved under data_path) ===
     data_path: Optional[str] = None
@@ -128,8 +120,6 @@ class Config:
     embedding_lr: float = 0.0      # 0 = frozen (mmBERT embedding table is ~197M)
     weight_decay: float = 0.05
     grad_clip: float = 1.0
-    warmup_ratio: float = 0.15
-    phase1_schedule: Phase1Schedule = 'constant'
     amp_init_scale: float = 1024.0
     amp_growth_interval: int = 256
     patience: int = 4
@@ -142,9 +132,6 @@ class Config:
     lambda_rank: float = 0.5
     rank_margin: float = 0.5
     rank_margin_mode: RankMarginMode = 'dynamic'
-    lambda_consist: float = 0.0
-    consist_mode: ConsistMode = 'pull'
-    consist_temp: float = 0.1
     # compound-center calibration: MSE between predicted and gold compound
     # centroids per batch (teaches between-compound ranking). 0 = off.
     lambda_compound: float = 0.0
@@ -232,12 +219,6 @@ class Config:
             errors.append(
                 f'rank_margin_mode must be one of {_RANK_MARGIN_MODES}, got {self.rank_margin_mode!r}'
             )
-        if self.consist_mode not in _CONSIST_MODES:
-            errors.append(f'consist_mode must be one of {_CONSIST_MODES}, got {self.consist_mode!r}')
-        if self.phase1_schedule not in _PHASE1_SCHEDULES:
-            errors.append(
-                f'phase1_schedule must be one of {_PHASE1_SCHEDULES}, got {self.phase1_schedule!r}'
-            )
 
         if self.batch_size < 1:
             errors.append(f'batch_size must be >= 1, got {self.batch_size}')
@@ -265,19 +246,15 @@ class Config:
             )
         if self.embedding_lr < 0:
             errors.append(f'embedding_lr must be >= 0, got {self.embedding_lr}')
-        if not 0 <= self.warmup_ratio <= 1:
-            errors.append(f'warmup_ratio must be in [0, 1], got {self.warmup_ratio}')
+        if not 0 <= self.grad_clip:
+            errors.append(f'grad_clip must be >= 0, got {self.grad_clip}')
 
         if self.lambda_rank < 0:
             errors.append(f'lambda_rank must be >= 0, got {self.lambda_rank}')
-        if self.lambda_consist < 0:
-            errors.append(f'lambda_consist must be >= 0, got {self.lambda_consist}')
         if self.lambda_compound < 0:
             errors.append(f'lambda_compound must be >= 0, got {self.lambda_compound}')
         if self.rank_margin <= 0:
             errors.append(f'rank_margin must be > 0, got {self.rank_margin}')
-        if self.consist_temp <= 0:
-            errors.append(f'consist_temp must be > 0, got {self.consist_temp}')
         if self.loss_std_alpha < 0:
             errors.append(f'loss_std_alpha must be >= 0, got {self.loss_std_alpha}')
         if self.ccc_var_floor < 0:

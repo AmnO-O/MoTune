@@ -1,16 +1,15 @@
 """mmBERT gauss scoring model: marker-free span pooling + LoRA + gauss heads only.
 
-Loads the backbone as an ``AutoModelForMaskedLM`` so the SAME forward pass
-yields both encoder hidden states (for span pooling) and, when requested, the
-LM-predictability / prototype signals — with no marker tokens and therefore
-no embedding resize. No ordinal/regression heads exist in this package; both
-modifier and head noun are scored by ``GaussHead`` instances predicting
-``(mu, sigma)``.
+Loads the backbone as a plain ``AutoModel`` (encoder only — the MLM head of
+the old MLM-wrapper design is gone, together with the LM-predictability stats
+that were its only consumer). No marker tokens and therefore no embedding
+resize. No ordinal/regression heads exist in this package; both modifier and
+head noun are scored by ``GaussHead`` instances predicting ``(mu, sigma)``.
 
 Head input: mod/head span embeddings (+ optional learned attention pooling)
-+ span-length fractions + context (mean and/or CLS), plus optional
-LM-predictability stats and a per-word literality ``cos(use, prototype)``
-scalar (no cross-talk between the two words).
++ span-length fractions + context (mean and/or CLS), plus a per-word
+literality ``cos(use, prototype)`` scalar (no cross-talk between the two
+words).
 
 LoRA is implemented inline (no ``peft`` dependency): target ``nn.Linear``
 modules are wrapped in ``LoRAAdapter`` (keeps the frozen base path), trained,
@@ -27,36 +26,9 @@ from typing import Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForMaskedLM
-
+from transformers import AutoModel
 from .constants import SCORE_MAX, SCORE_MIN
 from .heads import GaussHead
-
-
-def _backbone(model: nn.Module) -> nn.Module:
-    """The base transformer (BERT / ModernBERT / Llama-style) inside the wrapper."""
-    lm = model.lm
-    for attr in ('model', 'bert', 'base_model', 'transformer'):
-        if hasattr(lm, attr):
-            return getattr(lm, attr)
-    raise AttributeError("Cannot locate the base transformer in the MLM model")
-
-
-def _backbone_embeddings(model: nn.Module) -> nn.Module:
-    lm = getattr(model, 'lm', model)
-    if hasattr(lm, 'get_input_embeddings') and lm.get_input_embeddings() is not None:
-        return lm.get_input_embeddings()
-    base = _backbone(model)
-    if hasattr(base, 'get_input_embeddings') and base.get_input_embeddings() is not None:
-        return base.get_input_embeddings()
-    for attr in ('embed_tokens', 'embeddings', 'word_embeddings', 'wte', 'tok_embeddings'):
-        m = getattr(base, attr, None)
-        if m is not None:
-            for sub in ('tok_embeddings', 'word_embeddings'):
-                if hasattr(m, sub):
-                    return getattr(m, sub)
-            return m
-    raise AttributeError("Cannot locate the embedding module")
 
 
 # --------------------------------------------------------------------------- #
@@ -320,15 +292,13 @@ class MMBertModel(nn.Module):
     """Encodes one sentence verbatim and scores modifier / head pair as
     Gaussians ``N(mu, sigma^2)``.
 
-    ``forward(batch, with_logits, with_reps, with_lm)`` mirrors the old
-    interface: predictions (B,), optional sigma via the "logits" channel
-    (B, 2), and optional span reps (B, H) for the consistency loss.
+    ``forward(batch, with_logits)``: predictions (B,), optional
+    sigma via the "logits" channel (B, 2).
     """
 
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
                  context_pool: str = 'mean+cls', head_pool: str = 'attn',
-                 head_hidden: int = 128, use_lm_features: bool = False,
-                 use_proto_cos: bool = False,
+                 head_hidden: int = 128,
                  span_layers: Optional[Sequence[int]] = None,
                  context_layers: Optional[Sequence[int]] = None,
                  gauss_dedicated: bool = False,
@@ -340,8 +310,6 @@ class MMBertModel(nn.Module):
         self.hidden_size = hidden_size
         self.context_pool = context_pool
         self.head_pool = head_pool
-        self.use_lm_features = use_lm_features
-        self.use_proto_cos = use_proto_cos
         # MID-layer span pooling. Empty/None = auto mid-5; a concrete tuple
         # (e.g. (-1,)) pins exact layers. Resolved lazily in _features on the
         # first forward, so __init__ only needs the raw knob.
@@ -367,23 +335,21 @@ class MMBertModel(nn.Module):
         self._ctx_head_hidden = None
         self._ctx_pv_hidden   = None
 
-        self.lm = AutoModelForMaskedLM.from_pretrained(backbone, tie_word_embeddings=False)
-        # Cached reference to the base transformer for the no-logits forward
-        # path. Deliberately NOT registered as a child module: registering the
-        # same instance under a second name would duplicate every state_dict
-        # key/parameter (double optimizer updates, 2x ckpt size, strict-load
-        # failures on pre-existing snapshots, and LoRA applied twice).
-        object.__setattr__(self, 'base_model', _backbone(self))
+        self.lm = AutoModel.from_pretrained(backbone)
+        # Alias to the encoder (there is no wrapper head anymore), kept so the
+        # feature/pooling code reads uniformly. Deliberately NOT registered as
+        # a child module: registering the same instance under a second name
+        # would duplicate every state_dict key/parameter (double optimizer
+        # updates, 2x ckpt size, strict-load failures, and LoRA applied twice).
+        object.__setattr__(self, 'base_model', self.lm)
 
         context_dim = hidden_size if context_pool in ('mean', 'cls') else 2 * hidden_size
-        # 2 spans + 2 lens + context (+ optional LM stats, + optional proto cos)
+        # 2 spans + 2 lens + context + 1 literalness cos
         self.head_in = hidden_size * 2 + context_dim + 2
-        if use_lm_features:
-            self.head_in += 4                                  # avg_logp + entropy x mod/head
         # Each output branch gets ONLY its own word's cos(use, prototype)
         # tacked on (torch.cat, last axis), so mod_out never sees head's
         # literalness and vice-versa. That extra column IS part of head_in.
-        self.head_in += 1 if use_proto_cos else 0
+        self.head_in += 1
 
         self.mod_pool = SpanPool(hidden_size, head_pool)
         self.head_role_pool = SpanPool(hidden_size, head_pool)
@@ -391,47 +357,6 @@ class MMBertModel(nn.Module):
         self.head_gauss = GaussHead(self.head_in, head_hidden, dropout)
 
     # ------------------------------------------------------------------ #
-    def mask_token_id(self):
-        tok = getattr(self.lm.config, 'mask_token_id', None)
-        return tok
-
-    def _lm_span_stats(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                       mod_mask: torch.Tensor, head_mask: torch.Tensor) -> torch.Tensor:
-        """avg logP + entropy of the pretrained MLM head over the two spans.
-
-        Runs one extra forward with the span tokens replaced by [MASK], and
-        reads the softmax distribution at those positions (cheap: only the
-        span logits are ever materialized). Returns (B, 4).
-        """
-        mask_id = self.mask_token_id()
-        if mask_id is None:
-            return torch.zeros(input_ids.size(0), 4, device=input_ids.device)
-        ids = input_ids.clone()
-        span = (mod_mask | head_mask)
-        if not span.any():
-            return torch.zeros(input_ids.size(0), 4, device=input_ids.device)
-        ids = ids.masked_fill(span, mask_id)
-        logits = self.lm(input_ids=ids, attention_mask=attention_mask).logits  # (B, L, V)
-
-        def _stats(mask: torch.Tensor) -> torch.Tensor:
-            B = input_ids.size(0)
-            rows = torch.nonzero(mask)                    # (N, 2): (batch, seq)
-            if rows.numel() == 0:
-                return torch.zeros(B, 2, device=input_ids.device)
-            b, l = rows[:, 0], rows[:, 1]
-            # log_softmax ONLY at the ~few span positions: a full (B, L, V)
-            # log-prob + exp table is tens of GB with a large-Vocab backbone.
-            pos_logp = F.log_softmax(logits[b, l].float(), dim=-1)            # (N, V)
-            tok_logp = torch.gather(
-                pos_logp, -1, input_ids[b, l].unsqueeze(-1)).squeeze(-1)      # (N,)
-            ent = -(pos_logp.exp() * pos_logp).sum(-1)                        # (N,)
-            avg = torch.zeros(B, device=input_ids.device).index_add_(0, b, tok_logp)
-            ent_sum = torch.zeros(B, device=input_ids.device).index_add_(0, b, ent)
-            n = mask.long().sum(-1).clamp(min=1)
-            return torch.stack([avg / n, ent_sum / n], dim=-1)                # (B, 2)
-
-        return torch.cat([_stats(mod_mask), _stats(head_mask)], dim=-1)
-
     def reset_span_cache(self) -> None:
         """Drop the lazily-cached layer indices.
 
@@ -471,9 +396,10 @@ class MMBertModel(nn.Module):
     def _context_emb(self, hidden: torch.Tensor, batch) -> torch.Tensor:
         """Pool a [B, S, H] hidden tensor into the whole-sentence context
         embedding (mean and/or [CLS]) and mask at the pool mode."""
-        mean_emb = _masked_mean(hidden, batch['attention_mask'])
         if self.context_pool == 'cls':
             return hidden[:, 0]
+
+        mean_emb = _masked_mean(hidden, batch['attention_mask'])
         if self.context_pool == 'mean':
             return mean_emb
         return torch.cat([mean_emb, hidden[:, 0]], dim=1)
@@ -491,38 +417,24 @@ class MMBertModel(nn.Module):
         return self._context_emb(hidden, batch)
 
     def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,
-                            context_emb, batch, lm_stats=None) -> torch.Tensor:
+                            context_emb) -> torch.Tensor:
         """Gauss-head feature bundle: mid-5 spans + 2 lens + (role-specific)
-        context + optional LM stats. Same width as the default shared soup."""
-        feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
-        if lm_stats is not None:
-            feats.append(lm_stats)
-        return torch.cat(feats, dim=1)
+        context. Same width as the default shared soup."""
+        return torch.cat([mod_emb, head_emb, mod_len, head_len, context_emb], dim=1)
 
-    def _features(self, batch, need_lm: bool, with_mlm_logits: bool = False):
+    def _features(self, batch):
         """Encoder forward + shared span/context feature building.
 
-        Returns ``(mod_emb, head_emb, features, logits, mod_feat, head_feat)``;
-        ``logits`` are the MLM logits only when the caller requests them,
+        Returns ``(mod_emb, head_emb, features, mod_feat, head_feat)``;
         ``mod_feat``/``head_feat`` are the per-role bundles when
         ``gauss_dedicated`` is on (``None`` otherwise).
         """
-        if need_lm:
-            outputs = self.lm(
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask'],
-                output_hidden_states=True,
-            )
-            hidden = outputs.hidden_states[-1]
-            logits = outputs.logits if with_mlm_logits else None
-        else:
-            outputs = self.base_model(
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask'],
-                output_hidden_states=True,
-            )
-            hidden = outputs[0] if isinstance(outputs, tuple) else outputs.last_hidden_state
-            logits = None
+        outputs = self.lm(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask'],
+            output_hidden_states=True,
+        )
+        hidden = outputs.last_hidden_state
 
         # Span embeddings come from a MID-pool of layers. Early/mid layers keep
         # the span's literal (word-identity) signal; late layers over-contextualize
@@ -583,12 +495,6 @@ class MMBertModel(nn.Module):
         head_len = (batch['head_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
 
         feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
-        lm_stats = None
-        if self.use_lm_features:
-            lm_stats = self._lm_span_stats(
-                batch['input_ids'], batch['attention_mask'],
-                batch['mod_span_mask'], batch['head_span_mask'])
-            feats.append(lm_stats)
         features = torch.cat(feats, dim=1)
         mod_feat = head_feat = None
         if self.gauss_dedicated:
@@ -613,44 +519,38 @@ class MMBertModel(nn.Module):
                 ctx_mod = torch.where(use_pv, ctx_pv, ctx_mod)
                 ctx_head = torch.where(use_pv, ctx_pv, ctx_head)
             mod_feat = self._compose_gauss_feat(
-                mod_emb, head_emb, mod_len, head_len, ctx_mod, batch,
-                lm_stats=lm_stats)
+                mod_emb, head_emb, mod_len, head_len, ctx_mod)
             head_feat = self._compose_gauss_feat(
-                mod_emb, head_emb, mod_len, head_len, ctx_head, batch,
-                lm_stats=lm_stats)
-        return mod_emb, head_emb, features, logits, mod_feat, head_feat
+                mod_emb, head_emb, mod_len, head_len, ctx_head)
+        return mod_emb, head_emb, features, mod_feat, head_feat
 
-    def _forward_gauss(self, batch, with_logits: bool = False, with_reps: bool = False,
-                       with_lm: bool = False):
+    def _forward_gauss(self, batch, with_logits: bool = False):
         """Predict N(mu, sigma^2) per span; sigma travels the "logits" channel."""
-        need_lm = self.use_lm_features or with_lm
-        mod_emb, head_emb, features, _, mod_feat, head_feat = self._features(
-            batch, need_lm, with_mlm_logits=False)
+        mod_emb, head_emb, features, mod_feat, head_feat = self._features(batch)
         if mod_feat is None:
             mod_feat = head_feat = features
-        if self.use_proto_cos:
-            cos_mod = self._prototype_cos(
-                batch['input_ids'], batch['mod_span_mask'], mod_emb)
-            cos_head = self._prototype_cos(
-                batch['input_ids'], batch['head_span_mask'], head_emb)
-            mod_mu, mod_sigma = self.mod_gauss(torch.cat([mod_feat, cos_mod], dim=1))
-            head_mu, head_sigma = self.head_gauss(torch.cat([head_feat, cos_head], dim=1))
+        cos_mod = self._prototype_cos(
+            batch['input_ids'], batch['mod_span_mask'], mod_emb)
+        cos_head = self._prototype_cos(
+            batch['input_ids'], batch['head_span_mask'], head_emb)
+        mod_mu, mod_sigma = self.mod_gauss(torch.cat([mod_feat, cos_mod], dim=1))
+        head_mu, head_sigma = self.head_gauss(torch.cat([head_feat, cos_head], dim=1))
+        # Clamp only where a bounded score is reported (eval/inference). During
+        # training the raw mu flows into the losses: clamp has zero gradient
+        # outside [SCORE_MIN, SCORE_MAX], so an out-of-range output would be
+        # pinned at the boundary with no (mu - target) pull-back. The KL/CCC
+        # terms are the correct regulator for range drift while training.
+        if self.training:
+            mod_pred, head_pred = mod_mu, head_mu
         else:
-            mod_mu, mod_sigma = self.mod_gauss(mod_feat)
-            head_mu, head_sigma = self.head_gauss(head_feat)
-        mod_pred = mod_mu.clamp(SCORE_MIN, SCORE_MAX)
-        head_pred = head_mu.clamp(SCORE_MIN, SCORE_MAX)
-        if with_reps and with_logits:
-            return mod_pred, head_pred, mod_emb, head_emb, mod_sigma, head_sigma
-        if with_reps:
-            return mod_pred, head_pred, mod_emb, head_emb
+            mod_pred = mod_mu.clamp(SCORE_MIN, SCORE_MAX)
+            head_pred = head_mu.clamp(SCORE_MIN, SCORE_MAX)
         if with_logits:
             return mod_pred, head_pred, mod_sigma, head_sigma
         return mod_pred, head_pred
 
-    def forward(self, batch, with_logits: bool = False, with_reps: bool = False,
-                with_lm: bool = False):
-        return self._forward_gauss(batch, with_logits, with_reps, with_lm)
+    def forward(self, batch, with_logits: bool = False):
+        return self._forward_gauss(batch, with_logits)
 
 
 def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertModel:
@@ -662,8 +562,8 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertMo
     model = MMBertModel(
         cfg.backbone, hidden_size=cfg.hidden_size, dropout=cfg.dropout,
         context_pool=cfg.context_pool, head_pool=cfg.head_pool,
-        head_hidden=cfg.head_hidden, use_lm_features=cfg.use_lm_features,
-        use_proto_cos=cfg.use_proto_cos, span_layers=cfg.span_layers,
+        head_hidden=cfg.head_hidden,
+        span_layers=cfg.span_layers,
         context_layers=cfg.context_layers,
         gauss_dedicated=cfg.gauss_dedicated, gauss_ctx_mod=cfg.gauss_ctx_mod,
         gauss_ctx_head=cfg.gauss_ctx_head, gauss_ctx_pv=cfg.gauss_ctx_pv,

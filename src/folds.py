@@ -10,15 +10,16 @@ dict with a ``fold`` key, not a DataFrame, so it plugs straight into
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 from typing import Dict, List, Sequence
 
 import numpy as np
 import pandas as pd
 
 try:
-    from sklearn.model_selection import StratifiedGroupKFold
+    from sklearn.model_selection import StratifiedKFold
 except ImportError:  # pragma: no cover - sklearn is present on Kaggle
-    StratifiedGroupKFold = None
+    StratifiedKFold = None
 
 
 def assign_folds(rows: List[Dict], n_splits: int = 5, seed: int = 42) -> List[Dict]:
@@ -26,46 +27,58 @@ def assign_folds(rows: List[Dict], n_splits: int = 5, seed: int = 42) -> List[Di
 
     Mutates nothing; returns ``rows`` with a new ``fold`` integer per row.
     Compounds whose rows are all unlabeled are bucketed with the labeled ones'
-    bins left as NaN and fall back to the last fold for stratification.
+    bins left as NaN and fall back to the last folds for stratification.
     """
-    if StratifiedGroupKFold is None:
+    if StratifiedKFold is None:
         raise RuntimeError('scikit-learn is required for fold assignment')
 
-    out: List[Dict] = []
-    for r in rows:
-        out.append(dict(r))
+    out: List[Dict] = [dict(r) for r in rows]
 
-    # stable compound ordering -> group ids are input-order invariant, so the
-    # fold assignment does not depend on the order rows arrive in
-    compounds = sorted({str(r['compound']) for r in rows})
-    rows_by = {c: [r for r in rows if str(r['compound']) == c] for c in compounds}
-    scores = [np.round(np.nanmean([(r['mod_avg'] + r['head_avg']) / 2.0
-                                   for r in rows_by[c] if r['has_label']]), 6)
-              if any(r['has_label'] for r in rows_by[c]) else float('nan')
-              for c in compounds]
+    # stable compound ordering -> the fold assignment does not depend on the
+    # order rows arrive in
+    rows_by: Dict[str, List[Dict]] = defaultdict(list)
+    for r in rows:
+        rows_by[str(r['compound'])].append(r)
+    compounds = sorted(rows_by.keys())
+
+    scores: List[float] = []
+    for c in compounds:
+        labeled = [(r['mod_avg'] + r['head_avg']) / 2.0
+                   for r in rows_by[c] if r['has_label']]
+        scores.append(np.round(float(np.mean(labeled)), 6) if labeled else float('nan'))
 
     cdf = pd.DataFrame({'compound': compounds, 'score': scores})
     graded = ~cdf['score'].isna()
-    bins = cdf.loc[graded, 'score'].rank(method='dense')
-    try:
-        bins = pd.qcut(bins, q=n_splits, labels=False, duplicates='drop')
-    except ValueError:
-        bins = pd.cut(bins, bins=n_splits, labels=False)
-    cdf.loc[graded, 'bin'] = bins.values
 
-    graded_df = cdf[graded].reset_index(drop=True)
-    group_ids = np.arange(len(graded_df))       # stable ids, order matches cdf
+    graded_has_bin = graded.any()
+    if graded_has_bin:
+        bins = cdf.loc[graded, 'score'].rank(method='dense')
+        try:
+            bins = pd.qcut(bins, q=n_splits, labels=False, duplicates='drop')
+        except ValueError:
+            bins = pd.cut(bins, bins=n_splits, labels=False)
+        cdf.loc[graded, 'bin'] = bins.values
 
+    # cdf holds ONE row per compound, so the compound-disjoint constraint is
+    # already satisfied by construction: plain StratifiedKFold on the compound
+    # frame == StratifiedGroupKFold with per-row-unique groups (which would
+    # only add sklearn-version-dependent behavior).
     fold_of: Dict[str, int] = {}
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    for fold, (_, val_idx) in enumerate(
-            sgkf.split(X=graded_df, y=graded_df['bin'], groups=group_ids)):
-        for idx in val_idx:
-            fold_of[graded_df['compound'].iloc[idx]] = int(fold)
+    graded_df = cdf[graded].reset_index(drop=True)
+    if len(graded_df):
+        try:
+            skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+            fold_splits = list(skf.split(graded_df, graded_df['bin']))
+        except ValueError:
+            from sklearn.model_selection import KFold
+            fold_splits = list(KFold(n_splits=n_splits, shuffle=True,
+                                     random_state=seed).split(graded_df))
+        for fold, (_, val_idx) in enumerate(fold_splits):
+            for idx in val_idx:
+                fold_of[graded_df['compound'].iloc[idx]] = int(fold)
 
-    ungraded = cdf[~graded].index
-    for i, pos in enumerate(ungraded):
-        fold_of[cdf['compound'].iloc[pos]] = i % n_splits
+    for i, comp in enumerate(cdf.loc[~graded, 'compound']):
+        fold_of[comp] = i % n_splits
 
     for r in out:
         r['fold'] = fold_of[str(r['compound'])]

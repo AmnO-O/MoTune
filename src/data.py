@@ -70,7 +70,8 @@ def read_tsv(path: str | Path) -> pd.DataFrame:
 def _df_to_rows(df: pd.DataFrame, tag: str, lang: str) -> List[Dict]:
     """Normalize an NN or PV dataframe to row dicts (see module docstring)."""
     nn = _is_nn(df)
-    if not nn and not _is_pv(df):
+    pv = _is_pv(df)
+    if not nn and not pv:
         raise ValueError(
             f'{tag}: expected NN columns (Compound/Mod/Head) or PV columns '
             f'(ParticleVerb/Base/Particle), got {list(df.columns)}'
@@ -97,6 +98,7 @@ def _df_to_rows(df: pd.DataFrame, tag: str, lang: str) -> List[Dict]:
             'head': str(head),
             'compound': str(compound),
             'lang': lang,
+            'is_pv': pv,
             'has_label': bool(np.isfinite(mod_avg)),
             'mod_avg': mod_avg,
             'head_avg': head_avg,
@@ -108,9 +110,6 @@ def _df_to_rows(df: pd.DataFrame, tag: str, lang: str) -> List[Dict]:
     return rows
 
 
-# --------------------------------------------------------------------------- #
-# top-level loaders
-# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 # top-level loaders
 # --------------------------------------------------------------------------- #
@@ -158,12 +157,6 @@ def load_labeled(cfg) -> List[Dict]:
     """Load dữ liệu Train đa ngữ/đa dạng (EN/DE, NN/PV)."""
     train_attrs = ['en_nn_train', 'de_nn_train', 'en_pv_train', 'de_pv_train']
     return _load_files(cfg, train_attrs, 'train_file')
-
-
-def load_trial(cfg) -> List[Dict]:
-    """Load dữ liệu Trial/Validation đa ngữ/đa dạng (EN/DE, NN/PV)."""
-    trial_attrs = ['en_nn_trial', 'de_nn_trial', 'en_pv_trial', 'de_pv_trial']
-    return _load_files(cfg, trial_attrs, 'trial_file')
 
 
 def load_aux(cfg) -> List[Dict]:
@@ -244,7 +237,7 @@ class CompDataset(_DatasetBase):
             'mod_std': torch.tensor(float(r['mod_std']), dtype=torch.float),
             'head_std': torch.tensor(float(r['head_std']), dtype=torch.float),
             'row_id': torch.tensor(int(r.get('row_id', 0)), dtype=torch.long),
-            'is_pv': torch.tensor(str(r.get('lang', '')) == 'en-pv', dtype=torch.bool),
+            'is_pv': torch.tensor(bool(r.get('is_pv', False)), dtype=torch.bool),
         }
 
     def _report(self) -> None:
@@ -269,13 +262,15 @@ class CompDataset(_DatasetBase):
 # --------------------------------------------------------------------------- #
 # collate helpers (pad to max length within the batch)
 # --------------------------------------------------------------------------- #
-def collate_comp(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+def collate_comp(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     seq_keys = ('input_ids', 'attention_mask', 'mod_span_mask', 'head_span_mask')
     for key in batch[0]:
         if key in seq_keys:
             length = max(int(b[key].size(0)) for b in batch)
-            out[key] = torch.zeros(len(batch), length, dtype=batch[0][key].dtype)
+            fill = pad_token_id if key == 'input_ids' else 0
+            out[key] = torch.full((len(batch), length), fill_value=fill,
+                                  dtype=batch[0][key].dtype)
             for i, b in enumerate(batch):
                 n = int(b[key].size(0))
                 out[key][i, :n] = b[key]
