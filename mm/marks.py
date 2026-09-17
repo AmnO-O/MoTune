@@ -289,6 +289,11 @@ def _match_from_compound(text_n: str, compound: Optional[str], mod: str, head: s
         h_end = c_end
         m_start = c_start
         m_end = h_start
+        # Spaced compounds ('night watch') would leave the separator in the mod
+        # char span; a trailing space maps onto the NEXT token via the whitespace
+        # fallback in _char_to_token, stretching mod over the head (mod 2..4).
+        while m_end > m_start and text_n[m_end - 1].isspace():
+            m_end -= 1
         if m_end > m_start:
             return ((m_start, m_end), (h_start, h_end))
     return None

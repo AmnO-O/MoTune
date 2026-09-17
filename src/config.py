@@ -87,12 +87,11 @@ class Config:
     en_nn_train: str = 'en-nn-train.tsv'
     de_nn_train: str = 'de-nn-train.tsv'
     en_pv_train: str = 'en-pv-train.tsv'
-    de_pv_train: str = 'de-pv-train.tsv'          # German PV joins the mix by default.
-    #                                Caveat: the particle is embedded inside other
-    #                                words and the split verb form is rare in this
-    #                                corpus (standalone particle in <1% of rows), so
-    #                                only ~3.8% of de-pv rows are span-alignable and
-    #                                reach supervised losses; the rest is auto-masked
+    de_pv_train: str = 'de-pv-train.tsv'          # German PV joins the mix by default
+    #                                (trennbare Verben, e.g. abhauen; mod=verb, head=particle).
+    #                                _match_german_pv locates 100% of spans; ~65% of rows are
+    #                                non-degenerate (particle detached) and reach supervised
+    #                                losses, the fused one-token rows ("abgehauen") stay masked
     #                                (representation-only). Turn off with --set de_pv_train=.
 
     # Multi-task Trial Datasets (EN / DE)
