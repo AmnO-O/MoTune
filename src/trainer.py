@@ -202,8 +202,7 @@ class Trainer:
             growth_interval=self.cfg.amp_growth_interval,
         )
         criterion = GaussLoss(
-            lambda_dist=self.cfg.lambda_dist, ccc_weight=self.cfg.ccc_weight,
-            lambda_rank=self.cfg.lambda_rank,
+            ccc_weight=self.cfg.ccc_weight, lambda_rank=self.cfg.lambda_rank,
             rank_margin=self.cfg.rank_margin,
             rank_margin_mode=self.cfg.rank_margin_mode,
             ccc_var_floor=self.cfg.ccc_var_floor,
@@ -254,7 +253,6 @@ class Trainer:
                 model, train_loader, optimizer, scheduler, criterion, scaler,
                 self.device, grad_clip=self.cfg.grad_clip,
                 accum_steps=self.cfg.accum_steps, report=diag,
-                compound_weight=self.cfg.lambda_compound,
             )
 
             # Compute train rho directly from in-epoch predictions

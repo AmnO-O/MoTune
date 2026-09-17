@@ -55,8 +55,7 @@ def check_config() -> None:
     check(defaults.total_epochs == defaults.freeze_epochs + defaults.lora_epochs,
           'total_epochs == freeze_epochs + lora_epochs')
     check(defaults.mode == 'train80', 'only train80 mode exists')
-    check(defaults.lambda_dist == 1.0 and defaults.ccc_weight == 0.7,
-          'lambda_dist (renamed ce_weight) + a single ccc_weight default')
+    check(defaults.ccc_weight == 0.7, 'single ccc_weight default')
     check(not hasattr(defaults, 'use_proto_cos'),
           'use_proto_cos knob removed (proto-cos always on, head_in += 1)')
     check(not hasattr(defaults, 'head_mode') and not hasattr(defaults, 'num_bins')
@@ -69,7 +68,8 @@ def check_config() -> None:
     bad = [
         ('lambda_rank=-1', lambda: Config.defaults().update(lambda_rank=-1)),
         ('head_pool=bogus', lambda: Config.defaults().update(head_pool='bogus')),
-        ('lambda_dist=-1', lambda: Config.defaults().update(lambda_dist=-1)),
+        ('removed lambda_dist', lambda: Config.defaults().update(lambda_dist=1)),
+        ('removed lambda_compound', lambda: Config.defaults().update(lambda_compound=1)),
         ('mode=train5', lambda: Config.defaults().update(mode='train5')),
         ('freeze_epochs=-1', lambda: Config.defaults().update(freeze_epochs=-1)),
         ('lora_epochs=0', lambda: Config.defaults().update(lora_epochs=0)),
@@ -83,12 +83,9 @@ def check_config() -> None:
         except ValueError:
             check(True, f'[reject] {label}')
 
-    ok = Config.defaults().update(
-        head_pool='mean', lambda_compound=0.3, lambda_dist=0.5,
-    )
+    ok = Config.defaults().update(head_pool='mean')
     ok.validate()
-    check(ok.lambda_compound == 0.3 and ok.lambda_dist == 0.5
-          and ok.total_epochs == ok.freeze_epochs + ok.lora_epochs,
+    check(ok.head_pool == 'mean' and ok.total_epochs == ok.freeze_epochs + ok.lora_epochs,
           'valid gauss config accepted, total_epochs derived')
 
     # JSON round-trip
@@ -109,7 +106,6 @@ def check_config() -> None:
     tmp.unlink()
 
     # --set coercion
-    check(coerce_value('lambda_dist', '0.0') == 0.0, 'coerce float')
     check(coerce_value('freeze_epochs', '3') == 3, 'coerce int')
     check(coerce_value('use_label_std', 'false') is False, 'coerce bool')
     check(coerce_value('span_layers', '-1') == ['-1'], 'coerce Tuple knob')
@@ -402,9 +398,9 @@ def check_fixes() -> None:
     check('class GaussLoss' in loss_src and 'def gauss_kl' in loss_src
           and 'self.requires_logits = True' in loss_src,
           'src/losses.py defines gauss_kl + GaussLoss (sigma via logits channel)')
-    check('def margin_rank_loss' in loss_src and 'def compound_center_loss' in loss_src
+    check('def margin_rank_loss' in loss_src and 'def compound_center_loss' not in loss_src
           and 'def compound_consistency_loss' not in loss_src,
-          'rank/center losses merged into src/losses.py; consistency dropped')
+          'src/losses.py retains ranking only; centre/consistency losses are absent')
     check('def _role_context(' in model_src and 'def _compose_gauss_feat(' in model_src,
           '_features builds per-role context bundles (_role_context/_compose_gauss_feat)')
 

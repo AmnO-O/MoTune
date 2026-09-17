@@ -22,11 +22,9 @@
   "patience": 4,
   "ccc_weight": 0.7,
   "ccc_var_floor": 0.05,
-  "lambda_dist": 1.0,
   "bin_sigma": 0.5,
   "lambda_rank": 0.5,
   "rank_margin": 0.5,
-  "lambda_compound": 1.0,
   "use_label_std": true,
   "test_size": 0.2,
   "seed": 42

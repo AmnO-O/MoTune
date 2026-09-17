@@ -2,9 +2,7 @@
 
   * ``allowed`` row mask = has_label & has_mod & has_head & ~degenerate, so
     unaligned (missing span) and German-collapsed (mod==head token) rows are
-    never fed to span-based supervised / center terms.
-  * per-batch compound-centroid MSE (``compound_center_loss``) added with
-    ``lambda_compound`` weight.
+    never fed to span-based supervised loss terms.
   * ``unfreeze_top_layers`` walks the encoder generically and skips
     ``.linear.`` paths so LoRA base weights stay frozen.
 """
@@ -16,7 +14,6 @@ import math
 import numpy as np
 import torch
 
-from .losses import compound_center_loss
 from .utils import get_logger
 
 logger = get_logger('src.train')
@@ -41,11 +38,9 @@ def track_optimizer_steps(optimizer) -> None:
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
-                grad_clip=1.0, accum_steps=1, report=None,
-                compound_weight=0.0):
+                grad_clip=1.0, accum_steps=1, report=None):
     """One scoring epoch with AMP + gradient accumulation + clipping.
 
-    ``compound_weight > 0`` adds the gold-centroid MSE on labeled rows.
     Returns the mean supervised loss of the epoch.
     """
     if not hasattr(optimizer, '_cmp_step_counter'):
@@ -105,20 +100,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             )
 
             loss = mod_loss + head_loss + pv_loss
-
-            if compound_weight > 0:
-                center_ids_nn = batch['compound_id'].clone()
-                center_ids_nn[~allowed_nn] = -1
-                center_ids_pv = batch['compound_id'].clone()
-                center_ids_pv[~allowed_pv] = -1
-                center = compound_center_loss(
-                    mod_pred, batch['mod_avg'], center_ids_nn,
-                ) + compound_center_loss(
-                    head_pred, batch['head_avg'], center_ids_nn,
-                ) + compound_center_loss(
-                    pv_pred, batch['mod_avg'], center_ids_pv,
-                )
-                loss = loss + compound_weight * center
 
             if not loss.requires_grad:
                 loss = loss + (mod_pred.sum() + head_pred.sum() + pv_pred.sum()) * 0.0

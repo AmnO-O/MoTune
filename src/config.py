@@ -133,11 +133,6 @@ class Config:
     lambda_rank: float = 0.5
     rank_margin: float = 0.5
     rank_margin_mode: RankMarginMode = 'dynamic'
-    # compound-center calibration: MSE between predicted and gold compound
-    # centroids per batch (teaches between-compound ranking). 0 = off.
-    lambda_compound: float = 0.0
-    # weight of the Gaussian distribution loss KL(N(mu_p,sigma_p) || N(y,sigma_t))
-    lambda_dist: float = 1.0
     bin_sigma: float = 0.5
     use_label_std: bool = True
 
@@ -252,16 +247,12 @@ class Config:
 
         if self.lambda_rank < 0:
             errors.append(f'lambda_rank must be >= 0, got {self.lambda_rank}')
-        if self.lambda_compound < 0:
-            errors.append(f'lambda_compound must be >= 0, got {self.lambda_compound}')
         if self.rank_margin <= 0:
             errors.append(f'rank_margin must be > 0, got {self.rank_margin}')
         if self.loss_std_alpha < 0:
             errors.append(f'loss_std_alpha must be >= 0, got {self.loss_std_alpha}')
         if self.ccc_var_floor < 0:
             errors.append(f'ccc_var_floor must be >= 0, got {self.ccc_var_floor}')
-        if self.lambda_dist < 0:
-            errors.append(f'lambda_dist must be >= 0, got {self.lambda_dist}')
         if self.bin_sigma <= 0:
             errors.append(f'bin_sigma must be > 0, got {self.bin_sigma}')
         if self.amp_init_scale <= 0:

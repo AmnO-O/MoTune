@@ -1,9 +1,9 @@
 """Gauss-only loss terms for the compositionality pipeline.
 
-Merged from the old ``losses.py`` + ``losses_gauss.py`` (the reg/softmax
-``CombinedLoss`` and its soft-target bin machinery are gone): the Gaussian
-distribution loss ``KL(N(mu_p, sigma_p^2) || N(y, sigma_t^2))`` plus the shared
-pairwise-ranking and compound-center terms.
+The objective combines an always-on Gaussian distribution loss
+``KL(N(mu_p, sigma_p^2) || N(y, sigma_t^2))``, CCC, and within-compound
+pairwise ranking.  The KL term is not weighted: predicting uncertainty without
+supervising its ``sigma`` output would leave that branch untrained.
 """
 
 from __future__ import annotations
@@ -59,42 +59,6 @@ def margin_rank_loss(
 
 
 # --------------------------------------------------------------------------- #
-# compound-center calibration (between-compound ranking)
-# --------------------------------------------------------------------------- #
-def compound_center_loss(pred: torch.Tensor, target: torch.Tensor,
-                         compound_ids: torch.Tensor) -> torch.Tensor:
-    """MSE between predicted and gold compound centroids, per batch.
-
-    Teaches the model the between-compound ordering directly: rows of the
-    same compound are averaged, and the predicted mean is pulled toward the
-    gold mean. Ignored labels (has_label=False rows have NaN gold) are left
-    out via NaN masking of ``target``.
-    """
-    if pred.ndim > 1:
-        return sum(
-            compound_center_loss(pred[:, i], target[:, i], compound_ids)
-            for i in range(pred.shape[1])
-        ) / pred.shape[1]
-
-    ids = compound_ids.to(pred.device)
-    target = target.float()
-    pred = pred.float()
-    labeled = (~torch.isnan(target)) & (ids >= 0)
-    if not labeled.any():
-        return pred.sum() * 0.0   # graph-connected zero; .backward() works in frozen phase
-
-    p, t = pred[labeled], target[labeled]
-    g = ids[labeled]
-    uniq, inv = torch.unique(g, return_inverse=True)
-    ncomp = uniq.shape[0]
-    onehot = F.one_hot(inv, ncomp).float()
-    counts = onehot.sum(0).clamp(min=1.0)
-    p_center = (onehot.t() @ p) / counts
-    t_center = (onehot.t() @ t) / counts
-    return F.mse_loss(p_center, t_center)
-
-
-# --------------------------------------------------------------------------- #
 # gaussian distribution loss
 # --------------------------------------------------------------------------- #
 def gauss_kl(mu_p: torch.Tensor, sigma_p: torch.Tensor,
@@ -132,21 +96,18 @@ def ccc_loss(pred: torch.Tensor, target: torch.Tensor,
 
 
 class GaussLoss(nn.Module):
-    """KL-Gaussian distribution loss + CCC + pairwise ranking.
+    """Gaussian KL + CCC + pairwise ranking.
 
-    ``lambda_dist`` weights the Gaussian KL term (was ``cfg.ce_weight`` in the
-    shared package). The predicted ``sigma`` travels through the ``logits``
-    channel, which is why ``requires_logits`` is True (the training loop needs
-    no changes).
+    The predicted ``sigma`` travels through the ``logits`` channel, which is
+    why ``requires_logits`` is True.
     """
 
-    def __init__(self, lambda_dist: float = 1.0, ccc_weight: float = 0.7,
+    def __init__(self, ccc_weight: float = 0.7,
                  lambda_rank: float = 0.5, rank_margin: float = 0.5,
                  rank_margin_mode: str = 'dynamic', ccc_var_floor: float = 0.05,
                  bin_sigma: float = 0.5, use_label_std: bool = True,
                  std_alpha: float = 0.0):
         super().__init__()
-        self.lambda_dist = lambda_dist
         self.ccc_weight = ccc_weight
         self.lambda_rank = lambda_rank
         self.rank_margin = rank_margin
@@ -187,9 +148,7 @@ class GaussLoss(nn.Module):
         else:
             sigma_t = torch.full_like(mu, float(self.bin_sigma))
 
-        loss = torch.zeros((), dtype=mu.dtype, device=mu.device)
-        if self.lambda_dist > 0:
-            loss = loss + self.lambda_dist * gauss_kl(mu, sigma_p, target, sigma_t)
+        loss = gauss_kl(mu, sigma_p, target, sigma_t)
         if self.ccc_weight > 0:
             w = self._weights(mu, std)
             loss = loss + self.ccc_weight * ccc_loss(mu, target, w, self.ccc_var_floor)
