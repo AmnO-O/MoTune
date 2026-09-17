@@ -231,6 +231,25 @@ def check_marks() -> None:
                    'night', 'watch')
     check(r.found and tp(r.mod) == (1, 2) and tp(r.head) == (2, 3), 'case-insensitive matching')
 
+    # 11) German PV fused past participle (ge- infix)
+    text_de1 = 'ich bin nach L.A. abgehauen .'
+    r_de1 = find_spans(text_de1, _word_offsets(text_de1), 'hauen', 'ab', 'abhauen')
+    check(r_de1.found and r_de1.degenerate and tp(r_de1.mod) == (4, 5) and tp(r_de1.head) == (4, 5),
+          'German PV fused past participle "abgehauen" matched')
+
+    # 12) German PV separated V2 clause
+    text_de2 = 'Die Linken lehnen sie ab .'
+    r_de2 = find_spans(text_de2, _word_offsets(text_de2), 'lehnen', 'ab', 'ablehnen')
+    check(r_de2.found and not r_de2.adjacent and tp(r_de2.mod) == (2, 3) and tp(r_de2.head) == (4, 5),
+          'German PV separated V2 clause "lehnen ... ab" matched')
+
+    # 13) German PV strong verb separated past
+    text_de3 = 'Er schloss die Tür ab .'
+    r_de3 = find_spans(text_de3, _word_offsets(text_de3), 'schließen', 'ab', 'abschließen')
+    check(r_de3.found and not r_de3.adjacent and tp(r_de3.mod) == (1, 2) and tp(r_de3.head) == (4, 5),
+          'German PV strong verb separated past "schloss ... ab" matched')
+
+
 
 def check_data() -> None:
     print('=== 5. DATA LOADERS (real local TSVs, no torch) ===')
@@ -293,6 +312,18 @@ def check_data() -> None:
     )
     check(pv_ok / pv_n > 0.8,
           f'en-pv irregular/doubled-verb alignment {pv_ok}/{pv_n} ({100*pv_ok/pv_n:.0f}%)')
+
+    rows_de_pv = _df_to_rows(read_tsv('dataset/de-pv-train.tsv'), 'de-pv', 'de')
+    check(len(rows_de_pv) == 1490 and rows_de_pv[0]['is_pv'],
+          f'de-pv: {len(rows_de_pv)} rows parsed (is_pv flag)')
+    de_pv_n = min(len(rows_de_pv), 500)
+    de_pv_ok = sum(
+        1 for r in rows_de_pv[:de_pv_n]
+        if find_spans(r['context'], synth_offsets(r['context']),
+                      r['mod'], r['head'], r.get('compound', '')).found
+    )
+    check(de_pv_ok / de_pv_n > 0.9,
+          f'de-pv trennbare Verben alignment {de_pv_ok}/{de_pv_n} ({100*de_pv_ok/de_pv_n:.0f}%)')
 
     # MLM warmup data pieces must be gone
     data_src = (ROOT / 'src' / 'data.py').read_text(encoding='utf-8')

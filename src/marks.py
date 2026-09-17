@@ -47,6 +47,59 @@ _LETTER = r"[^\W\d_]"
 _START_BOUNDARY = f"(?<!{_LETTER})"
 _END_BOUNDARY = f"(?!{_LETTER})"
 
+_GERMAN_PARTICLES = (
+    "ab", "an", "auf", "aus", "bei", "ein", "fest", "fort", "her", "hin",
+    "los", "mit", "nach", "vor", "weg", "zu", "zurück", "zusammen",
+)
+
+# Irregular German verbs (Ablaut / strong verbs / dental stems) for German PV rows
+_IRREGULAR_DE = {
+    "biegen": ("bog", "böge", "gebogen", "biegt", "biegst"),
+    "bieten": ("bot", "böte", "geboten", "bietet", "bietest"),
+    "bleiben": ("blieb", "geblieben", "bleibt", "bleibst", "bliebe"),
+    "brennen": ("brannt", "brannte", "brannten", "gebrannt", "brennt", "brennst"),
+    "bringen": ("bracht", "brachte", "brächte", "brachten", "brächten", "gebracht", "bringt", "bringst"),
+    "denken": ("dacht", "dachte", "dächte", "dachten", "dächten", "gedacht", "denkt", "denkst"),
+    "fahren": ("fuhr", "führe", "gefahren", "fährt", "fährst"),
+    "fangen": ("fing", "finge", "gefangen", "fängt", "fängst"),
+    "geben": ("gab", "gäbe", "gegeben", "gibt", "gibst"),
+    "gehen": ("ging", "ginge", "gegangen", "geht", "gehst"),
+    "graben": ("grub", "grübe", "gegraben", "gräbt", "gräbst"),
+    "hauen": ("hieb", "gehauen", "haut", "haust"),
+    "heben": ("hob", "höbe", "gehoben", "hebt", "hebst"),
+    "hängen": ("hing", "hinge", "gehangen", "hängt", "hängst"),
+    "klingen": ("klang", "klänge", "geklungen", "klingt", "klingst"),
+    "kommen": ("kam", "käme", "gekommen", "kommt", "kommst"),
+    "lassen": ("ließ", "ließe", "gelassen", "lässt", "läßt", "lies"),
+    "leihen": ("lieh", "liehe", "geliehen", "leiht", "leihst"),
+    "lesen": ("las", "läse", "gelesen", "liest"),
+    "nehmen": ("nahm", "nähme", "genommen", "nimmt", "nimmst"),
+    "passen": ("gepasst", "gepaßt", "passte", "paßte", "passt", "paßt"),
+    "reißen": ("riss", "risse", "gerissen", "reißt", "reissen", "reisst"),
+    "rufen": ("rief", "riefe", "gerufen", "ruft", "rufst"),
+    "saugen": ("sog", "gesogen", "saugt", "saugst"),
+    "schaffen": ("schuf", "schüfe", "geschaffen", "schafft", "schaffst"),
+    "schieben": ("schob", "schöbe", "geschoben", "schiebt", "schiebst"),
+    "schlagen": ("schlug", "schlüge", "geschlagen", "schlägt", "schlägst"),
+    "schließen": ("schloss", "schloß", "schlösse", "geschlossen", "schließt", "schliessen", "schliess"),
+    "schneiden": ("schnitt", "schnitte", "geschnitten", "schneidet", "schneidest"),
+    "schreiben": ("schrieb", "schriebe", "geschrieben", "schreibt", "schreibst"),
+    "schreien": ("schrie", "geschrien", "schreit", "schreist"),
+    "sehen": ("sah", "sähe", "gesehen", "sieht", "siehst"),
+    "sprechen": ("sprach", "spräche", "gesprochen", "spricht", "sprichst"),
+    "stoßen": ("stieß", "stieße", "gestoßen", "stößt"),
+    "tragen": ("trug", "trüge", "getragen", "trägt", "trägst"),
+    "treffen": ("traf", "träfe", "getroffen", "trifft", "triffst"),
+    "treiben": ("trieb", "triebe", "getrieben", "treibt", "treibst"),
+    "treten": ("trat", "träte", "getreten", "tritt", "trittst"),
+    "wachsen": ("wuchs", "wüchse", "gewachsen", "wächst"),
+    "weichen": ("wich", "wiche", "gewichen", "weicht", "weichst"),
+    "weisen": ("wies", "wiese", "gewiesen", "weist"),
+    "wenden": ("wandt", "wandte", "gewandt", "wendet", "wendest"),
+    "ziehen": ("zog", "zöge", "gezogen", "zieht", "ziehst"),
+    "zwingen": ("zwang", "zwänge", "gezwungen", "zwingt", "zwingst"),
+}
+
 # Suppletive English verb surfaces for PV rows (walk/drop/step etc. are covered
 # by the regular e-drop / consonant-doubling alternates below, so only the truly
 # irregular bases live here). Base first so exact matches win.
@@ -300,23 +353,168 @@ def _match_independent(text_n: str, mod: str, head: str,
     return None
 
 
+def _german_base_forms(base: str) -> Tuple[str, ...]:
+    """Surface candidates for a German base verb (infinitive/stem -> inflections)."""
+    b = normalize(base)
+    if not b:
+        return ()
+    forms: List[str] = [b]
+
+    # Stem extraction
+    if b.endswith(("eln", "ern")) and len(b) > 4:
+        stem = b[:-1]
+    elif b.endswith("en") and len(b) > 3:
+        stem = b[:-2]
+    elif b.endswith("n") and len(b) > 2:
+        stem = b[:-1]
+    else:
+        stem = b
+
+    # Regular weak endings (present, past weak, dental/nasal stems, participles)
+    endings = (
+        "e", "st", "t", "en",
+        "te", "test", "ten", "tet",
+        "ete", "etest", "eten", "etet", "et", "est",
+        "end", "ende", "enden", "nd",
+    )
+    for end in endings:
+        forms.append(stem + end)
+
+    # Weak participle forms
+    forms.append("ge" + stem + "t")
+    forms.append("ge" + stem + "et")
+    forms.append("ge" + stem + "te")
+    forms.append("ge" + stem + "ten")
+    forms.append("ge" + stem + "ter")
+    forms.append("ge" + stem + "tes")
+
+    # -eln / -ern verbs (e.g. wickeln -> wickle, wickelst, wickelt)
+    if b.endswith("eln") and len(b) > 4:
+        s = b[:-3] + "l"
+        forms.extend([s + "e", s + "st", s + "t", s + "te", s + "ten"])
+        forms.append(b[:-1])
+    elif b.endswith("ern") and len(b) > 4:
+        s = b[:-3] + "r"
+        forms.extend([s + "e", s + "st", s + "t", s + "te", s + "ten"])
+        forms.append(b[:-1])
+
+    # Irregular verbs
+    irreg = _IRREGULAR_DE.get(b)
+    if irreg:
+        for v in irreg:
+            forms.append(v)
+            for end in ("st", "en", "t", "e", "er", "es", "em", "te", "ten"):
+                forms.append(v + end)
+
+    # Orthographic tolerance: ß <-> ss
+    expanded: List[str] = []
+    for f in forms:
+        expanded.append(f)
+        if "ß" in f:
+            expanded.append(f.replace("ß", "ss"))
+        if "ss" in f:
+            expanded.append(f.replace("ss", "ß"))
+
+    return tuple(sorted(dict.fromkeys(expanded), key=len, reverse=True))
+
+
+def _match_german_pv(text_n: str, mod: str, head: str
+                     ) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """German particle verb matching (trennbare Verben).
+
+    Here mod = Base (verb stem/infinitive), head = Particle (ab, an, auf, aus, etc.).
+    Covers:
+      1. Fused direct: particle + base_form (e.g. abhauen, abgehauen, abgeschlossen, ablehnte)
+      2. Fused zu-infinitive: particle + 'zu' + base_form (e.g. abzuhauen, abzuwickeln)
+      3. Fused hyphenated: particle + '-' + base_form
+      4. Separated main clause (V2): base_form appears first, particle appears later
+      5. Separated inverted: particle appears first, base_form appears later
+    """
+    t_part = normalize(head)
+    t_base = normalize(mod)
+    forms = _german_base_forms(t_base)
+    if not forms or not t_part:
+        return None
+
+    # 1. Fused direct: particle directly attached to base form (incl. ge- participles)
+    for f in forms:
+        f_joined = t_part + f
+        pat = re.compile(_START_BOUNDARY + re.escape(f_joined) + _END_BOUNDARY)
+        m = pat.search(text_n)
+        if m:
+            h_span = (m.start(), m.start() + len(t_part))
+            m_span = (m.start() + len(t_part), m.end())
+            return (m_span, h_span)
+
+    # 2. Fused zu-infinitive: particle + 'zu' + infinitive
+    zu_candidates = [b for b in forms if b.endswith(("en", "eln", "ern", "n"))]
+    for f in zu_candidates:
+        f_zu = t_part + "zu" + f
+        pat = re.compile(_START_BOUNDARY + re.escape(f_zu) + _END_BOUNDARY)
+        m = pat.search(text_n)
+        if m:
+            h_span = (m.start(), m.start() + len(t_part))
+            m_span = (m.start() + len(t_part) + 2, m.end())
+            return (m_span, h_span)
+
+    # 3. Fused hyphenated
+    for f in forms:
+        f_hyphen = t_part + "-" + f
+        pat = re.compile(_START_BOUNDARY + re.escape(f_hyphen) + _END_BOUNDARY)
+        m = pat.search(text_n)
+        if m:
+            h_span = (m.start(), m.start() + len(t_part))
+            m_span = (m.start() + len(t_part) + 1, m.end())
+            return (m_span, h_span)
+
+    # 4. Separated (V2): base form appears first, particle appears later in the clause
+    part_pat = re.compile(_START_BOUNDARY + re.escape(t_part) + _END_BOUNDARY)
+    for f in forms:
+        base_pat = re.compile(_START_BOUNDARY + re.escape(f) + _END_BOUNDARY)
+        for m_base in base_pat.finditer(text_n):
+            m_part = part_pat.search(text_n, m_base.end())
+            if m_part:
+                return ((m_base.start(), m_base.end()), (m_part.start(), m_part.end()))
+
+    # 5. Separated inverted: particle appears before base
+    for f in forms:
+        base_pat = re.compile(_START_BOUNDARY + re.escape(f) + _END_BOUNDARY)
+        for m_part in part_pat.finditer(text_n):
+            m_base = base_pat.search(text_n, m_part.end())
+            if m_base:
+                return ((m_base.start(), m_base.end()), (m_part.start(), m_part.end()))
+
+    return None
+
+
 def find_spans(text: str, offsets: Iterable[Tuple[int, int]],
                mod: str, head: str, compound: Optional[str] = None) -> SpanResult:
     """Character-match Mod/Head inside ``text`` and map them to token spans.
 
     ``offsets`` is the tokenizer offset_mapping for ``text`` (special tokens
     with (0,0) offsets are skipped). See module docstring for the strategy
-    order (compound surface -> fused -> spaced -> independent).
+    order (German PV -> compound surface -> fused -> spaced -> independent).
     """
     offsets = list(offsets)
     text_n = normalize(text)
 
-    pair = (
-        _match_from_compound(text_n, compound, mod, head)
-        or _match_fused(text_n, mod, head)
-        or _match_spaced(text_n, mod, head)
-        or _match_independent(text_n, mod, head)
+    # Detect German separable particle verbs (trennbare Verben) where head is the particle
+    t_head_n = normalize(head)
+    is_de_pv = t_head_n in _GERMAN_PARTICLES or bool(
+        compound and normalize(compound).startswith(t_head_n)
     )
+
+    pair = None
+    if is_de_pv:
+        pair = _match_german_pv(text_n, mod, head)
+
+    if pair is None:
+        pair = (
+            _match_from_compound(text_n, compound, mod, head)
+            or _match_fused(text_n, mod, head)
+            or _match_spaced(text_n, mod, head)
+            or _match_independent(text_n, mod, head)
+        )
     if pair is None:
         return SpanResult(Span(None, None), Span(None, None), found=False)
 
@@ -336,7 +534,7 @@ def find_spans(text: str, offsets: Iterable[Tuple[int, int]],
         return SpanResult(Span(None, None), Span(None, None), found=False)
 
     same = mod_sp.start == head_sp.start
-    adjacent = (mod_sp.end == head_sp.start) or (same and mod_sp.end == head_sp.end)
+    adjacent = (mod_sp.end == head_sp.start) or (head_sp.end == mod_sp.start) or (same and mod_sp.end == head_sp.end)
     return SpanResult(
         mod=Span(mod_sp.start, mod_sp.end, degenerate=same),
         head=Span(head_sp.start, head_sp.end, degenerate=same),

@@ -20,7 +20,10 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 from src.config import Config, coerce_value
 from src.utils import get_logger, set_seed, get_device, resolve_paths
