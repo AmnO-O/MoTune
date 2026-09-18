@@ -431,9 +431,10 @@ def check_fixes() -> None:
     check('proto_safe = torch.where(has_span, proto, torch.ones_like(proto))' in model_src,
           '_prototype_cos substitutes ones BEFORE the cosine (no NaN in backward)')
 
-    # 4) LoRA base-freeze invariant
-    check('linear.weight.requires_grad = False' in model_src
-          and 'linear.bias.requires_grad = False' in model_src,
+    # 4) LoRA base-freeze invariant (LoRA now lives in src/lora.py)
+    lora_src = (ROOT / 'src' / 'lora.py').read_text(encoding='utf-8')
+    check('linear.weight.requires_grad = False' in lora_src
+          and 'linear.bias.requires_grad = False' in lora_src,
           'LoRAAdapter freezes its base weight/bias on wrap')
     check("if '.linear.' in name:" in train_src,
           'unfreeze_top_layers skips LoRA-wrapped base weights')
