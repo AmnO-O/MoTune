@@ -378,15 +378,18 @@ class MMBertModel(nn.Module):
         )
         hid_all = outputs.hidden_states
         n_layers = len(hid_all)
+        
         seq_len = batch['attention_mask'].sum(dim=1).clamp(min=1.0).float()
         mod_len = (batch['mod_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
         head_len = (batch['head_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
+
         mod_hidden = self._role_hidden(
             tuple(i % n_layers for i in self.gauss_ctx_mod), hid_all)
         head_hidden = self._role_hidden(
             tuple(i % n_layers for i in self.gauss_ctx_head), hid_all)
         pv_hidden = self._role_hidden(
             tuple(i % n_layers for i in self.gauss_ctx_pv), hid_all)
+        
         mod_exit_emb = self.mod_pool(mod_hidden, batch['mod_span_mask'])
         head_exit_emb = self.head_role_pool(head_hidden, batch['head_span_mask'])
         pv_mod_emb = self.mod_pool(pv_hidden, batch['mod_span_mask'])
@@ -395,6 +398,7 @@ class MMBertModel(nn.Module):
         mod_feat = self._compose_gauss_feat(
             mod_exit_emb, self.head_role_pool(mod_hidden, batch['head_span_mask']),
             mod_len, head_len, self._context_emb(mod_hidden, batch))
+        
         head_feat = self._compose_gauss_feat(
             self.mod_pool(head_hidden, batch['mod_span_mask']), head_exit_emb,
             mod_len, head_len, self._context_emb(head_hidden, batch))
