@@ -11,18 +11,16 @@ Head input: per-exit cross-attended mod/head span embeddings (learned pooling)
 fused by ``OptimizedSpanFusion`` (no torch.cat) into one ``[B, H]`` vector.
 
 ``CrossSpanAttentionBlock`` and ``OptimizedSpanFusion`` are new, freshly-
-initialized modules (~9.4M params combined at the ffn_expansion=2 default
-below -- see their docstrings) with nothing to fall back on but this task's
-own small training set. Both use a learnable, zero-initialized gate on their
-attention/FFN contributions (``alpha_attn`` / ``alpha_ffn``) so they start as
-a gentle near-identity pass-through and only grow in influence as training
-supports it -- the same "start at zero, earn it" principle already used for
-``LoRAAdapter.b`` below, just applied to these two new blocks. This keeps the
-existing post-LayerNorm structure (unlike pure ReZero, which drops LayerNorm
-entirely and has been reported to destabilize under fp16/dropout without it
--- Liu et al., "Understanding the Difficulty of Training Transformers"), so
-it's a conservative version of Bachlechner et al. (2020/2021 UAI), "ReZero is
-All You Need", not a literal implementation of it.
+initialized modules with nothing to fall back on but this task's own small
+training set. Both use learnable, **ones-initialized** gates (``alpha_attn`` /
+``alpha_ffn``) on their attention/FFN contributions: at step 0 they are
+exactly the same ``query + attn_out → LayerNorm`` residual that worked in the
+previous ungated version, so the feature extractor produces meaningful,
+input-dependent features from the first step. As training progresses the gates
+are free to move in either direction -- shrink toward zero if the network
+finds the attention or FFN residual unnecessary for a given layer, or grow
+beyond 1.0 if it needs more emphasis -- giving the model a continuously
+learnable knob without sacrificing the known-good initialization point.
 
 LoRA lives in :mod:`src.lora` (no ``peft`` dependency) and is re-exported
 here (``apply_lora`` / ``lora_parameters`` / ``merge_lora``) for the trainer.
@@ -123,11 +121,13 @@ class CrossSpanAttentionBlock(nn.Module):
     query_hidden --+--> Cross-MHA (Key/Val: kv_hidden) --> (*alpha_attn) --> (+) --> LayerNorm --+--> FFN --> (*alpha_ffn) --> (+) --> LayerNorm --> Masking
                    +-- (Residual 1) -----------------------------------------+                   +-- (Residual 2) -------------------+
 
-    ``alpha_attn``/``alpha_ffn`` are learnable scalars, zero-initialized, so
-    at step 0 this block is close to a normalization pass-through of
-    ``query_hidden`` rather than a full-strength random transformation --
-    see the module-level docstring for why, on a dataset this size, that
-    matters more here than it would training from a large corpus.
+    ``alpha_attn``/``alpha_ffn`` are learnable scalars, **ones-initialized**:
+    at step 0 the residuals are exactly the ungated ``+ attn_out`` /
+    ``+ ffn_out`` form that previously worked, so attention gets real
+    gradients from the first step and the features are input-dependent; the
+    gates can then shrink or grow through training (the reversible
+    generalization of a ReZero-style gate that keeps LayerNorm and the
+    known-good starting point).
 
     ``ffn_expansion`` defaults to 2 rather than the more common 4: this is a
     freshly-initialized block with no pretraining to fall back on, and the
@@ -152,7 +152,7 @@ class CrossSpanAttentionBlock(nn.Module):
             batch_first=True
         )
         self.norm1 = nn.LayerNorm(hidden)
-        self.alpha_attn = nn.Parameter(torch.zeros(1))
+        self.alpha_attn = nn.Parameter(torch.ones(1))
 
         self.ffn = nn.Sequential(
             nn.Linear(hidden, hidden * ffn_expansion),
@@ -162,7 +162,7 @@ class CrossSpanAttentionBlock(nn.Module):
             nn.Dropout(dropout)
         )
         self.norm2 = nn.LayerNorm(hidden)
-        self.alpha_ffn = nn.Parameter(torch.zeros(1))
+        self.alpha_ffn = nn.Parameter(torch.ones(1))
 
     def forward(self, query_hidden: torch.Tensor, kv_hidden: torch.Tensor,
                 query_mask: torch.Tensor, kv_mask: torch.Tensor) -> torch.Tensor:
@@ -206,8 +206,8 @@ class OptimizedSpanFusion(nn.Module):
     the literality scalar each become a role-tagged token, and one learned
     query attends over them, collapsing to a single ``[B, H]`` vector.
 
-    ``alpha_attn``/``alpha_ffn`` and ``ffn_expansion`` follow the same
-    zero-init-gate, lower-default-capacity reasoning as
+    ``alpha_attn``/``alpha_ffn`` (ones-init, learnable to shrink OR grow)
+    and ``ffn_expansion`` follow the same reasoning as
     ``CrossSpanAttentionBlock`` -- see its docstring and the module-level one.
     """
     def __init__(self, hidden: int = 768, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1):
@@ -218,7 +218,7 @@ class OptimizedSpanFusion(nn.Module):
         # 2. Multi-Head Attention (includes W_q, W_k, W_v, W_out)
         self.attn = nn.MultiheadAttention(embed_dim=hidden, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(hidden)
-        self.alpha_attn = nn.Parameter(torch.zeros(1))
+        self.alpha_attn = nn.Parameter(torch.ones(1))
 
         # 3. Feed-Forward Network (FFN)
         self.ffn = nn.Sequential(
@@ -229,7 +229,7 @@ class OptimizedSpanFusion(nn.Module):
             nn.Dropout(dropout)
         )
         self.norm2 = nn.LayerNorm(hidden)
-        self.alpha_ffn = nn.Parameter(torch.zeros(1))
+        self.alpha_ffn = nn.Parameter(torch.ones(1))
 
         # Scalar & Role embeddings
         self.scalar_embed = nn.Linear(1, hidden)
