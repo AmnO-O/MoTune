@@ -480,12 +480,15 @@ class MMBertModel(nn.Module):
     # ------------------------------------------------------------------ #
     def _prototype_cos(self, input_ids: torch.Tensor, span_mask: torch.Tensor,
                        use_emb: torch.Tensor) -> torch.Tensor:
-        """Literality: cosine between the contextualised USE embedding and the
+        """Literality: cosine between a word's contextual USE embedding and the
         static prototype (base/lemma) embedding rows of the span's own tokens.
 
         High = the word keeps its literal meaning in this context (e.g.
         "market" in "flea market"); low = drift/lexicalised use (e.g. "tower"
-        in "ivory tower"). Rows with no span contribute 0.
+        in "ivory tower"). ``use_emb`` must be the span's OWN contextual
+        vector (span-mean of the raw role-exit hidden states), not the pooled
+        cross-attended output -- cross-attention contaminates a token with its
+        counterpart span. Rows with no span contribute 0.
         """
         weight = self.lm.get_input_embeddings().weight
         tok = F.embedding(input_ids, weight)
@@ -558,13 +561,20 @@ class MMBertModel(nn.Module):
 
         mod_exit_emb, head_exit_emb = mod_u, head_v
 
-        cos_mod = self._prototype_cos(
-            batch['input_ids'], batch['mod_span_mask'], mod_exit_emb)
-        cos_head = self._prototype_cos(
-            batch['input_ids'], batch['head_span_mask'], head_exit_emb)
+        # Literality is a property of the WORD's own contextual vector: compare
+        # the span-mean of the RAW role-exit hidden states against the static
+        # prototype, NOT the pooled output of cross-attention. The cross-attn
+        # mixes in the counterpart span ("flea" attends over "market"), so its
+        # pooled vector is contaminated as a literalness measurement.
+        mod_use = _masked_mean(mod_hidden, batch['mod_span_mask'])
+        head_use = _masked_mean(head_hidden, batch['head_span_mask'])
+        cos_mod = self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], mod_use)
+        cos_head = self._prototype_cos(batch['input_ids'], batch['head_span_mask'], head_use)
         cos_pv = 0.5 * (
-            self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], pv_u)
-            + self._prototype_cos(batch['input_ids'], batch['head_span_mask'], pv_v))
+            self._prototype_cos(batch['input_ids'], batch['mod_span_mask'],
+                                _masked_mean(pv_hidden, batch['mod_span_mask']))
+            + self._prototype_cos(batch['input_ids'], batch['head_span_mask'],
+                                  _masked_mean(pv_hidden, batch['head_span_mask'])))
         mod_feat = self._compose_gauss_feat(
             mod_u, mod_v, self._context_emb(mod_hidden, batch), cos_mod)
         head_feat = self._compose_gauss_feat(
