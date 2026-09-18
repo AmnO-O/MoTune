@@ -88,7 +88,7 @@ class Config:
     # dataset to one row per listed target, each supervised on its own label:
     #   ['mod'] -> ModAvg, ['head'] -> HeadAvg, ['pv'] -> Avg (PV rows only).
     # List e.g. ['mod', 'head', 'pv'] for the 3N design.
-    targets: List[str] = field(default_factory=list)
+    targets: List[str] = field(default_factory=lambda: ['mod', 'head', 'pv'])
     # A/B escape hatch: also fully unfreeze top layers from this index (0 = off)
     unfreeze_from_layer: int = 0
     # LoRA adapter used during scoring (fresh rank, trained on the spot)
