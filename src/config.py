@@ -39,13 +39,13 @@ class Config:
     gauss_ctx_head: Tuple[int, ...] = (20,)      # head exit: block 19
     gauss_ctx_pv: Tuple[int, ...] = (21, 22)     # PV exit: blocks 20--21
     head_hidden: int = 128
-    # Token-level cross-attention between the modifier and head spans before
-    # pooling: each mod token attends over the head span and vice-versa, so the
-    # two constituents interact BEFORE collapsing to a single vector (the plain
-    # concat-only path forces all mod x head interactions into one Linear).
-    cross_span: bool = True
-    # Append element-wise composition features u*v, |u-v|, (u+v)/2 to the
-    # pooled span pair (standard relation-classification trick).
+    # Token-level cross-attention between the modifier and head spans is ALWAYS
+    # on (no concat-only path): each mod token attends over the head span and
+    # vice-versa, so the two constituents interact BEFORE collapsing to a single
+    # vector. A concat-only design forces all mod x head interactions into one
+    # Linear of the GaussHead, which is weaker.
+    # Optional extra: append element-wise composition features u*v, |u-v|,
+    # (u+v)/2 to the pooled span pair (standard relation-classification trick).
     elementwise: bool = False
     dropout: float = 0.2
     # literality feature (ALWAYS ON, no knob): cosine between the contextualised
