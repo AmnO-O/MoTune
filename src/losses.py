@@ -144,8 +144,8 @@ class GaussLoss(nn.Module):
         loss = gauss_kl(mu, sigma_p, target, sigma_t)
         # KL-only mode (no CCC, no pair ranking). Kept as comments so they are
         # trivial to re-enable for ablations.
-        # if self.ccc_weight > 0:
-        #     loss = loss + self.ccc_weight * ccc_loss(mu, target, var_floor=self.ccc_var_floor)
+        if self.ccc_weight > 0:
+            loss = loss + self.ccc_weight * ccc_loss(mu, target, var_floor=self.ccc_var_floor)
         if self.lambda_rank > 0:
             loss = loss + self.lambda_rank * margin_rank_loss(
                 mu, target, margin=self.rank_margin,
