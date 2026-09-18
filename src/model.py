@@ -568,13 +568,15 @@ class MMBertModel(nn.Module):
         # pooled vector is contaminated as a literalness measurement.
         mod_use = _masked_mean(mod_hidden, batch['mod_span_mask'])
         head_use = _masked_mean(head_hidden, batch['head_span_mask'])
-        cos_mod = self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], mod_use)
-        cos_head = self._prototype_cos(batch['input_ids'], batch['head_span_mask'], head_use)
-        cos_pv = 0.5 * (
-            self._prototype_cos(batch['input_ids'], batch['mod_span_mask'],
-                                _masked_mean(pv_hidden, batch['mod_span_mask']))
-            + self._prototype_cos(batch['input_ids'], batch['head_span_mask'],
-                                  _masked_mean(pv_hidden, batch['head_span_mask'])))
+        cos_mod = cos_head = cos_pv = None
+
+        # cos_mod = self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], mod_use)
+        # cos_head = self._prototype_cos(batch['input_ids'], batch['head_span_mask'], head_use)
+        # cos_pv = 0.5 * (
+        #     self._prototype_cos(batch['input_ids'], batch['mod_span_mask'],
+        #                         _masked_mean(pv_hidden, batch['mod_span_mask']))
+        #     + self._prototype_cos(batch['input_ids'], batch['head_span_mask'],
+        #                           _masked_mean(pv_hidden, batch['head_span_mask'])))
         mod_feat = self._compose_gauss_feat(
             mod_u, mod_v, self._context_emb(mod_hidden, batch), cos_mod)
         head_feat = self._compose_gauss_feat(
