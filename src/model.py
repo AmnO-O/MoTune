@@ -69,6 +69,33 @@ class SpanPool(nn.Module):
     def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return self.attn(hidden, mask)
 
+class HybridSpanPool(nn.Module):
+    """Combines Attention, Mean, and Max pooling for short constituent spans."""
+
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.attn_pool = AttentionPool(hidden)
+        self.fuse = nn.Linear(hidden * 3, hidden)
+        self.norm = nn.LayerNorm(hidden)
+
+    def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # 1. Attention Pool
+        v_attn = self.attn_pool(hidden, mask)
+        
+        # 2. Masked Mean Pool
+        mask_f = mask.float().unsqueeze(-1)
+        counts = mask_f.sum(dim=1).clamp(min=1.0)
+        v_mean = (hidden * mask_f).sum(dim=1) / counts
+        
+        # 3. Masked Max Pool
+        hidden_masked = hidden.masked_fill(~mask.unsqueeze(-1), -1e4)
+        v_max = hidden_masked.max(dim=1).values
+        v_max = torch.where(mask.any(dim=-1, keepdim=True), v_max, torch.zeros_like(v_max))
+        
+        # 4. Concatenate & Project back to H
+        fused = torch.cat([v_attn, v_mean, v_max], dim=-1)
+        return self.norm(self.fuse(fused))
+
 
 class CrossSpanAttentionBlock(nn.Module):
     """Full Transformer Cross-Attention Block with Multi-Head, FFN, and Residuals.
@@ -248,6 +275,13 @@ def _derive_attn_targets(model: nn.Module, from_layer: int = 0) -> List[str]:
     def _walk(m: nn.Module, path: str) -> None:
         for name, child in list(m.named_children()):
             full = f'{path}.{name}' if path else name
+            # LoRA is for the pretrained backbone (``model.lm``) only: the
+            # scorer-side attention/fusion blocks are random-init, stay fully
+            # trainable, and expose nn.MultiheadAttention internals
+            # (``self.out_proj.weight``) that break when wrapped in an
+            # adapter. Skip any subtree whose root is not ``lm``.
+            if full and not full.split('.', 1)[0] == 'lm':
+                continue
             layer = _layer_idx(full)
             if layer is not None and layer < from_layer:
                 if len(list(child.children())) > 0:
@@ -312,6 +346,12 @@ def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,
         def _walk(module: nn.Module, path: str) -> None:
             for name, child in list(module.named_children()):
                 full = f'{path}.{name}' if path else name
+                # LoRA is for the pretrained backbone (``model.lm``) only; the
+                # scorer-side attention/fusion blocks are random-init and stay
+                # fully trainable (their MHA params are also not attribute-safe
+                # to wrap). See _derive_attn_targets._walk.
+                if full and not full.split('.', 1)[0] == 'lm':
+                    continue
                 layer = _layer_idx(full)
                 if layer is not None and layer < from_layer:
                     # outside the LoRA window; keep descending to reach deeper layers
