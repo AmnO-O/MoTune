@@ -7,9 +7,22 @@ resize. No ordinal/regression heads exist in this package; both modifier and
 head noun are scored by ``GaussHead`` instances predicting ``(mu, sigma)``.
 
 Head input: per-exit cross-attended mod/head span embeddings (learned pooling)
-+ mean-and-CLS context, fused by ``OptimizedSpanFusion`` (no torch.cat),
-plus a per-word literality ``cos(use, prototype)`` scalar computed from the
-word's own raw contextual vector.
++ mean-and-CLS context + a per-word literality ``cos(use, prototype)`` scalar,
+fused by ``OptimizedSpanFusion`` (no torch.cat) into one ``[B, H]`` vector.
+
+``CrossSpanAttentionBlock`` and ``OptimizedSpanFusion`` are new, freshly-
+initialized modules (~9.4M params combined at the ffn_expansion=2 default
+below -- see their docstrings) with nothing to fall back on but this task's
+own small training set. Both use a learnable, zero-initialized gate on their
+attention/FFN contributions (``alpha_attn`` / ``alpha_ffn``) so they start as
+a gentle near-identity pass-through and only grow in influence as training
+supports it -- the same "start at zero, earn it" principle already used for
+``LoRAAdapter.b`` below, just applied to these two new blocks. This keeps the
+existing post-LayerNorm structure (unlike pure ReZero, which drops LayerNorm
+entirely and has been reported to destabilize under fp16/dropout without it
+-- Liu et al., "Understanding the Difficulty of Training Transformers"), so
+it's a conservative version of Bachlechner et al. (2020/2021 UAI), "ReZero is
+All You Need", not a literal implementation of it.
 
 LoRA lives in :mod:`src.lora` (no ``peft`` dependency) and is re-exported
 here (``apply_lora`` / ``lora_parameters`` / ``merge_lora``) for the trainer.
@@ -67,8 +80,16 @@ class SpanPool(nn.Module):
     def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return self.attn(hidden, mask)
 
+
 class HybridSpanPool(nn.Module):
-    """Combines Attention, Mean, and Max pooling for short constituent spans."""
+    """Combines Attention, Mean, and Max pooling for short constituent spans.
+
+    NOT currently wired in anywhere -- ``mod_pool``/``head_role_pool`` below
+    still use plain ``SpanPool``. Left in place since it may be worth its own
+    ablation arm, but as-is it's dead code; either wire it in behind a flag
+    and test it on its own, or remove it so the next reader doesn't wonder
+    whether it's silently active.
+    """
 
     def __init__(self, hidden: int):
         super().__init__()
@@ -79,17 +100,17 @@ class HybridSpanPool(nn.Module):
     def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # 1. Attention Pool
         v_attn = self.attn_pool(hidden, mask)
-        
+
         # 2. Masked Mean Pool
         mask_f = mask.float().unsqueeze(-1)
         counts = mask_f.sum(dim=1).clamp(min=1.0)
         v_mean = (hidden * mask_f).sum(dim=1) / counts
-        
+
         # 3. Masked Max Pool
         hidden_masked = hidden.masked_fill(~mask.unsqueeze(-1), -1e4)
         v_max = hidden_masked.max(dim=1).values
         v_max = torch.where(mask.any(dim=-1, keepdim=True), v_max, torch.zeros_like(v_max))
-        
+
         # 4. Concatenate & Project back to H
         fused = torch.cat([v_attn, v_mean, v_max], dim=-1)
         return self.norm(self.fuse(fused))
@@ -97,23 +118,42 @@ class HybridSpanPool(nn.Module):
 
 class CrossSpanAttentionBlock(nn.Module):
     """Full Transformer Cross-Attention Block with Multi-Head, FFN, and Residuals.
-    
+
     Flow:
-    query_hidden ──┬──> Cross-MHA (Key/Val: kv_hidden) ──> (+) ──> LayerNorm ──┬──> FFN ──> (+) ──> LayerNorm ──> Masking
-                   └── (Residual 1) ──────────────────────┘                   └── (Residual 2) ──┘
+    query_hidden --+--> Cross-MHA (Key/Val: kv_hidden) --> (*alpha_attn) --> (+) --> LayerNorm --+--> FFN --> (*alpha_ffn) --> (+) --> LayerNorm --> Masking
+                   +-- (Residual 1) -----------------------------------------+                   +-- (Residual 2) -------------------+
+
+    ``alpha_attn``/``alpha_ffn`` are learnable scalars, zero-initialized, so
+    at step 0 this block is close to a normalization pass-through of
+    ``query_hidden`` rather than a full-strength random transformation --
+    see the module-level docstring for why, on a dataset this size, that
+    matters more here than it would training from a large corpus.
+
+    ``ffn_expansion`` defaults to 2 rather than the more common 4: this is a
+    freshly-initialized block with no pretraining to fall back on, and the
+    smaller default roughly halves its parameter count (~4.7M vs ~7.1M at
+    hidden=768) for a first test. Widen it later if an ablation shows it's
+    worth the extra capacity.
+
+    NOTE (efficiency, not correctness): ``query_hidden``/``kv_hidden`` are
+    passed in as the FULL sequence, and only ``query_mask`` positions are
+    kept at the end (``x * query_mask``) -- so this computes attention
+    outputs at every sequence position even though only the ~1-4 span
+    positions survive. Correct, but O(seq_len) more compute than necessary;
+    gathering the span positions first would be the efficient version if
+    this ever becomes a bottleneck.
     """
-    def __init__(self, hidden: int = 768, num_heads: int = 8, ffn_expansion: int = 4, dropout: float = 0.1):
+    def __init__(self, hidden: int = 768, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1):
         super().__init__()
-        # 1. PyTorch MultiheadAttention (Đã tích hợp W_q, W_k, W_v, W_out & FlashAttention)
         self.mha = nn.MultiheadAttention(
-            embed_dim=hidden, 
-            num_heads=num_heads, 
-            dropout=dropout, 
+            embed_dim=hidden,
+            num_heads=num_heads,
+            dropout=dropout,
             batch_first=True
         )
         self.norm1 = nn.LayerNorm(hidden)
-        
-        # 2. Position-wise Feed-Forward Network (FFN)
+        self.alpha_attn = nn.Parameter(torch.zeros(1))
+
         self.ffn = nn.Sequential(
             nn.Linear(hidden, hidden * ffn_expansion),
             nn.GELU(),
@@ -122,6 +162,7 @@ class CrossSpanAttentionBlock(nn.Module):
             nn.Dropout(dropout)
         )
         self.norm2 = nn.LayerNorm(hidden)
+        self.alpha_ffn = nn.Parameter(torch.zeros(1))
 
     def forward(self, query_hidden: torch.Tensor, kv_hidden: torch.Tensor,
                 query_mask: torch.Tensor, kv_mask: torch.Tensor) -> torch.Tensor:
@@ -145,63 +186,75 @@ class CrossSpanAttentionBlock(nn.Module):
             attn_mask=attn_mask,
             need_weights=False,
         )
-        
-        # Add & Norm (Residual 1)
-        x = self.norm1(query_hidden + attn_out)
-        
+
+        # Add & Norm (Residual 1) -- gated: starts at ~identity, learns to open up
+        x = self.norm1(query_hidden + self.alpha_attn * attn_out)
+
         # --- STAGE 2: Feed-Forward Network (FFN) ---
         ffn_out = self.ffn(x)
-        
-        # Add & Norm (Residual 2)
-        x = self.norm2(x + ffn_out)
-        
-        # Giữ sạch các token PAD theo query_mask
+
+        # Add & Norm (Residual 2) -- gated, same reasoning
+        x = self.norm2(x + self.alpha_ffn * ffn_out)
+
+        # Keep PAD tokens clean per query_mask
         return x * query_mask.unsqueeze(-1)
 
+
 class OptimizedSpanFusion(nn.Module):
-    def __init__(self, hidden: int = 768, num_heads: int = 8, dropout: float = 0.1):
+    """Learned-query attention fusion, replacing ``torch.cat`` of the feature
+    bundle: mod span, head span, context mean, context CLS, and (if passed)
+    the literality scalar each become a role-tagged token, and one learned
+    query attends over them, collapsing to a single ``[B, H]`` vector.
+
+    ``alpha_attn``/``alpha_ffn`` and ``ffn_expansion`` follow the same
+    zero-init-gate, lower-default-capacity reasoning as
+    ``CrossSpanAttentionBlock`` -- see its docstring and the module-level one.
+    """
+    def __init__(self, hidden: int = 768, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1):
         super().__init__()
-        # 1. Query học được
+        # 1. Learned query
         self.fuse_q = nn.Parameter(torch.randn(1, 1, hidden) * (hidden ** -0.5))
-        
-        # 2. Multi-Head Attention tối ưu sẵn (Bao gồm W_q, W_k, W_v và W_out)
+
+        # 2. Multi-Head Attention (includes W_q, W_k, W_v, W_out)
         self.attn = nn.MultiheadAttention(embed_dim=hidden, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(hidden)
-        
+        self.alpha_attn = nn.Parameter(torch.zeros(1))
+
         # 3. Feed-Forward Network (FFN)
         self.ffn = nn.Sequential(
-            nn.Linear(hidden, hidden * 4),
+            nn.Linear(hidden, hidden * ffn_expansion),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden * 4, hidden),
+            nn.Linear(hidden * ffn_expansion, hidden),
             nn.Dropout(dropout)
         )
         self.norm2 = nn.LayerNorm(hidden)
-        
+        self.alpha_ffn = nn.Parameter(torch.zeros(1))
+
         # Scalar & Role embeddings
         self.scalar_embed = nn.Linear(1, hidden)
         self.type_emb = nn.Parameter(torch.randn(5, hidden) * (hidden ** -0.5))
 
     def forward(self, mod, head, context, cos_=None):
-        # --- Gom Tokens ---
+        # --- Gather tokens ---
         ctx_mean, ctx_cls = context.chunk(2, dim=1)
         toks = [mod, head, ctx_mean, ctx_cls]
         types = [0, 1, 2, 3]
         if cos_ is not None:
             toks.append(self.scalar_embed(cos_))
             types.append(4)
-            
-        kv_toks = torch.stack(toks, dim=1) + self.type_emb[types] # [B, 5, 768]
-        q = self.fuse_q.expand(kv_toks.size(0), -1, -1)          # [B, 1, 768]
-        
-        # --- STAGE 1: Cross-Attention (Đã tối ưu CUDA/FlashAttention) ---
-        attn_out, _ = self.attn(query=q, key=kv_toks, value=kv_toks) # [B, 1, 768]
-        x = self.norm1(q + attn_out).squeeze(1)                      # [B, 768]
-        
+
+        kv_toks = torch.stack(toks, dim=1) + self.type_emb[types]   # [B, T, 768]
+        q = self.fuse_q.expand(kv_toks.size(0), -1, -1)             # [B, 1, 768]
+
+        # --- STAGE 1: Cross-Attention ---
+        attn_out, _ = self.attn(query=q, key=kv_toks, value=kv_toks)   # [B, 1, 768]
+        x = self.norm1(q + self.alpha_attn * attn_out).squeeze(1)       # [B, 768]
+
         # --- STAGE 2: FFN ---
-        out = self.norm2(x + self.ffn(x))                             # [B, 768]
+        out = self.norm2(x + self.alpha_ffn * self.ffn(x))              # [B, 768]
         return out
-    
+
 
 # --------------------------------------------------------------------------- #
 # the model (gauss only)
@@ -339,19 +392,22 @@ class MMBertModel(nn.Module):
         # the span-mean of the RAW role-exit hidden states against the static
         # prototype, NOT the pooled output of cross-attention. The cross-attn
         # mixes in the counterpart span ("flea" attends over "market"), so its
-        # pooled vector is contaminated as a literalness measurement.
+        # pooled vector would be contaminated as a literalness measurement.
+        # (Restored -- this was computed and then discarded in the previous
+        # version: mod_use/head_use were built but cos_mod/cos_head/cos_pv
+        # were hardcoded to None and the three lines below were commented out,
+        # so the feature never reached the fusion module or the heads.)
         mod_use = _masked_mean(mod_hidden, batch['mod_span_mask'])
         head_use = _masked_mean(head_hidden, batch['head_span_mask'])
-        cos_mod = cos_head = cos_pv = None
 
-        # cos_mod = self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], mod_use)
-        # cos_head = self._prototype_cos(batch['input_ids'], batch['head_span_mask'], head_use)
-        # cos_pv = 0.5 * (
-        #     self._prototype_cos(batch['input_ids'], batch['mod_span_mask'],
-        #                         _masked_mean(pv_hidden, batch['mod_span_mask']))
-        #     + self._prototype_cos(batch['input_ids'], batch['head_span_mask'],
-        #                           _masked_mean(pv_hidden, batch['head_span_mask'])))
-        
+        cos_mod = self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], mod_use)
+        cos_head = self._prototype_cos(batch['input_ids'], batch['head_span_mask'], head_use)
+        cos_pv = 0.5 * (
+            self._prototype_cos(batch['input_ids'], batch['mod_span_mask'],
+                                _masked_mean(pv_hidden, batch['mod_span_mask']))
+            + self._prototype_cos(batch['input_ids'], batch['head_span_mask'],
+                                  _masked_mean(pv_hidden, batch['head_span_mask'])))
+
         mod_feat = self._compose_gauss_feat(
             mod_u, mod_v, self._context_emb(mod_hidden, batch), cos_mod)
         head_feat = self._compose_gauss_feat(
