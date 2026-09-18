@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -68,6 +68,40 @@ class SpanPool(nn.Module):
 
     def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return self.attn(hidden, mask)
+
+
+class CrossSpanAttention(nn.Module):
+    """Single-head token-level cross-attention between two constituent spans.
+
+    Each token of the query span attends over the key/value span, so the two
+    constituents interact BEFORE either is collapsed to a single vector. One
+    module (shared weights) serves every role exit; the direction is chosen by
+    which span you pass as ``query_hidden``. Output token vectors are masked to
+    the query span so the downstream attention pool stays honest.
+    """
+
+    def __init__(self, hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.q = nn.Linear(hidden, hidden)
+        self.k = nn.Linear(hidden, hidden)
+        self.v = nn.Linear(hidden, hidden)
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.scale = hidden ** -0.5
+
+    def forward(self, query_hidden: torch.Tensor, kv_hidden: torch.Tensor,
+                query_mask: torch.Tensor, kv_mask: torch.Tensor) -> torch.Tensor:
+        q = self.q(query_hidden)
+        k = self.k(kv_hidden)
+        v = self.v(kv_hidden)
+        scores = torch.bmm(q, k.transpose(-1, -2)) * self.scale
+        # -1e4 guards FP16 underflow to -inf (NaN softmax), like AttentionPool.
+        scores = scores.masked_fill(~kv_mask.unsqueeze(1), -1e4)
+        attn = F.softmax(scores, dim=-1)
+        # Rows with no kv-span tokens stay at zero attention (no NaN in backward).
+        has_kv = kv_mask.any(-1, keepdim=True).unsqueeze(1)
+        attn = torch.where(has_kv, attn, torch.zeros_like(attn))
+        out = self.drop(torch.bmm(attn, v))
+        return out * query_mask.unsqueeze(-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -296,7 +330,8 @@ class MMBertModel(nn.Module):
                  head_hidden: int = 128,
                  gauss_ctx_mod: Optional[Sequence[int]] = None,
                  gauss_ctx_head: Optional[Sequence[int]] = None,
-                 gauss_ctx_pv: Optional[Sequence[int]] = None):
+                 gauss_ctx_pv: Optional[Sequence[int]] = None,
+                 cross_span: bool = False, elementwise: bool = False):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
@@ -320,6 +355,14 @@ class MMBertModel(nn.Module):
         # tacked on (torch.cat, last axis), so mod_out never sees head's
         # literalness and vice-versa. That extra column IS part of head_in.
         self.head_in += 1
+        if elementwise:
+            # u*v, |u-v|, (u+v)/2 appended after the pooled span pair.
+            self.head_in += 3 * hidden_size
+
+        self.cross_span = cross_span
+        self.elementwise = elementwise
+        # Token-level cross-attention between spans, shared across role exits.
+        self.cross_attn = CrossSpanAttention(hidden_size, dropout) if cross_span else None
 
         self.mod_pool = SpanPool(hidden_size)
         self.head_role_pool = SpanPool(hidden_size)
@@ -364,10 +407,36 @@ class MMBertModel(nn.Module):
             or getattr(getattr(self.base_model, 'encoder', None), 'final_norm', None)
         return norm(hidden) if norm is not None else hidden
 
+    def _span_pair(self, hidden: torch.Tensor, batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pooled (mod, head) span embeddings at one exit, with interaction.
+
+        With ``cross_span`` on, each span's tokens first attend over the other
+        span (token-level, before pooling) so the constituents interact before
+        being collapsed. Otherwise this is exactly the plain double pool.
+        """
+        mod_mask = batch['mod_span_mask']
+        head_mask = batch['head_span_mask']
+        if self.cross_span:
+            mod_tok = self.cross_attn(hidden, hidden, mod_mask, head_mask)
+            head_tok = self.cross_attn(hidden, hidden, head_mask, mod_mask)
+            return (self.mod_pool(mod_tok, mod_mask),
+                    self.head_role_pool(head_tok, head_mask))
+        return (self.mod_pool(hidden, mod_mask),
+                self.head_role_pool(hidden, head_mask))
+
+    def _comp_extra(self, u: torch.Tensor, v: torch.Tensor) -> Optional[torch.Tensor]:
+        """Element-wise composition features u*v, |u-v|, (u+v)/2, or None."""
+        if not self.elementwise:
+            return None
+        return torch.cat([u * v, (u - v).abs(), (u + v) / 2], dim=1)
+
     def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,
-                            context_emb) -> torch.Tensor:
-        """Feature bundle: two spans, two lengths, and role-specific context."""
-        return torch.cat([mod_emb, head_emb, mod_len, head_len, context_emb], dim=1)
+                            context_emb, extra=None) -> torch.Tensor:
+        """Feature bundle: two spans, two lengths, role-specific context + optional extras."""
+        feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
+        if extra is not None:
+            feats.append(extra)
+        return torch.cat(feats, dim=1)
 
     def _features(self, batch):
         """Build one feature bundle per dedicated Gaussian exit."""
@@ -389,24 +458,23 @@ class MMBertModel(nn.Module):
             tuple(i % n_layers for i in self.gauss_ctx_head), hid_all)
         pv_hidden = self._role_hidden(
             tuple(i % n_layers for i in self.gauss_ctx_pv), hid_all)
-        
-        mod_exit_emb = self.mod_pool(mod_hidden, batch['mod_span_mask'])
-        head_exit_emb = self.head_role_pool(head_hidden, batch['head_span_mask'])
-        pv_mod_emb = self.mod_pool(pv_hidden, batch['mod_span_mask'])
-        pv_head_emb = self.head_role_pool(pv_hidden, batch['head_span_mask'])
 
+        mod_u, mod_v = self._span_pair(mod_hidden, batch)
+        head_u, head_v = self._span_pair(head_hidden, batch)
+        pv_u, pv_v = self._span_pair(pv_hidden, batch)
+
+        mod_exit_emb, head_exit_emb = mod_u, head_v
         mod_feat = self._compose_gauss_feat(
-            mod_exit_emb, self.head_role_pool(mod_hidden, batch['head_span_mask']),
-            mod_len, head_len, self._context_emb(mod_hidden, batch))
-        
+            mod_u, mod_v, mod_len, head_len, self._context_emb(mod_hidden, batch),
+            extra=self._comp_extra(mod_u, mod_v))
         head_feat = self._compose_gauss_feat(
-            self.mod_pool(head_hidden, batch['mod_span_mask']), head_exit_emb,
-            mod_len, head_len, self._context_emb(head_hidden, batch))
+            head_u, head_v, mod_len, head_len, self._context_emb(head_hidden, batch),
+            extra=self._comp_extra(head_u, head_v))
         pv_feat = self._compose_gauss_feat(
-            pv_mod_emb, pv_head_emb, mod_len, head_len,
-            self._context_emb(pv_hidden, batch))
-        
-        return mod_feat, head_feat, pv_feat, mod_exit_emb, head_exit_emb, pv_mod_emb, pv_head_emb
+            pv_u, pv_v, mod_len, head_len, self._context_emb(pv_hidden, batch),
+            extra=self._comp_extra(pv_u, pv_v))
+
+        return mod_feat, head_feat, pv_feat, mod_exit_emb, head_exit_emb, pv_u, pv_v
 
     def _forward_gauss(self, batch, with_logits: bool = False, with_pv: bool = False):
         """Predict N(mu, sigma^2) per span; sigma travels the "logits" channel."""
@@ -455,6 +523,7 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertMo
         head_hidden=cfg.head_hidden,
         gauss_ctx_mod=cfg.gauss_ctx_mod,
         gauss_ctx_head=cfg.gauss_ctx_head, gauss_ctx_pv=cfg.gauss_ctx_pv,
+        cross_span=cfg.cross_span, elementwise=cfg.elementwise,
     )
     if load_from is not None:
         load_from = Path(load_from)
