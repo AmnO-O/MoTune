@@ -44,16 +44,14 @@ class Config:
     # vice-versa, so the two constituents interact BEFORE collapsing to a single
     # vector. A concat-only design forces all mod x head interactions into one
     # Linear of the GaussHead, which is weaker.
-    # Optional extra: append element-wise composition features u*v, |u-v|,
-    # (u+v)/2 to the pooled span pair (standard relation-classification trick).
-    elementwise: bool = False
     dropout: float = 0.2
     # literality feature (ALWAYS ON, no knob): cosine between the contextualised
     # USE embedding of a constituent span and the static prototype (base/lemma)
     # embedding row of its own tokens. High = word keeps its literal meaning in
     # context (e.g. "market" in "flea market"); low = drift/lexicalised (e.g.
-    # "tower" in "ivory tower"). The cos column is appended to the head input
-    # unconditionally in build_model (head_in += 1).
+    # "tower" in "ivory tower"). The cos becomes one role-tagged token of the
+    # SpanFusion attention (always on, no knob), alongside the span pair, the
+    # context mean/CLS, and the two length fractions.
 
     # === data / paths (filenames are resolved under data_path) ===
     data_path: Optional[str] = None

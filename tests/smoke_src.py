@@ -412,17 +412,19 @@ def check_fixes() -> None:
     check('pv_mod_exit_emb, pv_head_exit_emb = mod_exit_emb, head_exit_emb' not in model_src,
           'PV literalness features stay on the PV exit layers')
 
-    # 3) proxy for the role-feature width: proto-cos dimension + plain-AutoModel
-    check('self.head_in += 1' in model_src,
-          'head_in counts the appended cos column (proto-cos always on)')
+    # 3) proxy for the role-feature width: attention-fused vector + plain-AutoModel
+    check('self.head_in = hidden_size' in model_src
+          and 'self.fusion = SpanFusion' in model_src,
+          'head_in is ONE fused attention vector per exit (no concat bundle)')
     check('from transformers import AutoModel' in model_src
           and 'AutoModelForMaskedLM' not in model_src
           and '_lm_span_stats' not in model_src
           and 'use_lm_features' not in model_src,
           'backbone is a plain AutoModel; LM-predictability stats dropped (no [MASK])')
     check('def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,'
-          in model_src and 'lm_stats' not in model_src,
-          '_compose_gauss_feat takes 5 args only (no lm_stats plumbing)')
+          in model_src and 'lm_stats' not in model_src
+          and 'return self.fusion(mod_emb, head_emb, context_emb, mod_len, head_len, cos_)' in model_src,
+          '_compose_gauss_feat fuses via SpanFusion attention (no lm_stats/cat plumbing)')
     check('tok = F.embedding(input_ids, weight)' in model_src,
           '_prototype_cos uses F.embedding (not manual index_select)')
     check('proto_safe = torch.where(has_span, proto, torch.ones_like(proto))' in model_src,

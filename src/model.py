@@ -109,6 +109,54 @@ class CrossSpanAttention(nn.Module):
         return out * query_mask.unsqueeze(-1)
 
 
+class SpanFusion(nn.Module):
+    """Attention-based fusion replacing the concat feature bundle.
+
+    The pooled span pair (already cross-attended), the context CLS/mean, and the
+    length + literalness scalars become ~7 role-tagged ``H``-tokens that a single
+    learned query token attends over, collapsing to ONE fused ``[B, H]`` vector
+    per exit. There is deliberately no ``torch.cat`` anywhere in this path, so
+    the "simple concat" that forced all span x context interactions into one
+    Linear of the GaussHead is gone.
+    """
+
+    def __init__(self, hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.fuse_q = nn.Parameter(torch.zeros(1, 1, hidden))
+        self.k_proj = nn.Linear(hidden, hidden)
+        self.v_proj = nn.Linear(hidden, hidden)
+        # role tags: 0 mod-span, 1 head-span, 2 ctx-mean, 3 ctx-CLS,
+        #             4 len-mod, 5 len-head, 6 literalness cos
+        self.type_emb = nn.Parameter(torch.randn(7, hidden) * hidden ** -0.5)
+        self.scalar_embed = nn.Linear(1, hidden)
+        self.norm = nn.LayerNorm(hidden)
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.scale = hidden ** -0.5
+        nn.init.normal_(self.fuse_q, std=hidden ** -0.5)
+
+    def forward(self, mod: torch.Tensor, head: torch.Tensor,
+                context: torch.Tensor, len_mod: torch.Tensor, len_head: torch.Tensor,
+                cos_: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # context is [B, 2H] = (mean, CLS) halves; split them into two tokens.
+        ctx_mean, ctx_cls = context.chunk(2, dim=1)
+        toks = [mod, head, ctx_mean, ctx_cls,
+                self.scalar_embed(len_mod), self.scalar_embed(len_head)]
+        types = [0, 1, 2, 3, 4, 5]
+        if cos_ is not None:
+            toks.append(self.scalar_embed(cos_))
+            types.append(6)
+        toks = torch.stack(toks, dim=1)               # [B, T, H]
+        toks = toks + self.type_emb[types]            # role tag per token
+        q = self.fuse_q                                # [1, 1, H]
+        k = self.k_proj(toks)
+        v = self.v_proj(toks)
+        scores = torch.bmm(q.expand(toks.size(0), 1, k.size(-1)),
+                           k.transpose(-1, -2))          # [B, 1, T]
+        attn = torch.softmax(scores * self.scale, dim=-1)
+        out = self.drop(torch.bmm(attn, v)).squeeze(1)   # [B, H]
+        return self.norm(out)
+
+
 # --------------------------------------------------------------------------- #
 # LoRA (inline, peft-free)
 # --------------------------------------------------------------------------- #
@@ -335,8 +383,7 @@ class MMBertModel(nn.Module):
                  head_hidden: int = 128,
                  gauss_ctx_mod: Optional[Sequence[int]] = None,
                  gauss_ctx_head: Optional[Sequence[int]] = None,
-                 gauss_ctx_pv: Optional[Sequence[int]] = None,
-                 elementwise: bool = False):
+                 gauss_ctx_pv: Optional[Sequence[int]] = None):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
@@ -354,17 +401,12 @@ class MMBertModel(nn.Module):
         # updates, 2x ckpt size, strict-load failures, and LoRA applied twice).
         object.__setattr__(self, 'base_model', self.lm)
 
-        # 2 spans + 2 length fractions + mean-and-CLS context + literalness.
-        self.head_in = hidden_size * 4 + 2
-        # Each output branch gets ONLY its own word's cos(use, prototype)
-        # tacked on (torch.cat, last axis), so mod_out never sees head's
-        # literalness and vice-versa. That extra column IS part of head_in.
-        self.head_in += 1
-        if elementwise:
-            # u*v, |u-v|, (u+v)/2 appended after the pooled span pair.
-            self.head_in += 3 * hidden_size
+        # No concat feature bundle: the fused pieces (cross-attended span pair,
+        # context mean/CLS, length + literalness scalars) collapse to ONE
+        # H-vector per exit via the learned-query SpanFusion attention.
+        self.head_in = hidden_size
+        self.fusion = SpanFusion(hidden_size, dropout)
 
-        self.elementwise = elementwise
         # Token-level cross-attention between spans, shared across role exits.
         self.cross_attn = CrossSpanAttention(hidden_size, dropout)
 
@@ -424,19 +466,13 @@ class MMBertModel(nn.Module):
         return (self.mod_pool(mod_tok, mod_mask),
                 self.head_role_pool(head_tok, head_mask))
 
-    def _comp_extra(self, u: torch.Tensor, v: torch.Tensor) -> Optional[torch.Tensor]:
-        """Element-wise composition features u*v, |u-v|, (u+v)/2, or None."""
-        if not self.elementwise:
-            return None
-        return torch.cat([u * v, (u - v).abs(), (u + v) / 2], dim=1)
-
     def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,
-                            context_emb, extra=None) -> torch.Tensor:
-        """Feature bundle: two spans, two lengths, role-specific context + optional extras."""
-        feats = [mod_emb, head_emb, mod_len, head_len, context_emb]
-        if extra is not None:
-            feats.append(extra)
-        return torch.cat(feats, dim=1)
+                            context_emb, cos_=None) -> torch.Tensor:
+        """Attention-fused feature vector (no torch.cat): the cross-attended
+        span pair, the context mean/CLS, and the length + literalness scalars
+        become role-tagged tokens of one learned-query SpanFusion attention,
+        collapsing to a single ``[B, H]`` vector."""
+        return self.fusion(mod_emb, head_emb, context_emb, mod_len, head_len, cos_)
 
     def _features(self, batch):
         """Build one feature bundle per dedicated Gaussian exit."""
@@ -464,15 +500,19 @@ class MMBertModel(nn.Module):
         pv_u, pv_v = self._span_pair(pv_hidden, batch)
 
         mod_exit_emb, head_exit_emb = mod_u, head_v
+        cos_mod = self._prototype_cos(
+            batch['input_ids'], batch['mod_span_mask'], mod_exit_emb)
+        cos_head = self._prototype_cos(
+            batch['input_ids'], batch['head_span_mask'], head_exit_emb)
+        cos_pv = 0.5 * (
+            self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], pv_u)
+            + self._prototype_cos(batch['input_ids'], batch['head_span_mask'], pv_v))
         mod_feat = self._compose_gauss_feat(
-            mod_u, mod_v, mod_len, head_len, self._context_emb(mod_hidden, batch),
-            extra=self._comp_extra(mod_u, mod_v))
+            mod_u, mod_v, mod_len, head_len, self._context_emb(mod_hidden, batch), cos_mod)
         head_feat = self._compose_gauss_feat(
-            head_u, head_v, mod_len, head_len, self._context_emb(head_hidden, batch),
-            extra=self._comp_extra(head_u, head_v))
+            head_u, head_v, mod_len, head_len, self._context_emb(head_hidden, batch), cos_head)
         pv_feat = self._compose_gauss_feat(
-            pv_u, pv_v, mod_len, head_len, self._context_emb(pv_hidden, batch),
-            extra=self._comp_extra(pv_u, pv_v))
+            pv_u, pv_v, mod_len, head_len, self._context_emb(pv_hidden, batch), cos_pv)
 
         return mod_feat, head_feat, pv_feat, mod_exit_emb, head_exit_emb, pv_u, pv_v
 
@@ -480,16 +520,9 @@ class MMBertModel(nn.Module):
         """Predict N(mu, sigma^2) per span; sigma travels the "logits" channel."""
         (mod_feat, head_feat, pv_feat, mod_exit_emb, head_exit_emb,
          pv_mod_exit_emb, pv_head_exit_emb) = self._features(batch)
-        cos_mod = self._prototype_cos(
-            batch['input_ids'], batch['mod_span_mask'], mod_exit_emb)
-        cos_head = self._prototype_cos(
-            batch['input_ids'], batch['head_span_mask'], head_exit_emb)
-        cos_pv = 0.5 * (self._prototype_cos(
-            batch['input_ids'], batch['mod_span_mask'], pv_mod_exit_emb) + self._prototype_cos(
-            batch['input_ids'], batch['head_span_mask'], pv_head_exit_emb))
-        mod_mu, mod_sigma = self.mod_gauss(torch.cat([mod_feat, cos_mod], dim=1))
-        head_mu, head_sigma = self.head_gauss(torch.cat([head_feat, cos_head], dim=1))
-        pv_mu, pv_sigma = self.pv_gauss(torch.cat([pv_feat, cos_pv], dim=1))
+        mod_mu, mod_sigma = self.mod_gauss(mod_feat)
+        head_mu, head_sigma = self.head_gauss(head_feat)
+        pv_mu, pv_sigma = self.pv_gauss(pv_feat)
         # Clamp only where a bounded score is reported (eval/inference). During
         # training the raw mu flows into the losses: clamp has zero gradient
         # outside [SCORE_MIN, SCORE_MAX], so an out-of-range output would be
@@ -523,7 +556,6 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertMo
         head_hidden=cfg.head_hidden,
         gauss_ctx_mod=cfg.gauss_ctx_mod,
         gauss_ctx_head=cfg.gauss_ctx_head, gauss_ctx_pv=cfg.gauss_ctx_pv,
-        elementwise=cfg.elementwise,
     )
     if load_from is not None:
         load_from = Path(load_from)
