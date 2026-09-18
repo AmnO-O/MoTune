@@ -479,7 +479,7 @@ def check_fixes() -> None:
               'margin_rank_loss returns non-negative finite values in either mode')
 
         # NaN mixing: NaN safe positive gate with std_alpha weighting
-        dfl = G.GaussLoss(std_alpha=0.0)
+        dfl = G.GaussLoss()
         loss = dfl(pred, tgt, logits=_torch.ones(16), compound_ids=c)
         check(bool(_torch.isfinite(loss)), 'GaussLoss forward finite')
 

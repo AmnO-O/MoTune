@@ -378,7 +378,7 @@ class MMBertModel(nn.Module):
         )
         hid_all = outputs.hidden_states
         n_layers = len(hid_all)
-        
+
         seq_len = batch['attention_mask'].sum(dim=1).clamp(min=1.0).float()
         mod_len = (batch['mod_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
         head_len = (batch['head_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
@@ -405,6 +405,7 @@ class MMBertModel(nn.Module):
         pv_feat = self._compose_gauss_feat(
             pv_mod_emb, pv_head_emb, mod_len, head_len,
             self._context_emb(pv_hidden, batch))
+        
         return mod_feat, head_feat, pv_feat, mod_exit_emb, head_exit_emb, pv_mod_emb, pv_head_emb
 
     def _forward_gauss(self, batch, with_logits: bool = False, with_pv: bool = False):
