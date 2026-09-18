@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .marks import Span, SpanResult, find_spans
-from .targets import TARGETS, target_code
+from .targets import MARKER_CODE, TARGETS, target_code
 from .utils import get_logger
 
 _TARGET_CODE = {t: target_code(t) for t in TARGETS}
@@ -263,11 +263,12 @@ class CompDataset(_DatasetBase):
     """One sentence (tokenized verbatim) per row, for scoring."""
 
     def __init__(self, rows: List[Dict], tokenizer, max_len: int = 256,
-                 is_test: bool = False):
+                 is_test: bool = False, target_prefix: bool = False):
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.is_test = is_test
+        self.target_prefix = target_prefix
         self.items = [self._encode(r) for r in rows]
         self._report()
 
@@ -286,11 +287,25 @@ class CompDataset(_DatasetBase):
         ) if (r['mod'] and r['head']) \
             else SpanResult(Span(None, None), Span(None, None), found=False)
 
+        mod_span_mask = _span_mask(result.mod, length)
+        head_span_mask = _span_mask(result.head, length)
+
+        if self.target_prefix and r.get('target') is not None and r['target'] in MARKER_CODE:
+            marker_id = MARKER_CODE[r['target']]
+            marker_tok = torch.tensor([marker_id], dtype=input_ids.dtype)
+            marker_attn = torch.tensor([1], dtype=attention_mask.dtype)
+            marker_span = torch.tensor([False], dtype=torch.bool)
+
+            input_ids = torch.cat([input_ids[:1], marker_tok, input_ids[1:]])[:self.max_len]
+            attention_mask = torch.cat([attention_mask[:1], marker_attn, attention_mask[1:]])[:self.max_len]
+            mod_span_mask = torch.cat([mod_span_mask[:1], marker_span, mod_span_mask[1:]])[:self.max_len]
+            head_span_mask = torch.cat([head_span_mask[:1], marker_span, head_span_mask[1:]])[:self.max_len]
+
         item = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
-            'mod_span_mask': _span_mask(result.mod, length),
-            'head_span_mask': _span_mask(result.head, length),
+            'mod_span_mask': mod_span_mask,
+            'head_span_mask': head_span_mask,
             'has_mod': torch.tensor(result.mod.start is not None, dtype=torch.bool),
             'has_head': torch.tensor(result.head.start is not None, dtype=torch.bool),
             'degenerate': torch.tensor(result.degenerate, dtype=torch.bool),

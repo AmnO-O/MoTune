@@ -14,9 +14,19 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 TARGETS = ('mod', 'head', 'pv')
+
+# One of mmBERT's reserved-but-unused vocab ids, reused as a learned task
+# marker (verified: id 7/8/9 = '<unused0>'/'<unused1>'/'<unused2>'). No embed
+# resize needed; the marker embedding is a tiny separate module that trains at
+# head_lr. (jhu-clsp/mmBERT-base, Gemma-2-style 256k vocab.)
+MARKER_CODE = {'mod': 7, 'head': 8, 'pv': 9}
+TARGET_PREFIX_TOKENS = {'mod': '<unused0>', 'head': '<unused1>', 'pv': '<unused2>'}
 
 
 def target_code(t):

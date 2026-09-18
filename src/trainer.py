@@ -69,8 +69,12 @@ class Trainer:
             self.logger.info('Single-target mode: expanded to %d train / %d val rows (targets=%s)',
                              len(train_rows), len(val_rows), self.cfg.targets)
         self._val_rows = list(val_rows)
-        train_ds = CompDataset(train_rows, tokenizer, max_len=self.cfg.max_context_length)
-        val_ds = CompDataset(val_rows, tokenizer, max_len=self.cfg.max_context_length)
+        train_ds = CompDataset(
+            train_rows, tokenizer, max_len=self.cfg.max_context_length,
+            target_prefix=self.cfg.target_prefix)
+        val_ds = CompDataset(
+            val_rows, tokenizer, max_len=self.cfg.max_context_length,
+            target_prefix=self.cfg.target_prefix)
         
         # Chỉ bật persistent_workers khi num_workers > 0 để tránh deadlock
         num_workers = max(0, self.cfg.num_workers)

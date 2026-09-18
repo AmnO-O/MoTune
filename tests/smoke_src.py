@@ -605,6 +605,55 @@ def check_targets() -> None:
     check("'target'" in d_src.replace(' ', '') and 'torch.stack' in d_src,
           'collate_comp stacks scalar keys (incl. target)')
 
+    # target_prefix validation in Config
+    from src.config import Config
+    cfg_ok = Config(target_prefix=True, targets=['mod', 'head'])
+    check(cfg_ok.target_prefix is True, 'Config accepts target_prefix=True with non-empty targets')
+    try:
+        Config(target_prefix=True, targets=[]).validate()
+        check(False, 'Config rejects target_prefix=True with empty targets')
+    except ValueError:
+        check(True, 'Config rejects target_prefix=True with empty targets')
+
+    # MARKER_CODE mapping
+    from src.targets import MARKER_CODE, TARGET_PREFIX_TOKENS
+    check(MARKER_CODE == {'mod': 7, 'head': 8, 'pv': 9},
+          'MARKER_CODE maps mod/head/pv to mmBERT unused token ids 7/8/9')
+    check(TARGET_PREFIX_TOKENS == {'mod': '<unused0>', 'head': '<unused1>', 'pv': '<unused2>'},
+          'TARGET_PREFIX_TOKENS maps targets to unused token names')
+
+    # CompDataset target_prefix token insertion and +1 span mask shift
+    try:
+        import torch as _torch
+        class _MockTok:
+            def __call__(self, text, max_length=256, truncation=True, return_tensors='pt', return_offsets_mapping=True):
+                return {
+                    'input_ids': _torch.tensor([[2, 10, 20, 30, 1]]),
+                    'attention_mask': _torch.tensor([[1, 1, 1, 1, 1]]),
+                    'offset_mapping': _torch.tensor([[[0, 0], [0, 3], [4, 8], [9, 15], [0, 0]]])
+                }
+        _row = {'context': 'our flea market', 'mod': 'flea', 'head': 'market', 'compound': 'flea market',
+                'compound_id': 0, 'has_label': True, 'mod_avg': 3.0, 'head_avg': 4.0, 'mod_std': 0.5,
+                'head_std': 0.5, 'target': 'mod'}
+        _ds0 = D.CompDataset([_row], _MockTok(), target_prefix=False)
+        _ds1 = D.CompDataset([_row], _MockTok(), target_prefix=True)
+        check(_ds0[0]['input_ids'].tolist() == [2, 10, 20, 30, 1],
+              'CompDataset without prefix preserves original token sequence')
+        check(_ds1[0]['input_ids'].tolist() == [2, 7, 10, 20, 30, 1],
+              'CompDataset with target_prefix prepends marker id right after <bos>')
+        check(_ds0[0]['mod_span_mask'].tolist() == [False, False, True, False, False]
+              and _ds1[0]['mod_span_mask'].tolist() == [False, False, False, True, False, False],
+              'CompDataset target_prefix shifts mod_span_mask exactly by +1')
+        check(_ds0[0]['head_span_mask'].tolist() == [False, False, False, True, False]
+              and _ds1[0]['head_span_mask'].tolist() == [False, False, False, False, True, False],
+              'CompDataset target_prefix shifts head_span_mask exactly by +1')
+    except ImportError:
+        print('  [SKIP] torch unavailable; CompDataset prefix check skipped')
+
+    # trainer wires target_prefix
+    check('target_prefix=self.cfg.target_prefix' in tr_src,
+          'trainer passes target_prefix to CompDataset')
+
 
 def main() -> int:
     sync_parse()

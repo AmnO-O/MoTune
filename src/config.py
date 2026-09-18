@@ -89,6 +89,11 @@ class Config:
     #   ['mod'] -> ModAvg, ['head'] -> HeadAvg, ['pv'] -> Avg (PV rows only).
     # List e.g. ['mod', 'head', 'pv'] for the 3N design.
     targets: List[str] = field(default_factory=lambda: ['mod', 'head', 'pv'])
+    # Prepend a learned marker token (one of mmBERT's unused vocab ids 7/8/9)
+    # right after <bos> so the backbone also SEES which target this row answers
+    # (task conditioning from layer 0). Off = span-pool only. Always requires
+    # the combined backend; ignored in joint mode (empty targets).
+    target_prefix: bool = False
     # A/B escape hatch: also fully unfreeze top layers from this index (0 = off)
     unfreeze_from_layer: int = 0
     # LoRA adapter used during scoring (fresh rank, trained on the spot)
@@ -208,6 +213,8 @@ class Config:
             errors.append(
                 f'targets must be a subset of {{mod, head, pv}}, got {self.targets}'
             )
+        if self.target_prefix and not self.targets:
+            errors.append('target_prefix requires a non-empty targets list (single-target mode)')
 
         if self.batch_size < 1:
             errors.append(f'batch_size must be >= 1, got {self.batch_size}')
