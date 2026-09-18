@@ -60,6 +60,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     tr_mod_preds, tr_head_preds = [], []
     tr_mod_targets, tr_head_targets = [], []
     tr_allowed = []
+    tr_targets = []
 
     for step_idx, batch in enumerate(dataloader, 1):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -69,6 +70,18 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         is_pv = batch.get('is_pv', torch.zeros_like(allowed))
         allowed_nn = allowed & (~is_pv)
         allowed_pv = allowed & is_pv
+
+        # Single-target mode: each row answers its own target, so each loss
+        # only sees the rows whose active target matches (others are zeroed by
+        # the model and would otherwise drag the loss through inactive heads).
+        if 'target' in batch:
+            tgt = batch['target']
+            mod_mask = allowed_nn & (tgt == 0)
+            head_mask = allowed_nn & (tgt == 1)
+            pv_mask = allowed_pv & (tgt == 2)
+        else:
+            mod_mask = head_mask = allowed_nn
+            pv_mask = allowed_pv
 
         with torch.amp.autocast(device_type, enabled=(device_type == 'cuda')):
             requires_logits = getattr(criterion, 'requires_logits', False)
@@ -84,19 +97,19 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             # NN loss (mask=allowed on NN rows)
             mod_loss = criterion(
                 mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
-                compound_ids=batch['compound_id'], mask=allowed_nn,
+                compound_ids=batch['compound_id'], mask=mod_mask,
             )
             head_loss = criterion(
                 head_pred, batch['head_avg'], head_logits, batch['head_std'],
-                compound_ids=batch['compound_id'], mask=allowed_nn,
+                compound_ids=batch['compound_id'], mask=head_mask,
             )
 
-            # PV has only an overall Avg/Std label.  Its dedicated composition
+# PV has only an overall Avg/Std label.  Its dedicated composition
             # exit consumes both Base and Particle spans; mod/head exits do not
             # receive PV supervision.
             pv_loss = criterion(
                 pv_pred, batch['mod_avg'], pv_logits, batch['mod_std'],
-                compound_ids=batch['compound_id'], mask=allowed_pv,
+                compound_ids=batch['compound_id'], mask=pv_mask,
             )
 
             loss = mod_loss + head_loss + pv_loss
@@ -114,6 +127,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         tr_mod_targets.append(batch['mod_avg'].cpu())
         tr_head_targets.append(batch['head_avg'].cpu())
         tr_allowed.append(allowed.cpu())
+        if 'target' in batch:
+            tr_targets.append(batch['target'].cpu())
 
         if step_idx % accum_steps == 0 or step_idx == n_micro:
             scaler.unscale_(optimizer)
@@ -173,7 +188,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             m_y = torch.cat(tr_mod_targets).numpy()
             h_y = torch.cat(tr_head_targets).numpy()
             al = torch.cat(tr_allowed).numpy()
-            report['train_preds'] = (m_p, h_p, m_y, h_y, al)
+            if tr_targets:
+                t_t = torch.cat(tr_targets).numpy()
+                report['train_preds'] = (m_p, h_p, m_y, h_y, al, t_t)
+            else:
+                report['train_preds'] = (m_p, h_p, m_y, h_y, al)
     return total_loss / n_micro
 
 

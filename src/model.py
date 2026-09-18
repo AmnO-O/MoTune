@@ -463,7 +463,12 @@ def build_model(cfg, device, load_from: Optional[str | Path] = None) -> MMBertMo
 
     ``load_from`` is a torch state_dict with the LM backbone keys only
     (``model.lm.state_dict()``); scorer heads always get fresh init.
+
+    Dispatches to :mod:`src.model_combined` when ``cfg.model_backend == 'combined'``.
     """
+    if getattr(cfg, 'model_backend', 'exits') == 'combined':
+        from .model_combined import build_combined_model
+        return build_combined_model(cfg, device, load_from=load_from)
     model = MMBertModel(
         cfg.backbone, hidden_size=cfg.hidden_size, dropout=cfg.dropout,
         head_hidden=cfg.head_hidden,

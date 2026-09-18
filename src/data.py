@@ -22,7 +22,10 @@ import numpy as np
 import pandas as pd
 
 from .marks import Span, SpanResult, find_spans
+from .targets import TARGETS, target_code
 from .utils import get_logger
+
+_TARGET_CODE = {t: target_code(t) for t in TARGETS}
 
 logger = get_logger('src.data')
 
@@ -207,6 +210,46 @@ def _resolve(cfg):
 
 
 # --------------------------------------------------------------------------- #
+# single-target expansion
+# --------------------------------------------------------------------------- #
+def expand_targets(rows: List[Dict], targets: List[str]) -> List[Dict]:
+    """Expand rows into one raw per active target (single-target design).
+
+    A row is a (source sentence + spans + labels) candidate for the targets
+    that actually make sense for its type -- NN rows grade the modifier and
+    the head noun separately, PV rows grade only the whole phrasal verb:
+
+        NN row  + 'mod'  => kept   (label ModAvg)
+        NN row  + 'head' => kept   (label HeadAvg)
+        NN row  + 'pv'   => DROPPED (no overall Avg gold for NN compounds)
+        PV row  + 'pv'   => kept   (label Avg)
+        PV row  + 'mod'/'head' => DROPPED (PV rows have no per-role gold)
+
+    Each kept row carries a ``'target'`` key; ``has_label`` reflects whether
+    the gold for that target is present. An empty ``targets`` list returns the
+    rows untouched (joint mode: one row scores all targets at once).
+    """
+    if not targets:
+        return rows
+
+    out: List[Dict] = []
+    for r in rows:
+        nn = not r.get('is_pv', False)
+        for t in targets:
+            if (nn and t == 'mod') or (nn and t == 'head'):
+                has_label = bool(np.isfinite(r['mod_avg' if t == 'mod' else 'head_avg']))
+            elif (not nn) and t == 'pv':
+                has_label = bool(np.isfinite(r['mod_avg']))   # Avg lives in mod_avg
+            else:
+                continue                                       # drop entirely
+            c = dict(r)
+            c['target'] = t
+            c['has_label'] = has_label
+            out.append(c)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # datasets
 # --------------------------------------------------------------------------- #
 def _span_mask(span: Optional[Span], length: int) -> torch.Tensor:
@@ -243,7 +286,7 @@ class CompDataset(_DatasetBase):
         ) if (r['mod'] and r['head']) \
             else SpanResult(Span(None, None), Span(None, None), found=False)
 
-        return {
+        item = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'mod_span_mask': _span_mask(result.mod, length),
@@ -260,6 +303,9 @@ class CompDataset(_DatasetBase):
             'row_id': torch.tensor(int(r.get('row_id', 0)), dtype=torch.long),
             'is_pv': torch.tensor(bool(r.get('is_pv', False)), dtype=torch.bool),
         }
+        if r.get('target') is not None:
+            item['target'] = torch.tensor(_TARGET_CODE[r['target']], dtype=torch.long)
+        return item
 
     def _report(self) -> None:
         if self.is_test:

@@ -19,7 +19,7 @@ from torch.amp import GradScaler
 from transformers import get_constant_schedule, get_linear_schedule_with_warmup
 
 from src.config import Config
-from src.data import CompDataset, collate_comp
+from src.data import CompDataset, collate_comp, expand_targets
 from src.folds import CompoundGroupSampler
 from src.losses import GaussLoss
 from src.model import apply_lora, build_model, lora_parameters
@@ -63,6 +63,11 @@ class Trainer:
     # ------------------------------------------------------------------ #
     def _build_loaders(self, train_rows, val_rows, tokenizer):
         self.logger.info("Building Datasets & Tokenizing %d train / %d val rows...", len(train_rows), len(val_rows))
+        if self.cfg.targets:
+            train_rows = expand_targets(train_rows, self.cfg.targets)
+            val_rows = expand_targets(val_rows, self.cfg.targets)
+            self.logger.info('Single-target mode: expanded to %d train / %d val rows (targets=%s)',
+                             len(train_rows), len(val_rows), self.cfg.targets)
         self._val_rows = list(val_rows)
         train_ds = CompDataset(train_rows, tokenizer, max_len=self.cfg.max_context_length)
         val_ds = CompDataset(val_rows, tokenizer, max_len=self.cfg.max_context_length)
@@ -249,10 +254,17 @@ class Trainer:
             )
 
             # Compute train rho directly from in-epoch predictions
+            single_target = 'train_preds' in diag and len(diag.get('train_preds', ())) == 6
             if 'train_preds' in diag:
-                tr_m, tr_h, tr_my, tr_hy, tr_al = diag['train_preds']
-                tr_rho_m = _safe_rho(tr_my[tr_al], tr_m[tr_al]) if tr_al.any() else 0.0
-                tr_rho_h = _safe_rho(tr_hy[tr_al], tr_h[tr_al]) if tr_al.any() else 0.0
+                if single_target:
+                    tr_m, tr_h, tr_my, tr_hy, tr_al, tr_tgt = diag['train_preds']
+                    tr_al_m = tr_al & (tr_tgt == 0)
+                    tr_al_h = tr_al & (tr_tgt == 1)
+                else:
+                    tr_m, tr_h, tr_my, tr_hy, tr_al = diag['train_preds']
+                    tr_al_m = tr_al_h = tr_al
+                tr_rho_m = _safe_rho(tr_my[tr_al_m], tr_m[tr_al_m]) if tr_al_m.any() else 0.0
+                tr_rho_h = _safe_rho(tr_hy[tr_al_h], tr_h[tr_al_h]) if tr_al_h.any() else 0.0
             else:
                 tr_rho_m = tr_rho_h = 0.0
 
@@ -263,8 +275,20 @@ class Trainer:
             nn_mask = val_mask & (~is_pv_mask)
             pv_mask = val_mask & is_pv_mask
 
-            rho_mod = _safe_rho(val_mod_y[nn_mask], val_mod[nn_mask]) if nn_mask.any() else 0.0
-            rho_head = _safe_rho(val_head_y[nn_mask], val_head[nn_mask]) if nn_mask.any() else 0.0
+            if self.cfg.targets:
+                # Single-target mode: each head only has ground truth on the
+                # rows that routed to it, so restrict each rho to its target.
+                trg = np.array([0 if r.get('target') == 'mod'
+                                else (1 if r.get('target') == 'head'
+                                      else 2) for r in self._val_rows])
+                nn_mod_mask = val_mask & (~is_pv_mask) & (trg == 0)
+                nn_head_mask = val_mask & (~is_pv_mask) & (trg == 1)
+                pv_mask = val_mask & is_pv_mask & (trg == 2)
+            else:
+                nn_mod_mask = nn_head_mask = nn_mask
+
+            rho_mod = _safe_rho(val_mod_y[nn_mod_mask], val_mod[nn_mod_mask]) if nn_mod_mask.any() else 0.0
+            rho_head = _safe_rho(val_head_y[nn_head_mask], val_head[nn_head_mask]) if nn_head_mask.any() else 0.0
 
             rho_pv = _safe_rho(val_mod_y[pv_mask], val_pv[pv_mask]) if pv_mask.any() else 0.0
 
@@ -314,11 +338,18 @@ class Trainer:
 
             if rho_mean > best_rho:
                 best_rho, best_epoch, no_improve_epochs = rho_mean, epoch + 1, 0
+                if self.cfg.targets:
+                    sel_mod = val_mask & (np.array([r.get('target') == 'mod' for r in self._val_rows]) if self._val_rows else np.zeros(len(val_mod), dtype=bool))
+                    sel_head = val_mask & (np.array([r.get('target') == 'head' for r in self._val_rows]) if self._val_rows else np.zeros(len(val_mod), dtype=bool))
+                    sel_pv = val_mask & (np.array([r.get('target') == 'pv' for r in self._val_rows]) if self._val_rows else np.zeros(len(val_mod), dtype=bool))
+                else:
+                    sel_mod = sel_head = val_mask & (~is_pv_mask)
+                    sel_pv = val_mask & is_pv_mask
                 best = {
-                    'mod': val_mod[val_mask].copy() if val_mask.any() else np.array([]),
-                    'head': val_head[val_mask].copy() if val_mask.any() else np.array([]),
-                    'mod_y': val_mod_y[val_mask].copy() if val_mask.any() else np.array([]),
-                    'head_y': val_head_y[val_mask].copy() if val_mask.any() else np.array([]),
+                    'mod': val_mod[sel_mod].copy() if sel_mod.any() else np.array([]),
+                    'head': val_head[sel_head].copy() if sel_head.any() else np.array([]),
+                    'mod_y': val_mod_y[sel_mod].copy() if sel_mod.any() else np.array([]),
+                    'head_y': val_head_y[sel_head].copy() if sel_head.any() else np.array([]),
                     'rho_mod': rho_mod, 'rho_head': rho_head, 'rho_pv': rho_pv,
                 }
                 torch.save(model.state_dict(), ckpt_path)

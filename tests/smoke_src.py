@@ -497,6 +497,114 @@ def check_fixes() -> None:
         print('  [SKIP] torch not installed; GaussHead / gauss_kl numerical checks skipped')
 
 
+def check_targets() -> None:
+    print('=== 8. SINGLE-TARGET WIRING (targets module, expansion, routing) ===')
+    sys.path.insert(0, str(ROOT))
+
+    import src.data as D
+    import src.train as T
+    import src.trainer as TR
+    from src.targets import TARGETS, target_code, row_targets, target_selector, pool_span
+
+    # target_code accepts both names and integer codes
+    check(target_code('mod') == 0 and target_code('head') == 1 and target_code('pv') == 2,
+          'target_code: names map to 0/1/2')
+    check(target_code(0) == 0 and target_code(1) == 1 and target_code(2) == 2,
+          'target_code: integer codes round-trip identity')
+    try:
+        target_code('bogus')
+        check(False, 'target_code rejects unknown names')
+    except ValueError:
+        check(True, 'target_code rejects unknown names')
+    try:
+        target_code(9)
+        check(False, 'target_code rejects out-of-range codes')
+    except ValueError:
+        check(True, 'target_code rejects out-of-range codes')
+
+    # row_targets: None when absent, int codes when a tensor is supplied
+    check(row_targets({}) is None, 'row_targets -> None when no target field')
+    import torch as _torch
+    check(row_targets({'target': _torch.tensor([0, 1, 2])}) == [0, 1, 2],
+          'row_targets converts a long tensor to a list of codes')
+
+    # target_selector: bool row masks + None passthrough for joint mode
+    sel_mod = target_selector([0, 1, 2], 'mod')
+    check(bool(_torch.equal(sel_mod, _torch.tensor([True, False, False]))),
+          'target_selector picks rows of one target')
+    check(target_selector(None, 'mod') is None, 'target_selector -> None for joint mode')
+
+    # pool_span: masked mean over the active span; PV pools mod|head
+    # hidden shape: (batch=2, seq_len=6, hidden_dim=4)
+    hidden = _torch.arange(48, dtype=_torch.float).reshape(2, 6, 4)
+    modm = _torch.tensor([[1, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]], dtype=_torch.bool)
+    headm = _torch.tensor([[0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 1, 1]], dtype=_torch.bool)
+    batch = {'mod_span_mask': modm, 'head_span_mask': headm}
+    pmod = pool_span(hidden, batch, 'mod')
+    phead = pool_span(hidden, batch, 'head')
+    ppv = pool_span(hidden, batch, 'pv')
+    check(pmod.shape == (2, 4) and phead.shape == (2, 4) and ppv.shape == (2, 4),
+          'pool_span returns one (hidden,) vector per row for every target')
+    check(bool(_torch.allclose(pmod[0], hidden[0, 0:2, :].mean(dim=0))),
+          'pool_span(mod) averages the modifier tokens')
+    check(bool(_torch.allclose(phead[0], hidden[0, 2:4, :].mean(dim=0))),
+          'pool_span(head) averages the head tokens')
+    check(bool(_torch.allclose(ppv[0], hidden[0, 0:4, :].mean(dim=0))),
+          'pool_span(pv) averages mod|head union')
+    check(bool(_torch.allclose(ppv[1], hidden[1, 4:6, :].mean(dim=0))),
+          'pool_span(pv) on PV-only row is well-defined')
+
+    # expand_targets: NN rows -> mod+head; PV rows -> pv; nothing else
+    nn = {'is_pv': False, 'mod_avg': 3.5, 'head_avg': 3.8, 'has_label': True,
+          'compound': 'flea market', 'mod': 'flea', 'head': 'market'}
+    pv = {'is_pv': True, 'mod_avg': 0.3, 'has_label': True,
+          'compound': 'crack down', 'mod': 'crack', 'head': 'down'}
+    fid = float('nan')
+    nnn = dict(nn, mod_avg=fid, head_avg=3.0)
+    full = D.expand_targets([nn, pv, nnn], ['mod', 'head', 'pv'])
+    labels = [(r['target'], bool(r['has_label'])) for r in full]
+    check(labels == [('mod', True), ('head', True),
+                     ('pv', True),
+                     ('mod', False), ('head', True)],
+          'expand_targets drops invalid target rows and recomputes has_label')
+    check(D.expand_targets([nn], []) == [nn], 'expand_targets with empty targets is a no-op')
+    try:
+        import numpy as _np
+        check(bool(_np.isfinite(full[0]['mod_avg'])),
+              'expand_targets: labeled nn mod-target row keeps its finite label')
+        check(not _np.isfinite(full[3]['mod_avg']) and full[3]['has_label'] is False,
+              'expand_targets: unlabeled mod-target row keeps NaN and has_label=False')
+    except ImportError:
+        print('  [SKIP] numpy unavailable; NaN passthrough check skipped')
+
+    # trainer expands rows in _build_loaders (source guard instead of GPU run)
+    tr_src = (ROOT / 'src' / 'trainer.py').read_text(encoding='utf-8')
+    check('expand_targets(train_rows' in tr_src and 'expand_targets(val_rows' in tr_src,
+          '_build_loaders expands train/val rows via expand_targets')
+    check("'target' in batch" in tr_src.replace(' ', '') or 'target' in tr_src,
+          'trainer dispatches on batch[target] when present')
+
+    # train_epoch gates each loss by its own target
+    t_src = (ROOT / 'src' / 'train.py').read_text(encoding='utf-8')
+    check("mod_mask = allowed_nn & (tgt == 0)" in t_src
+          and "head_mask = allowed_nn & (tgt == 1)" in t_src
+          and "pv_mask = allowed_pv & (tgt == 2)" in t_src,
+          'train_epoch gates mod/head/pv losses by per-row target')
+
+    # model routing: inactive heads are zeroed (source guard in model_combined)
+    m_src = (ROOT / 'src' / 'model_combined.py').read_text(encoding='utf-8')
+    check('torch.where(target_selector' in m_src
+          and 'torch.zeros_like' in m_src,
+          'CombinedBackboneModel zeroes inactive-head predictions via torch.where')
+
+    # collate stacks the scalar target key
+    d_src = (ROOT / 'src' / 'data.py').read_text(encoding='utf-8')
+    check("item['target'] = torch.tensor(_TARGET_CODE" in d_src,
+          'CompDataset encodes target as a scalar long tensor')
+    check("'target'" in d_src.replace(' ', '') and 'torch.stack' in d_src,
+          'collate_comp stacks scalar keys (incl. target)')
+
+
 def main() -> int:
     sync_parse()
     check_config()
@@ -505,6 +613,7 @@ def main() -> int:
     check_data()
     check_folds()
     check_fixes()
+    check_targets()
 
     print('=' * 50)
     if FAILURES:

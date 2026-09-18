@@ -16,9 +16,11 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 Mode = Literal['train80']
 RankMarginMode = Literal['clamp', 'dynamic']
+ModelBackend = Literal['exits', 'combined']
 
 _MODES = ('train80',)
 _RANK_MARGIN_MODES = ('clamp', 'dynamic')
+_MODEL_BACKENDS = ('exits', 'combined')
 
 
 @dataclass
@@ -32,6 +34,9 @@ class Config:
     # === model ===
     backbone: str = 'jhu-clsp/mmBERT-base'
     hidden_size: int = 768
+    # 'exits' = dedicated intermediate exits (src.model); 'combined' = final-layer
+    # readout fusing mod/head/context (src.model_combined).
+    model_backend: ModelBackend = 'exits'
     # Every output uses a dedicated intermediate exit. hidden_states[0] is the
     # embedding output, so 19/20/21,22 select transformer blocks 18/19/20,21.
     # The PV exit predicts one overall distribution from Base and Particle.
@@ -78,6 +83,12 @@ class Config:
     # === scoring phases (encoder frozen, then LoRA) ===
     freeze_epochs: int = 3
     lora_epochs: int = 9
+    # Per-sample active target (single-target prompt mode). Empty = joint
+    # training (mod + head + pv supervised as today). Non-empty expands the
+    # dataset to one row per listed target, each supervised on its own label:
+    #   ['mod'] -> ModAvg, ['head'] -> HeadAvg, ['pv'] -> Avg (PV rows only).
+    # List e.g. ['mod', 'head', 'pv'] for the 3N design.
+    targets: List[str] = field(default_factory=list)
     # A/B escape hatch: also fully unfreeze top layers from this index (0 = off)
     unfreeze_from_layer: int = 0
     # LoRA adapter used during scoring (fresh rank, trained on the spot)
@@ -188,6 +199,14 @@ class Config:
         if self.rank_margin_mode not in _RANK_MARGIN_MODES:
             errors.append(
                 f'rank_margin_mode must be one of {_RANK_MARGIN_MODES}, got {self.rank_margin_mode!r}'
+            )
+        if self.model_backend not in _MODEL_BACKENDS:
+            errors.append(
+                f'model_backend must be one of {_MODEL_BACKENDS}, got {self.model_backend!r}'
+            )
+        if not set(self.targets) <= {'mod', 'head', 'pv'}:
+            errors.append(
+                f'targets must be a subset of {{mod, head, pv}}, got {self.targets}'
             )
 
         if self.batch_size < 1:
