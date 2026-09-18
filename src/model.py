@@ -8,9 +8,9 @@ head noun are scored by ``GaussHead`` instances predicting ``(mu, sigma)``.
 
 Head input: per-exit cross-attended mod/head span embeddings (learned pooling)
 + mean-and-CLS context + a per-word literality ``cos(use, prototype)`` scalar,
-fused by ``OptimizedSpanFusion`` (no torch.cat) into one ``[B, H]`` vector.
+fused by ``SpanFusion`` (no torch.cat) into one ``[B, H]`` vector.
 
-``CrossSpanAttentionBlock`` and ``OptimizedSpanFusion`` are new, freshly-
+``CrossSpanAttentionBlock`` and ``SpanFusion`` are new, freshly-
 initialized modules with nothing to fall back on but this task's own small
 training set. Both use learnable, **ones-initialized** gates (``alpha_attn`` /
 ``alpha_ffn``) on their attention/FFN contributions: at step 0 they are
@@ -143,7 +143,7 @@ class CrossSpanAttentionBlock(nn.Module):
     gathering the span positions first would be the efficient version if
     this ever becomes a bottleneck.
     """
-    def __init__(self, hidden: int = 768, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1):
+    def __init__(self, hidden: int = 768, num_heads: int = 2, ffn_expansion: int = 2, dropout: float = 0.1):
         super().__init__()
         self.mha = nn.MultiheadAttention(
             embed_dim=hidden,
@@ -166,19 +166,19 @@ class CrossSpanAttentionBlock(nn.Module):
 
     def forward(self, query_hidden: torch.Tensor, kv_hidden: torch.Tensor,
                 query_mask: torch.Tensor, kv_mask: torch.Tensor) -> torch.Tensor:
-        # --- STAGE 1: Cross-Attention (Multi-Head + Output Projection W_out) ---
+        
+        # --- STAGE 1: Cross-Attention ---
         # Key/value positions outside kv_mask get a FINITE additive penalty
-        # (-1e4), never -inf: key_padding_mask fills with -inf, and a row whose
-        # span is empty (fully masked) then softmaxes to NaN in both fp32 and
-        # fp16 and poisons the whole backward pass. -1e4 keeps those rows finite
-        # (near-uniform weights => harmless mean-fallback), matching the old
-        # greedy-guard behaviour while keeping the fused CUDA/Flash paths valid.
+        # (-1e4), never -inf: a fully-masked row then softmaxes to near-uniform
+        # weights (harmless mean-fallback) instead of NaN in fp32 or fp16.
+        # MHA accepts 2-D/3-D masks only, so build the per-head form
+        # (B * num_heads, Tq, Tk) by expanding the per-batch penalty over heads.
         q_len = query_hidden.size(1)
-        # per-head penalty: [1, 1, Tk] -> expand -> (B * num_heads, Tq, Tk)
-        penalty = (1.0 - kv_mask.unsqueeze(1).float()) * -1e4   # [B, 1, Tk]
+        penalty = (1.0 - kv_mask.unsqueeze(1).float()) * -1e4      # [B, 1, Tk]
         attn_mask = penalty.unsqueeze(0).expand(
             self.mha.num_heads, -1, q_len, -1
         ).reshape(query_hidden.size(0) * self.mha.num_heads, q_len, -1)
+
         attn_out, _ = self.mha(
             query=query_hidden,
             key=kv_hidden,
@@ -187,40 +187,26 @@ class CrossSpanAttentionBlock(nn.Module):
             need_weights=False,
         )
 
-        # Add & Norm (Residual 1) -- gated: starts at ~identity, learns to open up
+        # Add & Norm (Residual 1)
         x = self.norm1(query_hidden + self.alpha_attn * attn_out)
 
         # --- STAGE 2: Feed-Forward Network (FFN) ---
         ffn_out = self.ffn(x)
 
-        # Add & Norm (Residual 2) -- gated, same reasoning
+        # Add & Norm (Residual 2)
         x = self.norm2(x + self.alpha_ffn * ffn_out)
 
-        # Keep PAD tokens clean per query_mask
+        # Masking nhẹ nhàng ở cuối
         return x * query_mask.unsqueeze(-1)
 
-
-class OptimizedSpanFusion(nn.Module):
-    """Learned-query attention fusion, replacing ``torch.cat`` of the feature
-    bundle: mod span, head span, context mean, context CLS, and (if passed)
-    the literality scalar each become a role-tagged token, and one learned
-    query attends over them, collapsing to a single ``[B, H]`` vector.
-
-    ``alpha_attn``/``alpha_ffn`` (ones-init, learnable to shrink OR grow)
-    and ``ffn_expansion`` follow the same reasoning as
-    ``CrossSpanAttentionBlock`` -- see its docstring and the module-level one.
-    """
-    def __init__(self, hidden: int = 768, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1):
+class FusionBlock(nn.Module):
+    """Một khối Transformer Fusion đơn lẻ (Cross-Attn + FFN)"""
+    def __init__(self, hidden: int, num_heads: int, ffn_expansion: int, dropout: float):
         super().__init__()
-        # 1. Learned query
-        self.fuse_q = nn.Parameter(torch.randn(1, 1, hidden) * (hidden ** -0.5))
-
-        # 2. Multi-Head Attention (includes W_q, W_k, W_v, W_out)
         self.attn = nn.MultiheadAttention(embed_dim=hidden, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(hidden)
         self.alpha_attn = nn.Parameter(torch.ones(1))
 
-        # 3. Feed-Forward Network (FFN)
         self.ffn = nn.Sequential(
             nn.Linear(hidden, hidden * ffn_expansion),
             nn.GELU(),
@@ -231,31 +217,57 @@ class OptimizedSpanFusion(nn.Module):
         self.norm2 = nn.LayerNorm(hidden)
         self.alpha_ffn = nn.Parameter(torch.ones(1))
 
+    def forward(self, q: torch.Tensor, kv_toks: torch.Tensor) -> torch.Tensor:
+        # Cross-Attention
+        attn_out, _ = self.attn(query=q, key=kv_toks, value=kv_toks)
+        x = self.norm1(q + self.alpha_attn * attn_out)
+        # FFN
+        out = self.norm2(x + self.alpha_ffn * self.ffn(x))
+        return out
+
+class SpanFusion(nn.Module):
+    """Module Fusion nâng cấp hỗ trợ xếp chồng N Layer (Iterative Refinement)"""
+    def __init__(self, hidden: int = 768, num_heads: int = 4, ffn_expansion: int = 2, 
+                 dropout: float = 0.1, num_layers: int = 2):
+        super().__init__()
+        
+        # 1. Learned Query
+        self.fuse_q = nn.Parameter(torch.empty(1, 1, hidden))
+        nn.init.normal_(self.fuse_q, std=0.02)
+
+        # 2. Xếp chồng N Layer Fusion (Mặc định 2 layers)
+        self.layers = nn.ModuleList([
+            FusionBlock(hidden, num_heads, ffn_expansion, dropout)
+            for _ in range(num_layers)
+        ])
+
         # Scalar & Role embeddings
         self.scalar_embed = nn.Linear(1, hidden)
-        self.type_emb = nn.Parameter(torch.randn(5, hidden) * (hidden ** -0.5))
+        self.type_emb = nn.Parameter(torch.empty(5, hidden))
+        nn.init.normal_(self.type_emb, std=0.02)
 
-    def forward(self, mod, head, context, cos_=None):
+    def forward(self, mod: torch.Tensor, head: torch.Tensor, context: torch.Tensor, cos_: torch.Tensor = None) -> torch.Tensor:
         # --- Gather tokens ---
         ctx_mean, ctx_cls = context.chunk(2, dim=1)
         toks = [mod, head, ctx_mean, ctx_cls]
-        types = [0, 1, 2, 3]
+        type_ids = [0, 1, 2, 3]
+        
         if cos_ is not None:
             toks.append(self.scalar_embed(cos_))
-            types.append(4)
+            type_ids.append(4)
 
-        kv_toks = torch.stack(toks, dim=1) + self.type_emb[types]   # [B, T, 768]
-        q = self.fuse_q.expand(kv_toks.size(0), -1, -1)             # [B, 1, 768]
+        type_tensor = torch.tensor(type_ids, device=mod.device, dtype=torch.long)
+        kv_toks = torch.stack(toks, dim=1) + self.type_emb[type_tensor]   # [B, T, 768]
+        
+        # Bắt đầu với learned query khởi tạo
+        q = self.fuse_q.expand(kv_toks.size(0), -1, -1)                   # [B, 1, 768]
 
-        # --- STAGE 1: Cross-Attention ---
-        attn_out, _ = self.attn(query=q, key=kv_toks, value=kv_toks)   # [B, 1, 768]
-        x = self.norm1(q + self.alpha_attn * attn_out).squeeze(1)       # [B, 768]
+        # --- Pass qua N Fusion Layers ---
+        for layer in self.layers:
+            q = layer(q, kv_toks)                                         # q được "tinh lọc" qua từng layer
 
-        # --- STAGE 2: FFN ---
-        out = self.norm2(x + self.alpha_ffn * self.ffn(x))              # [B, 768]
-        return out
-
-
+        return q.squeeze(1)                                               # [B, 768]
+    
 # --------------------------------------------------------------------------- #
 # the model (gauss only)
 # --------------------------------------------------------------------------- #
@@ -293,7 +305,7 @@ class MMBertModel(nn.Module):
         # context mean/CLS, literalness scalar) collapse to ONE H-vector per
         # exit via the learned-query SpanFusion attention.
         self.head_in = hidden_size
-        self.fusion = OptimizedSpanFusion(hidden_size, dropout=dropout)
+        self.fusion = SpanFusion(hidden_size, dropout=dropout)
 
         # Token-level cross-attention between spans, shared across role exits.
         self.cross_attn = CrossSpanAttentionBlock(hidden_size, dropout=dropout)

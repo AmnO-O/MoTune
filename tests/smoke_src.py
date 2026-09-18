@@ -414,7 +414,7 @@ def check_fixes() -> None:
 
     # 3) proxy for the role-feature width: attention-fused vector + plain-AutoModel
     check('self.head_in = hidden_size' in model_src
-          and 'self.fusion = OptimizedSpanFusion' in model_src,
+          and 'self.fusion = SpanFusion' in model_src,
           'head_in is ONE fused attention vector per exit (no concat bundle)')
     check('from transformers import AutoModel' in model_src
           and 'AutoModelForMaskedLM' not in model_src
