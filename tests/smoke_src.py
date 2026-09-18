@@ -593,7 +593,8 @@ def check_targets() -> None:
 
     # model routing: inactive heads are zeroed (source guard in model_combined)
     m_src = (ROOT / 'src' / 'model_combined.py').read_text(encoding='utf-8')
-    check('torch.where(target_selector' in m_src
+    check('torch.where(select(' in m_src
+          and 'target_selector(targets, t)' in m_src
           and 'torch.zeros_like' in m_src,
           'CombinedBackboneModel zeroes inactive-head predictions via torch.where')
 

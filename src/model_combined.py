@@ -94,13 +94,16 @@ class CombinedBackboneModel(nn.Module):
             return (mus['mod'], mus['head'], mus['pv'],
                     sigmas['mod'], sigmas['head'], sigmas['pv'])
 
+        dev = mus['mod'].device
         zero = torch.zeros_like(mus['mod'])
-        mod_pred = torch.where(target_selector(targets, 'mod'), mus['mod'], zero)
-        head_pred = torch.where(target_selector(targets, 'head'), mus['head'], zero)
-        pv_pred = torch.where(target_selector(targets, 'pv'), mus['pv'], zero)
-        mod_sigma = torch.where(target_selector(targets, 'mod'), sigmas['mod'], zero)
-        head_sigma = torch.where(target_selector(targets, 'head'), sigmas['head'], zero)
-        pv_sigma = torch.where(target_selector(targets, 'pv'), sigmas['pv'], zero)
+        def select(t: str) -> torch.Tensor:
+            return target_selector(targets, t).to(dev)
+        mod_pred = torch.where(select('mod'), mus['mod'], zero)
+        head_pred = torch.where(select('head'), mus['head'], zero)
+        pv_pred = torch.where(select('pv'), mus['pv'], zero)
+        mod_sigma = torch.where(select('mod'), sigmas['mod'], zero)
+        head_sigma = torch.where(select('head'), sigmas['head'], zero)
+        pv_sigma = torch.where(select('pv'), sigmas['pv'], zero)
         return (mod_pred, head_pred, pv_pred,
                 mod_sigma, head_sigma, pv_sigma)
 
