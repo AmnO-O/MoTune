@@ -109,6 +109,60 @@ class CrossSpanAttention(nn.Module):
         return out * query_mask.unsqueeze(-1)
 
 
+import torch
+import torch.nn as nn
+
+class CrossSpanAttentionBlock(nn.Module):
+    """Full Transformer Cross-Attention Block with Multi-Head, FFN, and Residuals.
+    
+    Flow:
+    query_hidden ──┬──> Cross-MHA (Key/Val: kv_hidden) ──> (+) ──> LayerNorm ──┬──> FFN ──> (+) ──> LayerNorm ──> Masking
+                   └── (Residual 1) ──────────────────────┘                   └── (Residual 2) ──┘
+    """
+    def __init__(self, hidden: int = 768, num_heads: int = 8, ffn_expansion: int = 4, dropout: float = 0.1):
+        super().__init__()
+        # 1. PyTorch MultiheadAttention (Đã tích hợp W_q, W_k, W_v, W_out & FlashAttention)
+        self.mha = nn.MultiheadAttention(
+            embed_dim=hidden, 
+            num_heads=num_heads, 
+            dropout=dropout, 
+            batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(hidden)
+        
+        # 2. Position-wise Feed-Forward Network (FFN)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden, hidden * ffn_expansion),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden * ffn_expansion, hidden),
+            nn.Dropout(dropout)
+        )
+        self.norm2 = nn.LayerNorm(hidden)
+
+    def forward(self, query_hidden: torch.Tensor, kv_hidden: torch.Tensor,
+                query_mask: torch.Tensor, kv_mask: torch.Tensor) -> torch.Tensor:
+        # --- STAGE 1: Cross-Attention (Multi-Head + Output Projection W_out) ---
+        # key_padding_mask trong PyTorch MHA nhận giá trị True cho vị trí PAD (nên cần dùng ~kv_mask)
+        attn_out, _ = self.mha(
+            query=query_hidden,
+            key=kv_hidden,
+            value=kv_hidden,
+            key_padding_mask=~kv_mask
+        )
+        
+        # Add & Norm (Residual 1)
+        x = self.norm1(query_hidden + attn_out)
+        
+        # --- STAGE 2: Feed-Forward Network (FFN) ---
+        ffn_out = self.ffn(x)
+        
+        # Add & Norm (Residual 2)
+        x = self.norm2(x + ffn_out)
+        
+        # Giữ sạch các token PAD theo query_mask
+        return x * query_mask.unsqueeze(-1)
+    
 class SpanFusion(nn.Module):
     """Attention-based fusion replacing the concat feature bundle.
 
@@ -154,6 +208,50 @@ class SpanFusion(nn.Module):
         out = self.drop(torch.bmm(attn, v)).squeeze(1)   # [B, H]
         return self.norm(out)
 
+class OptimizedSpanFusion(nn.Module):
+    def __init__(self, hidden: int = 768, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        # 1. Query học được
+        self.fuse_q = nn.Parameter(torch.randn(1, 1, hidden) * (hidden ** -0.5))
+        
+        # 2. Multi-Head Attention tối ưu sẵn (Bao gồm W_q, W_k, W_v và W_out)
+        self.attn = nn.MultiheadAttention(embed_dim=hidden, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden)
+        
+        # 3. Feed-Forward Network (FFN)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden, hidden * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden * 4, hidden),
+            nn.Dropout(dropout)
+        )
+        self.norm2 = nn.LayerNorm(hidden)
+        
+        # Scalar & Role embeddings
+        self.scalar_embed = nn.Linear(1, hidden)
+        self.type_emb = nn.Parameter(torch.randn(5, hidden) * (hidden ** -0.5))
+
+    def forward(self, mod, head, context, cos_=None):
+        # --- Gom Tokens ---
+        ctx_mean, ctx_cls = context.chunk(2, dim=1)
+        toks = [mod, head, ctx_mean, ctx_cls]
+        types = [0, 1, 2, 3]
+        if cos_ is not None:
+            toks.append(self.scalar_embed(cos_))
+            types.append(4)
+            
+        kv_toks = torch.stack(toks, dim=1) + self.type_emb[types] # [B, 5, 768]
+        q = self.fuse_q.expand(kv_toks.size(0), -1, -1)          # [B, 1, 768]
+        
+        # --- STAGE 1: Cross-Attention (Đã tối ưu CUDA/FlashAttention) ---
+        attn_out, _ = self.attn(query=q, key=kv_toks, value=kv_toks) # [B, 1, 768]
+        x = self.norm1(q + attn_out).squeeze(1)                      # [B, 768]
+        
+        # --- STAGE 2: FFN ---
+        out = self.norm2(x + self.ffn(x))                             # [B, 768]
+        return out
+    
 
 # --------------------------------------------------------------------------- #
 # LoRA (inline, peft-free)
@@ -403,10 +501,10 @@ class MMBertModel(nn.Module):
         # context mean/CLS, literalness scalar) collapse to ONE H-vector per
         # exit via the learned-query SpanFusion attention.
         self.head_in = hidden_size
-        self.fusion = SpanFusion(hidden_size, dropout)
+        self.fusion = OptimizedSpanFusion(hidden_size, dropout)
 
         # Token-level cross-attention between spans, shared across role exits.
-        self.cross_attn = CrossSpanAttention(hidden_size, dropout)
+        self.cross_attn = CrossSpanAttentionBlock(hidden_size, dropout)
 
         self.mod_pool = SpanPool(hidden_size)
         self.head_role_pool = SpanPool(hidden_size)
@@ -494,6 +592,7 @@ class MMBertModel(nn.Module):
         pv_u, pv_v = self._span_pair(pv_hidden, batch)
 
         mod_exit_emb, head_exit_emb = mod_u, head_v
+
         cos_mod = self._prototype_cos(
             batch['input_ids'], batch['mod_span_mask'], mod_exit_emb)
         cos_head = self._prototype_cos(
