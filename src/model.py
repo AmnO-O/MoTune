@@ -70,48 +70,6 @@ class SpanPool(nn.Module):
         return self.attn(hidden, mask)
 
 
-class CrossSpanAttention(nn.Module):
-    """Single-head token-level cross-attention between two constituent spans.
-
-    Each token of the query span attends over the key/value span, so the two
-    constituents interact BEFORE either is collapsed to a single vector. One
-    module (shared weights) serves every role exit; the direction is chosen by
-    which span you pass as ``query_hidden``. Output token vectors are masked to
-    the query span so the downstream attention pool stays honest.
-    """
-
-    def __init__(self, hidden: int, dropout: float = 0.0):
-        super().__init__()
-        self.q = nn.Linear(hidden, hidden)
-        self.k = nn.Linear(hidden, hidden)
-        self.v = nn.Linear(hidden, hidden)
-        self.norm = nn.LayerNorm(hidden)
-        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.scale = hidden ** -0.5
-
-    def forward(self, query_hidden: torch.Tensor, kv_hidden: torch.Tensor,
-                query_mask: torch.Tensor, kv_mask: torch.Tensor) -> torch.Tensor:
-        q = self.q(query_hidden)
-        k = self.k(kv_hidden)
-        v = self.v(kv_hidden)
-        scores = torch.bmm(q, k.transpose(-1, -2)) * self.scale
-        # -1e4 guards FP16 underflow to -inf (NaN softmax), like AttentionPool.
-        scores = scores.masked_fill(~kv_mask.unsqueeze(1), -1e4)
-        attn = F.softmax(scores, dim=-1)
-        # Rows with no kv-span tokens stay at zero attention (no NaN in backward).
-        has_kv = kv_mask.any(-1, keepdim=True).unsqueeze(1)
-        attn = torch.where(has_kv, attn, torch.zeros_like(attn))
-        out = self.drop(torch.bmm(attn, v))
-        # Residual keeps the query token's own identity in the pooled
-        # representation (a plain attended vector is a pure function of the
-        # OTHER span and loses the literal/self signal), then LayerNorm.
-        out = self.norm(out + query_hidden)
-        return out * query_mask.unsqueeze(-1)
-
-
-import torch
-import torch.nn as nn
-
 class CrossSpanAttentionBlock(nn.Module):
     """Full Transformer Cross-Attention Block with Multi-Head, FFN, and Residuals.
     
@@ -143,12 +101,24 @@ class CrossSpanAttentionBlock(nn.Module):
     def forward(self, query_hidden: torch.Tensor, kv_hidden: torch.Tensor,
                 query_mask: torch.Tensor, kv_mask: torch.Tensor) -> torch.Tensor:
         # --- STAGE 1: Cross-Attention (Multi-Head + Output Projection W_out) ---
-        # key_padding_mask trong PyTorch MHA nhận giá trị True cho vị trí PAD (nên cần dùng ~kv_mask)
+        # Key/value positions outside kv_mask get a FINITE additive penalty
+        # (-1e4), never -inf: key_padding_mask fills with -inf, and a row whose
+        # span is empty (fully masked) then softmaxes to NaN in both fp32 and
+        # fp16 and poisons the whole backward pass. -1e4 keeps those rows finite
+        # (near-uniform weights => harmless mean-fallback), matching the old
+        # greedy-guard behaviour while keeping the fused CUDA/Flash paths valid.
+        q_len = query_hidden.size(1)
+        # per-head penalty: [1, 1, Tk] -> expand -> (B * num_heads, Tq, Tk)
+        penalty = (1.0 - kv_mask.unsqueeze(1).float()) * -1e4   # [B, 1, Tk]
+        attn_mask = penalty.unsqueeze(0).expand(
+            self.mha.num_heads, -1, q_len, -1
+        ).reshape(query_hidden.size(0) * self.mha.num_heads, q_len, -1)
         attn_out, _ = self.mha(
             query=query_hidden,
             key=kv_hidden,
             value=kv_hidden,
-            key_padding_mask=~kv_mask
+            attn_mask=attn_mask,
+            need_weights=False,
         )
         
         # Add & Norm (Residual 1)
@@ -162,51 +132,6 @@ class CrossSpanAttentionBlock(nn.Module):
         
         # Giữ sạch các token PAD theo query_mask
         return x * query_mask.unsqueeze(-1)
-    
-class SpanFusion(nn.Module):
-    """Attention-based fusion replacing the concat feature bundle.
-
-    The pooled span pair (already cross-attended), the context mean/CLS, and the
-    literalness scalar become ~5 role-tagged ``H``-tokens that a single learned
-    query token attends over, collapsing to ONE fused ``[B, H]`` vector per
-    exit. There is deliberately no ``torch.cat`` anywhere in this path, so the
-    "simple concat" that forced all span x context interactions into one Linear
-    of the GaussHead is gone.
-    """
-
-    def __init__(self, hidden: int, dropout: float = 0.0):
-        super().__init__()
-        self.fuse_q = nn.Parameter(torch.zeros(1, 1, hidden))
-        self.k_proj = nn.Linear(hidden, hidden)
-        self.v_proj = nn.Linear(hidden, hidden)
-        # role tags: 0 mod-span, 1 head-span, 2 ctx-mean, 3 ctx-CLS, 4 cos
-        self.type_emb = nn.Parameter(torch.randn(5, hidden) * hidden ** -0.5)
-        self.scalar_embed = nn.Linear(1, hidden)
-        self.norm = nn.LayerNorm(hidden)
-        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.scale = hidden ** -0.5
-        nn.init.normal_(self.fuse_q, std=hidden ** -0.5)
-
-    def forward(self, mod: torch.Tensor, head: torch.Tensor,
-                context: torch.Tensor,
-                cos_: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # context is [B, 2H] = (mean, CLS) halves; split them into two tokens.
-        ctx_mean, ctx_cls = context.chunk(2, dim=1)
-        toks = [mod, head, ctx_mean, ctx_cls]
-        types = [0, 1, 2, 3]
-        if cos_ is not None:
-            toks.append(self.scalar_embed(cos_))
-            types.append(4)
-        toks = torch.stack(toks, dim=1)               # [B, T, H]
-        toks = toks + self.type_emb[types]            # role tag per token
-        q = self.fuse_q                                # [1, 1, H]
-        k = self.k_proj(toks)
-        v = self.v_proj(toks)
-        scores = torch.bmm(q.expand(toks.size(0), 1, k.size(-1)),
-                           k.transpose(-1, -2))          # [B, 1, T]
-        attn = torch.softmax(scores * self.scale, dim=-1)
-        out = self.drop(torch.bmm(attn, v)).squeeze(1)   # [B, H]
-        return self.norm(out)
 
 class OptimizedSpanFusion(nn.Module):
     def __init__(self, hidden: int = 768, num_heads: int = 8, dropout: float = 0.1):
@@ -501,10 +426,10 @@ class MMBertModel(nn.Module):
         # context mean/CLS, literalness scalar) collapse to ONE H-vector per
         # exit via the learned-query SpanFusion attention.
         self.head_in = hidden_size
-        self.fusion = OptimizedSpanFusion(hidden_size, dropout)
+        self.fusion = OptimizedSpanFusion(hidden_size, dropout=dropout)
 
         # Token-level cross-attention between spans, shared across role exits.
-        self.cross_attn = CrossSpanAttentionBlock(hidden_size, dropout)
+        self.cross_attn = CrossSpanAttentionBlock(hidden_size, dropout=dropout)
 
         self.mod_pool = SpanPool(hidden_size)
         self.head_role_pool = SpanPool(hidden_size)
