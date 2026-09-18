@@ -323,9 +323,9 @@ class MMBertModel(nn.Module):
 
         self.mod_pool = SpanPool(hidden_size)
         self.head_role_pool = SpanPool(hidden_size)
-        self.mod_gauss = GaussHead(self.head_in, head_hidden, dropout)
-        self.head_gauss = GaussHead(self.head_in, head_hidden, dropout)
-        self.pv_gauss = GaussHead(self.head_in, head_hidden, dropout)
+        self.mod_gauss = GaussHead(self.head_in, head_hidden, dropout=dropout)
+        self.head_gauss = GaussHead(self.head_in, head_hidden, dropout=dropout)
+        self.pv_gauss = GaussHead(self.head_in, head_hidden, dropout=dropout)
 
     # ------------------------------------------------------------------ #
     def _prototype_cos(self, input_ids: torch.Tensor, span_mask: torch.Tensor,
