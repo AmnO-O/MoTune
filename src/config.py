@@ -50,8 +50,8 @@ class Config:
     # embedding row of its own tokens. High = word keeps its literal meaning in
     # context (e.g. "market" in "flea market"); low = drift/lexicalised (e.g.
     # "tower" in "ivory tower"). The cos becomes one role-tagged token of the
-    # SpanFusion attention (always on, no knob), alongside the span pair, the
-    # context mean/CLS, and the two length fractions.
+    # SpanFusion attention (always on, no knob), alongside the span pair and the
+    # context mean/CLS.
 
     # === data / paths (filenames are resolved under data_path) ===
     data_path: Optional[str] = None

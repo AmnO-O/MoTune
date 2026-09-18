@@ -421,10 +421,11 @@ def check_fixes() -> None:
           and '_lm_span_stats' not in model_src
           and 'use_lm_features' not in model_src,
           'backbone is a plain AutoModel; LM-predictability stats dropped (no [MASK])')
-    check('def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,'
+    check('def _compose_gauss_feat(self, mod_emb, head_emb, context_emb,'
           in model_src and 'lm_stats' not in model_src
-          and 'return self.fusion(mod_emb, head_emb, context_emb, mod_len, head_len, cos_)' in model_src,
-          '_compose_gauss_feat fuses via SpanFusion attention (no lm_stats/cat plumbing)')
+          and 'mod_len, head_len' not in model_src
+          and 'return self.fusion(mod_emb, head_emb, context_emb, cos_)' in model_src,
+          'SpanFusion fuses span pair + context mean/CLS + cos (lengths removed, no cat)')
     check('tok = F.embedding(input_ids, weight)' in model_src,
           '_prototype_cos uses F.embedding (not manual index_select)')
     check('proto_safe = torch.where(has_span, proto, torch.ones_like(proto))' in model_src,

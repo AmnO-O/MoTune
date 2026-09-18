@@ -112,12 +112,12 @@ class CrossSpanAttention(nn.Module):
 class SpanFusion(nn.Module):
     """Attention-based fusion replacing the concat feature bundle.
 
-    The pooled span pair (already cross-attended), the context CLS/mean, and the
-    length + literalness scalars become ~7 role-tagged ``H``-tokens that a single
-    learned query token attends over, collapsing to ONE fused ``[B, H]`` vector
-    per exit. There is deliberately no ``torch.cat`` anywhere in this path, so
-    the "simple concat" that forced all span x context interactions into one
-    Linear of the GaussHead is gone.
+    The pooled span pair (already cross-attended), the context mean/CLS, and the
+    literalness scalar become ~5 role-tagged ``H``-tokens that a single learned
+    query token attends over, collapsing to ONE fused ``[B, H]`` vector per
+    exit. There is deliberately no ``torch.cat`` anywhere in this path, so the
+    "simple concat" that forced all span x context interactions into one Linear
+    of the GaussHead is gone.
     """
 
     def __init__(self, hidden: int, dropout: float = 0.0):
@@ -125,9 +125,8 @@ class SpanFusion(nn.Module):
         self.fuse_q = nn.Parameter(torch.zeros(1, 1, hidden))
         self.k_proj = nn.Linear(hidden, hidden)
         self.v_proj = nn.Linear(hidden, hidden)
-        # role tags: 0 mod-span, 1 head-span, 2 ctx-mean, 3 ctx-CLS,
-        #             4 len-mod, 5 len-head, 6 literalness cos
-        self.type_emb = nn.Parameter(torch.randn(7, hidden) * hidden ** -0.5)
+        # role tags: 0 mod-span, 1 head-span, 2 ctx-mean, 3 ctx-CLS, 4 cos
+        self.type_emb = nn.Parameter(torch.randn(5, hidden) * hidden ** -0.5)
         self.scalar_embed = nn.Linear(1, hidden)
         self.norm = nn.LayerNorm(hidden)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -135,16 +134,15 @@ class SpanFusion(nn.Module):
         nn.init.normal_(self.fuse_q, std=hidden ** -0.5)
 
     def forward(self, mod: torch.Tensor, head: torch.Tensor,
-                context: torch.Tensor, len_mod: torch.Tensor, len_head: torch.Tensor,
+                context: torch.Tensor,
                 cos_: Optional[torch.Tensor] = None) -> torch.Tensor:
         # context is [B, 2H] = (mean, CLS) halves; split them into two tokens.
         ctx_mean, ctx_cls = context.chunk(2, dim=1)
-        toks = [mod, head, ctx_mean, ctx_cls,
-                self.scalar_embed(len_mod), self.scalar_embed(len_head)]
-        types = [0, 1, 2, 3, 4, 5]
+        toks = [mod, head, ctx_mean, ctx_cls]
+        types = [0, 1, 2, 3]
         if cos_ is not None:
             toks.append(self.scalar_embed(cos_))
-            types.append(6)
+            types.append(4)
         toks = torch.stack(toks, dim=1)               # [B, T, H]
         toks = toks + self.type_emb[types]            # role tag per token
         q = self.fuse_q                                # [1, 1, H]
@@ -402,8 +400,8 @@ class MMBertModel(nn.Module):
         object.__setattr__(self, 'base_model', self.lm)
 
         # No concat feature bundle: the fused pieces (cross-attended span pair,
-        # context mean/CLS, length + literalness scalars) collapse to ONE
-        # H-vector per exit via the learned-query SpanFusion attention.
+        # context mean/CLS, literalness scalar) collapse to ONE H-vector per
+        # exit via the learned-query SpanFusion attention.
         self.head_in = hidden_size
         self.fusion = SpanFusion(hidden_size, dropout)
 
@@ -466,13 +464,13 @@ class MMBertModel(nn.Module):
         return (self.mod_pool(mod_tok, mod_mask),
                 self.head_role_pool(head_tok, head_mask))
 
-    def _compose_gauss_feat(self, mod_emb, head_emb, mod_len, head_len,
-                            context_emb, cos_=None) -> torch.Tensor:
+    def _compose_gauss_feat(self, mod_emb, head_emb, context_emb,
+                            cos_=None) -> torch.Tensor:
         """Attention-fused feature vector (no torch.cat): the cross-attended
-        span pair, the context mean/CLS, and the length + literalness scalars
-        become role-tagged tokens of one learned-query SpanFusion attention,
+        span pair, the context mean/CLS, and the literalness scalar become
+        role-tagged tokens of one learned-query SpanFusion attention,
         collapsing to a single ``[B, H]`` vector."""
-        return self.fusion(mod_emb, head_emb, context_emb, mod_len, head_len, cos_)
+        return self.fusion(mod_emb, head_emb, context_emb, cos_)
 
     def _features(self, batch):
         """Build one feature bundle per dedicated Gaussian exit."""
@@ -483,10 +481,6 @@ class MMBertModel(nn.Module):
         )
         hid_all = outputs.hidden_states
         n_layers = len(hid_all)
-
-        seq_len = batch['attention_mask'].sum(dim=1).clamp(min=1.0).float()
-        mod_len = (batch['mod_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
-        head_len = (batch['head_span_mask'].float().sum(dim=1) / seq_len).unsqueeze(-1)
 
         mod_hidden = self._role_hidden(
             tuple(i % n_layers for i in self.gauss_ctx_mod), hid_all)
@@ -508,11 +502,11 @@ class MMBertModel(nn.Module):
             self._prototype_cos(batch['input_ids'], batch['mod_span_mask'], pv_u)
             + self._prototype_cos(batch['input_ids'], batch['head_span_mask'], pv_v))
         mod_feat = self._compose_gauss_feat(
-            mod_u, mod_v, mod_len, head_len, self._context_emb(mod_hidden, batch), cos_mod)
+            mod_u, mod_v, self._context_emb(mod_hidden, batch), cos_mod)
         head_feat = self._compose_gauss_feat(
-            head_u, head_v, mod_len, head_len, self._context_emb(head_hidden, batch), cos_head)
+            head_u, head_v, self._context_emb(head_hidden, batch), cos_head)
         pv_feat = self._compose_gauss_feat(
-            pv_u, pv_v, mod_len, head_len, self._context_emb(pv_hidden, batch), cos_pv)
+            pv_u, pv_v, self._context_emb(pv_hidden, batch), cos_pv)
 
         return mod_feat, head_feat, pv_feat, mod_exit_emb, head_exit_emb, pv_u, pv_v
 
