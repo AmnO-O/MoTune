@@ -702,6 +702,10 @@ def check_targets() -> None:
           and "mu, sigma = self.gauss(pool)" in m_src,
           'fast path pools each row OWN span once and runs the shared head once')
 
+    # target_prefix must not crash on predict/joint batches (no target key)
+    check("if self.target_prefix and 'target' in batch:" in m_src,
+          'marker injection gated on batch[target] so predict/joint mode is safe')
+
     # config: build_combined_model forwards both flags
     check("target_prefix=bool(getattr(cfg, 'target_prefix', False))" in m_src
           and "static_span=bool(getattr(cfg, 'static_span', False))" in m_src,

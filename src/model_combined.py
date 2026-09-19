@@ -209,7 +209,11 @@ class CombinedBackboneModel(nn.Module):
                 mod_sigma, head_sigma, pv_sigma)
 
     def _forward_gauss(self, batch, with_logits: bool = False, with_pv: bool = False):
-        if self.target_prefix:
+        # Marker injection requires per-row targets in the batch. Predict/joint
+        # batches (no ``target`` key) fall back to the plain token path even
+        # when ``target_prefix`` is on -- the per-target marker is only ever
+        # inserted into the input by the dataset for single-target rows.
+        if self.target_prefix and 'target' in batch:
             emb = self.lm.get_input_embeddings()
             hidden_states = emb(batch['input_ids'])
             hidden_states = hidden_states.clone()
