@@ -3,15 +3,20 @@
   "backbone": "jhu-clsp/mmBERT-base",
   "targets": ["mod", "head", "pv"],
   "max_context_length": 256,
+
   "mlm_epochs": 3,
   "mlm_lr": 5e-5,
   "mlm_mask_prob": 0.8,
   "mlm_from_layer": 18,
   "mlm_output_dir": "checkpoints/prefix_mlm_adapted",
+
+  "mlm_batch_size": 16,
+
   "lora_rank": 8,
   "lora_alpha": 16,
   "lora_dropout": 0.1,
   "lora_targets": ["Wqkv", "Wo"],
+
   "batch_size": 32,
   "accum_steps": 1,
   "num_workers": 2,

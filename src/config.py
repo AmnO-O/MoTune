@@ -150,6 +150,10 @@ class Config:
     mlm_mask_prob: float = 0.8
     mlm_from_layer: int = 18
     mlm_output_dir: Optional[str] = None
+    # Separate batch size for Stage 1 MLM (smaller to fit 14 GB VRAM with
+    # the full ModernBERT + gradient checkpointing). If 0, falls back to
+    # cfg.batch_size.
+    mlm_batch_size: int = 16
 
     # === optimization ===
     batch_size: int = 32
