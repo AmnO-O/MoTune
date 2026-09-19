@@ -378,6 +378,9 @@ def coerce_value(name: str, raw: Any, cfg: type = Config) -> Any:
         return raw
     type_ = f.type
     if 'List' in type_ or 'list' in type_ or 'Tuple' in type_ or 'tuple' in type_:
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] in ('[', '(') and raw[-1] in (']', ')'):
+            raw = raw[1:-1]
         return [x.strip() for x in raw.split(',') if x.strip()]
     if type_ == 'int':
         return int(raw)
