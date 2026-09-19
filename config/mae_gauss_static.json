@@ -15,7 +15,7 @@
     "lora_rank": 8,
     "lora_alpha": 16,
     "lora_from_layer": 18,
-    "batch_size": 32,
+    "batch_size": 64,
     "accum_steps": 1,
     "num_workers": 0,
     "head_lr": 2e-4,

@@ -330,6 +330,7 @@ class CompDataset(_DatasetBase):
 
         mod_span_mask = _span_mask(result.mod, length)
         head_span_mask = _span_mask(result.head, length)
+        prefix_mask = torch.zeros(length, dtype=torch.bool)
 
         if self.target_prefix and r.get('target') is not None and r['target'] in MARKER_CODE:
             t = r['target']
@@ -350,11 +351,15 @@ class CompDataset(_DatasetBase):
             prefix_tok = torch.tensor(prefix_ids, dtype=input_ids.dtype)
             prefix_attn = torch.ones(k, dtype=attention_mask.dtype)
             prefix_span = torch.zeros(k, dtype=torch.bool)
+            prefix_word = torch.zeros(k, dtype=torch.bool)
+            if word_ids:
+                prefix_word[1:1 + len(word_ids)] = True
 
             input_ids = torch.cat([input_ids[:1], prefix_tok, input_ids[1:]])[:self.max_len]
             attention_mask = torch.cat([attention_mask[:1], prefix_attn, attention_mask[1:]])[:self.max_len]
             mod_span_mask = torch.cat([mod_span_mask[:1], prefix_span, mod_span_mask[1:]])[:self.max_len]
             head_span_mask = torch.cat([head_span_mask[:1], prefix_span, head_span_mask[1:]])[:self.max_len]
+            prefix_mask = torch.cat([prefix_mask[:1], prefix_word, prefix_mask[1:]])[:self.max_len]
         elif self.span_markers and r.get('target') is not None and r['target'] in MARKER_CODE:
             # Border markers (ids spliced, NOT strings): wrap the row's own
             # target span with a single unused id that both opens and closes --
@@ -377,16 +382,19 @@ class CompDataset(_DatasetBase):
                     attention_mask = _splice(attention_mask, pos, 1)
                     mod_span_mask = _splice(mod_span_mask, pos, False)
                     head_span_mask = _splice(head_span_mask, pos, False)
+                    prefix_mask = _splice(prefix_mask, pos, False)
                 input_ids = input_ids[:self.max_len]
                 attention_mask = attention_mask[:self.max_len]
                 mod_span_mask = mod_span_mask[:self.max_len]
                 head_span_mask = head_span_mask[:self.max_len]
+                prefix_mask = prefix_mask[:self.max_len]
 
         item = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'mod_span_mask': mod_span_mask,
             'head_span_mask': head_span_mask,
+            'prefix_mask': prefix_mask,
             'has_mod': torch.tensor(result.mod.start is not None, dtype=torch.bool),
             'has_head': torch.tensor(result.head.start is not None, dtype=torch.bool),
             'degenerate': torch.tensor(result.degenerate, dtype=torch.bool),
@@ -448,7 +456,8 @@ class CompDataset(_DatasetBase):
 # --------------------------------------------------------------------------- #
 def collate_comp(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
-    seq_keys = ('input_ids', 'attention_mask', 'mod_span_mask', 'head_span_mask')
+    seq_keys = ('input_ids', 'attention_mask', 'mod_span_mask', 'head_span_mask',
+                'prefix_mask')
     for key in batch[0]:
         if key in seq_keys:
             length = max(int(b[key].size(0)) for b in batch)

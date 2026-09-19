@@ -17,10 +17,12 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 Mode = Literal['train80']
 RankMarginMode = Literal['clamp', 'dynamic']
 ModelBackend = Literal['exits', 'combined']
+PrefixReadout = Literal['context', 'prefix', 'dual']
 
 _MODES = ('train80',)
 _RANK_MARGIN_MODES = ('clamp', 'dynamic')
 _MODEL_BACKENDS = ('exits', 'combined')
+_PREFIX_READOUTS = ('context', 'prefix', 'dual')
 
 
 @dataclass
@@ -97,6 +99,11 @@ class Config:
     # Always requires the combined backend; ignored in joint mode (empty
     # targets). Mutually exclusive with ``span_markers``.
     target_prefix: bool = False
+    # Readout pooling when target_prefix is on:
+    # 'context' = pool the target span in the context sentence (2nd occurrence, baseline).
+    # 'prefix'  = pool the target word in the prefix prompt (1st occurrence).
+    # 'dual'    = blend both pools via a learned scalar gate (starts at 50/50 mean).
+    prefix_readout: PrefixReadout = 'context'
     # Border markers: wrap the row's OWN target span with its unused-id pair
     # spliced at the span's token boundaries -- mod -> <unused0>..<unused0>,
     # head -> <unused1>..<unused1>, pv -> <unused2>..<unused2> (ids 7/8/9).
@@ -254,6 +261,10 @@ class Config:
             errors.append('target_prefix requires a non-empty targets list (single-target mode)')
         if self.target_prefix and self.model_backend != 'combined':
             errors.append('target_prefix requires model_backend="combined"')
+        if self.prefix_readout not in _PREFIX_READOUTS:
+            errors.append(f'prefix_readout must be one of {_PREFIX_READOUTS}, got {self.prefix_readout!r}')
+        if self.prefix_readout in ('prefix', 'dual') and not self.target_prefix:
+            errors.append('prefix_readout="prefix" or "dual" requires target_prefix=True')
         if self.span_markers and not self.targets:
             errors.append('span_markers requires a non-empty targets list (single-target mode)')
         if self.span_markers and self.model_backend != 'combined':

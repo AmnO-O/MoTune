@@ -225,6 +225,9 @@ class Trainer:
         proj = getattr(model, 'static_proj', None)
         if proj is not None:
             heads.append(proj)
+        gate = getattr(model, 'prefix_gate', None)
+        if gate is not None:
+            heads.append(nn.ParameterList([gate]))
         seen = set()
         uniq: List[nn.Module] = []
         for m in heads:

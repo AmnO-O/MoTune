@@ -115,3 +115,19 @@ def pool_active(hidden: torch.Tensor, batch, targets: Sequence[str]) -> torch.Te
     mask = mask.float().unsqueeze(-1)
     counts = mask.sum(dim=1).clamp(min=1.0)
     return (hidden * mask).sum(dim=1) / counts
+
+
+def pool_prefix(hidden: torch.Tensor, batch) -> torch.Tensor:
+    """Masked-mean over the row's OWN prefix WORD tokens (``prefix_mask``).
+
+    ``target_prefix=True`` prepends ``<marker> WORD <marker>`` right after
+    <bos>; this pools ONLY the WORD tokens inside that prefix -- after the
+    22 bidirectional layers they are fully contextualized by the whole
+    sentence, so the readout reads "the word as mentioned in this sentence"
+    from a dedicated answer slot rather than from the literal span copy.
+    Rows with no word tokens (empty prefix) pool over nothing -> zero vector;
+    the caller decides when a ``prefix_mask`` is present at all.
+    """
+    mask = batch['prefix_mask'].float().unsqueeze(-1)
+    counts = mask.sum(dim=1).clamp(min=1.0)
+    return (hidden * mask).sum(dim=1) / counts

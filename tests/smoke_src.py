@@ -662,6 +662,11 @@ def check_targets() -> None:
         check(_ds0[0]['head_span_mask'].tolist() == [False, False, False, True, False]
               and _ds1[0]['head_span_mask'].tolist() == [False, False, False, False, False, False, True, False],
               'CompDataset target_prefix shifts head_span_mask cleanly past prefix to the context occurrence')
+        check(_ds0[0]['prefix_mask'].tolist() == [False, False, False, False, False]
+              and _ds1[0]['prefix_mask'].tolist() == [False, False, True, False, False, False, False, False],
+              'CompDataset prefix_mask marks ONLY the WORD tokens inside the prefix (markers excluded)')
+        check(_ds1[0]['attention_mask'].tolist() == [1, 1, 1, 1, 1, 1, 1, 1],
+              'prefix word tokens are attended')
     except ImportError:
         print('  [SKIP] torch unavailable; CompDataset prefix check skipped')
 
@@ -704,6 +709,29 @@ def check_targets() -> None:
     except ValueError:
         check(True, 'Config rejects span_markers with empty targets')
 
+    # config: prefix_readout validation ('prefix'/'dual' need target_prefix)
+    from src.config import Config as _C
+    try:
+        _C(prefix_readout='prefix', target_prefix=False, targets=['mod']).validate()
+        check(False, 'Config rejects prefix_readout=prefix without target_prefix')
+    except ValueError:
+        check(True, 'Config rejects prefix_readout=prefix without target_prefix')
+    try:
+        _C(prefix_readout='dual', target_prefix=False, targets=['mod']).validate()
+        check(False, 'Config rejects prefix_readout=dual without target_prefix')
+    except ValueError:
+        check(True, 'Config rejects prefix_readout=dual without target_prefix')
+    try:
+        _C(prefix_readout='nope', target_prefix=True, targets=['mod']).validate()
+        check(False, 'Config rejects an unknown prefix_readout value')
+    except ValueError:
+        check(True, 'Config rejects an unknown prefix_readout value')
+    check(_C(prefix_readout='dual', target_prefix=True, targets=['mod'],
+             model_backend='combined').validate() is None
+          and _C(prefix_readout='prefix', target_prefix=True, targets=['mod'],
+                 model_backend='combined').validate() is None,
+          'Config accepts prefix_readout together with target_prefix')
+
     # trainer wires span_markers
     check('span_markers=self.cfg.span_markers' in tr_src,
           'trainer passes span_markers to CompDataset')
@@ -724,6 +752,29 @@ def check_targets() -> None:
     check("seen = set()" in tr_src
           and "if id(m) not in seen:" in tr_src,
           'trainer._pred_heads dedupes shared-head aliases by module identity')
+
+    # model: prefix_readout wiring (context/prefix/dual pooling + head-group gate)
+    check("self.prefix_readout = prefix_readout" in m_src,
+          'CombinedBackboneModel stores prefix_readout from cfg')
+    check("self.prefix_gate = None" in m_src
+          and "if target_prefix and prefix_readout == 'dual':" in m_src
+          and "nn.Parameter(torch.zeros(1))" in m_src,
+          'dual readout gets a trainable 1-param gate (sigmoid 0 -> 50/50 start)')
+    check("from .targets import TARGETS, pool_active, pool_prefix, pool_span, row_targets, target_selector" in m_src,
+          'CombinedBackboneModel imports pool_prefix for the prefix readout')
+    check("pre = pool_prefix(hidden, batch)" in m_src
+          and "pool = pre" in m_src and "'dual'" in m_src,
+          'prefix readout pools the prefix WORD tokens')
+    check("a = torch.sigmoid(self.prefix_gate.to(hidden.device))" in m_src
+          and "pool = a * ctx + (1 - a) * pre" in m_src,
+          'dual readout blends context+prefix pools via a learned gate')
+    check("'prefix_mask' in batch" in m_src,
+          'prefix readout guards on batch prefix_mask presence (joint/predict safe)')
+    check('prefix_readout=str(getattr(cfg, \'prefix_readout\', \'context\'))' in m_src,
+          'build_combined_model forwards prefix_readout from cfg')
+    check("gate = getattr(model, 'prefix_gate', None)" in tr_src
+          and "heads.append(nn.ParameterList([gate]))" in tr_src,
+          'trainer._pred_heads folds prefix_gate into the head_lr group')
 
     # model: single shared GaussHead (mod/head/pv_gauss all alias the same module)
     check("self.gauss = GaussHead(self.head_in, head_hidden, dropout=dropout)" in m_src
@@ -950,6 +1001,49 @@ def check_static_ext() -> None:
         check(model.static_proj.weight.grad is not None
               and bool(_torch.isfinite(model.static_proj.weight.grad).all()),
               'gradient flows into static_proj (fusion is not frozen)')
+
+        # 5) prefix readout: pool_prefix masked-mean + model wiring
+        from src.targets import pool_prefix as _pp
+        _hid = _torch.tensor([[[1., 1., 1.], [2., 2., 2.], [3., 3., 3.], [4., 4., 4.]]])
+        _pm = _torch.tensor([[0, 1, 1, 0]], dtype=_torch.bool)
+        _pooled = _pp(_hid, {'prefix_mask': _pm})
+        check(_torch.allclose(_pooled, _torch.tensor([[2.5, 2.5, 2.5]])),
+              'pool_prefix masked-mean over ONLY the prefix word tokens')
+        _pm_empty = _torch.tensor([[0, 0, 0, 0]], dtype=_torch.bool)
+        check(_torch.allclose(_pp(_hid, {'prefix_mask': _pm_empty}),
+                              _torch.zeros(1, 3)),
+              'pool_prefix on an empty prefix degrades to a zero pool (caller guards)')
+
+        _kept = ('input_ids', 'attention_mask', 'mod_span_mask', 'head_span_mask',
+                 'target', 'mod_static', 'head_static', 'pv_static')
+        _pb = {k: batch[k] for k in _kept}
+        _pb['prefix_mask'] = _torch.tensor(
+            [[0, 0, 1, 0, 0, 0], [0, 0, 1, 0, 0, 0], [0, 0, 1, 0, 0, 0]], dtype=_torch.bool)
+        with _mock.patch.object(MC.AutoModel, 'from_pretrained', return_value=_FakeLM()):
+            _mpref = MC.CombinedBackboneModel(
+                'fake', hidden_size=8, dropout=0.0, head_hidden=8,
+                target_prefix=True, prefix_readout='prefix')
+            _mdual = MC.CombinedBackboneModel(
+                'fake', hidden_size=8, dropout=0.0, head_hidden=8,
+                target_prefix=True, prefix_readout='dual')
+        check(_mpref.prefix_gate is None,
+              'prefix readout uses no gate')
+        check(_mdual.prefix_gate is not None
+              and tuple(_mdual.prefix_gate.shape) == (1,),
+              'dual readout owns a 1-param scalar gate')
+        _mpref.eval(); _mdual.train()
+        with _torch.no_grad():
+            _mpref(batch, with_logits=True, with_pv=True)              # no prefix_mask
+            _out_p = _mpref(_pb, with_logits=True, with_pv=True)       # prefix pool
+        check(all(_torch.isfinite(o).all() for o in _out_p if o is not None),
+              'prefix readout runs on batches with AND without prefix_mask')
+        _dual_out, *_ = _mdual(_pb, with_logits=True, with_pv=True)
+        check(bool(_torch.isfinite(_dual_out).all()),
+              'dual readout blends+gates without NaNs')
+        _dual_out.sum().backward()
+        check(_mdual.prefix_gate.grad is not None
+              and bool(_torch.isfinite(_mdual.prefix_gate.grad).all()),
+              'gradient flows into the dual gate (trains at head_lr)')
     except ImportError:
         print('  [SKIP] numpy/torch unavailable; StaticVec + fusion functional checks skipped')
     finally:

@@ -46,7 +46,7 @@ from transformers import AutoModel
 from .constants import SCORE_MIN, SCORE_MAX
 from .heads import GaussHead
 from .model import FusionBlock
-from .targets import TARGETS, pool_active, pool_span, row_targets, target_selector
+from .targets import TARGETS, pool_active, pool_prefix, pool_span, row_targets, target_selector
 
 
 class StaticFusion(nn.Module):
@@ -92,6 +92,7 @@ class CombinedBackboneModel(nn.Module):
 
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
                  head_hidden: int = 128, target_prefix: bool = False,
+                 prefix_readout: str = 'context',
                  static_span: bool = False,
                  static_ext: bool = False, static_ext_dim: int = 300,
                  static_fuse_layers: int = 3, static_fuse_heads: int = 2):
@@ -99,6 +100,7 @@ class CombinedBackboneModel(nn.Module):
         self.backbone = backbone
         self.hidden_size = hidden_size
         self.target_prefix = target_prefix
+        self.prefix_readout = prefix_readout
         self.static_span = static_span
         self.static_ext = static_span and static_ext
 
@@ -113,6 +115,16 @@ class CombinedBackboneModel(nn.Module):
         # this module's vector, so the backbone sees a learnable task token
         # from layer 0 WITHOUT touching the frozen 256k embedding matrix.
         self.marker_emb = nn.Embedding(3, hidden_size) if target_prefix else None
+
+        # Two readout views under target_prefix: 'context' pools the target
+        # span inside the sentence (baseline); 'prefix' pools the target's
+        # WORD tokens in the prefix prompt (the mention, fully contextualized
+        # after 22 layers -- immune to find_spans failures); 'dual' blends
+        # both with a learned scalar gate. sigmoid(0) = 0.5 -> both pools
+        # start at equal weight and the gate tunes the blend at head_lr.
+        self.prefix_gate = None
+        if target_prefix and prefix_readout == 'dual':
+            self.prefix_gate = nn.Parameter(torch.zeros(1))
 
         # Readout feature: always the final-layer span pool. With static_span
         # the pool is fused with the span's frozen embedding-table mean (its
@@ -194,7 +206,18 @@ class CombinedBackboneModel(nn.Module):
             return out
 
         # --- single-target fast path: one pool + one head pass per batch ---
-        pool = pool_active(hidden, batch, targets)
+        pool = None
+        if self.prefix_readout != 'context' and 'prefix_mask' in batch \
+                and bool(batch['prefix_mask'].any()):
+            pre = pool_prefix(hidden, batch)
+            if self.prefix_readout == 'prefix':
+                pool = pre
+            else:   # 'dual'
+                ctx = pool_active(hidden, batch, targets)
+                a = torch.sigmoid(self.prefix_gate.to(hidden.device))
+                pool = a * ctx + (1 - a) * pre
+        if pool is None:
+            pool = pool_active(hidden, batch, targets)
         if self.static_span:
             if ext is not None:
                 # Route each row to its OWN target's static anchor: default to
@@ -300,6 +323,7 @@ def build_combined_model(cfg, device, load_from: Optional[str | Path] = None) ->
         cfg.backbone, hidden_size=cfg.hidden_size, dropout=cfg.dropout,
         head_hidden=cfg.head_hidden,
         target_prefix=bool(getattr(cfg, 'target_prefix', False)),
+        prefix_readout=str(getattr(cfg, 'prefix_readout', 'context')),
         static_span=bool(getattr(cfg, 'static_span', False)),
         static_ext=bool(getattr(cfg, 'static_ext_path', None)),
         static_ext_dim=int(getattr(cfg, 'static_ext_dim', 300)),
