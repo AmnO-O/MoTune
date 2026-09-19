@@ -199,14 +199,27 @@ class CrossSpanAttentionBlock(nn.Module):
         # Masking nhẹ nhàng ở cuối
         return x * query_mask.unsqueeze(-1)
 
-class FusionBlock(nn.Module):
-    """Một khối Transformer Fusion đơn lẻ (Cross-Attn + FFN)"""
-    def __init__(self, hidden: int, num_heads: int, ffn_expansion: int, dropout: float):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=hidden, num_heads=num_heads, dropout=dropout, batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden)
-        self.alpha_attn = nn.Parameter(torch.ones(1))
+import torch
+import torch.nn as nn
 
+class FusionBlock(nn.Module):
+    """Khối Transformer Fusion tối ưu (Pre-LN Cross-Attn + FFN với ReZero Init)"""
+    def __init__(self, hidden: int, num_heads: int = 2, ffn_expansion: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden, 
+            num_heads=num_heads, 
+            dropout=dropout, 
+            batch_first=True
+        )
+        # Pre-LN riêng biệt cho Query và Key/Value
+        self.norm_q = nn.LayerNorm(hidden)
+        self.norm_kv = nn.LayerNorm(hidden)
+        
+        # ReZero Trick: khởi tạo alpha = 0.0 để giữ nguyên thông tin ở step 0
+        self.alpha_attn = nn.Parameter(torch.zeros(1))
+
+        # Khối Feed-Forward
         self.ffn = nn.Sequential(
             nn.Linear(hidden, hidden * ffn_expansion),
             nn.GELU(),
@@ -214,15 +227,18 @@ class FusionBlock(nn.Module):
             nn.Linear(hidden * ffn_expansion, hidden),
             nn.Dropout(dropout)
         )
-        self.norm2 = nn.LayerNorm(hidden)
-        self.alpha_ffn = nn.Parameter(torch.ones(1))
+        self.norm_ffn = nn.LayerNorm(hidden)
+        self.alpha_ffn = nn.Parameter(torch.zeros(1))
 
     def forward(self, q: torch.Tensor, kv_toks: torch.Tensor) -> torch.Tensor:
-        # Cross-Attention
-        attn_out, _ = self.attn(query=q, key=kv_toks, value=kv_toks)
-        x = self.norm1(q + self.alpha_attn * attn_out)
-        # FFN
-        out = self.norm2(x + self.alpha_ffn * self.ffn(x))
+        # 1. Pre-LN Cross-Attention
+        q_norm = self.norm_q(q)
+        kv_norm = self.norm_kv(kv_toks)
+        attn_out, _ = self.attn(query=q_norm, key=kv_norm, value=kv_norm)
+        x = q + self.alpha_attn * attn_out
+
+        # 2. Pre-LN FFN
+        out = x + self.alpha_ffn * self.ffn(self.norm_ffn(x))
         return out
 
 class SpanFusion(nn.Module):
