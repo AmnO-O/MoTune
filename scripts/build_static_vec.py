@@ -101,7 +101,7 @@ def keep_wanted(src: Path, wanted: Set[str], found: Set[str],
             if w in wanted and w not in found:
                 found.add(w)
                 kept += 1
-                fout.write(line + '\n')
+                fout.write(line.rstrip('\r\n') + '\n')
             if n % 500_000 == 0:
                 print(f'  [{tag}] {n} lines, {len(found)} kept so far', flush=True)
     print(f'  [{tag}] done: {n} lines, {kept} new kept')
