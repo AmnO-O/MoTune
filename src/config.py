@@ -89,11 +89,23 @@ class Config:
     #   ['mod'] -> ModAvg, ['head'] -> HeadAvg, ['pv'] -> Avg (PV rows only).
     # List e.g. ['mod', 'head', 'pv'] for the 3N design.
     targets: List[str] = field(default_factory=lambda: ['mod', 'head', 'pv'])
-    # Prepend a learned marker token (one of mmBERT's unused vocab ids 7/8/9)
-    # right after <bos> so the backbone also SEES which target this row answers
-    # (task conditioning from layer 0). Off = span-pool only. Always requires
-    # the combined backend; ignored in joint mode (empty targets).
+    # Prefix prompt: right after <bos> prepend <marker> WORD <marker> where
+    # WORD is the row's own target surface form (mod/head/whole compound,
+    # BPE-tokenized) and the marker is one of mmBERT's unused vocab ids 7/8/9
+    # (mod/head/pv). The id itself is the role signal, so the backbone SEES both
+    # the target role AND the target word from layer 0. Off = span-pool only.
+    # Always requires the combined backend; ignored in joint mode (empty
+    # targets). Mutually exclusive with ``span_markers``.
     target_prefix: bool = False
+    # Border markers: wrap the row's OWN target span with its unused-id pair
+    # spliced at the span's token boundaries -- mod -> <unused0>..<unused0>,
+    # head -> <unused1>..<unused1>, pv -> <unused2>..<unused2> (ids 7/8/9).
+    # The id itself IS the role signal, so target_prefix is redundant and the
+    # two are mutually exclusive. Requires the combined backend and single
+    # targets. (mmBERT's tokenizer cannot produce these ids from the strings:
+    # '<unused0>' tokenizes to '< unu ##sed ##0 >', verified, so ids are
+    # spliced post-tokenization exactly like the pos-1 marker.)
+    span_markers: bool = False
     # Concat the frozen embedding-table mean of the span (word's general,
     # context-free meaning) with the final-layer contextualized pool, so the
     # readout blends "what the word means" and "what it means here".
@@ -242,6 +254,13 @@ class Config:
             errors.append('target_prefix requires a non-empty targets list (single-target mode)')
         if self.target_prefix and self.model_backend != 'combined':
             errors.append('target_prefix requires model_backend="combined"')
+        if self.span_markers and not self.targets:
+            errors.append('span_markers requires a non-empty targets list (single-target mode)')
+        if self.span_markers and self.model_backend != 'combined':
+            errors.append('span_markers requires model_backend="combined"')
+        if self.span_markers and self.target_prefix:
+            errors.append('span_markers is mutually exclusive with target_prefix '
+                          '(the unused-id pair carries the role signal)')
         if self.static_span and self.model_backend != 'combined':
             errors.append('static_span requires model_backend="combined"')
         if self.static_fuse_layers < 1 or self.static_fuse_heads < 1:

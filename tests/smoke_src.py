@@ -633,7 +633,7 @@ def check_targets() -> None:
     check(TARGET_PREFIX_TOKENS == {'mod': '<unused0>', 'head': '<unused1>', 'pv': '<unused2>'},
           'TARGET_PREFIX_TOKENS maps targets to unused token names')
 
-    # CompDataset target_prefix token insertion and +1 span mask shift
+    # CompDataset target_prefix token insertion (<marker> word <marker>) and span mask shift
     try:
         import torch as _torch
         class _MockTok:
@@ -643,6 +643,10 @@ def check_targets() -> None:
                     'attention_mask': _torch.tensor([[1, 1, 1, 1, 1]]),
                     'offset_mapping': _torch.tensor([[[0, 0], [0, 3], [4, 8], [9, 15], [0, 0]]])
                 }
+            def encode(self, text, add_special_tokens=False):
+                mapping = {'flea': [20], 'market': [30], 'flea market': [20, 30]}
+                return mapping.get(text, [99])
+
         _row = {'context': 'our flea market', 'mod': 'flea', 'head': 'market', 'compound': 'flea market',
                 'compound_id': 0, 'has_label': True, 'mod_avg': 3.0, 'head_avg': 4.0, 'mod_std': 0.5,
                 'head_std': 0.5, 'target': 'mod'}
@@ -650,16 +654,59 @@ def check_targets() -> None:
         _ds1 = D.CompDataset([_row], _MockTok(), target_prefix=True)
         check(_ds0[0]['input_ids'].tolist() == [2, 10, 20, 30, 1],
               'CompDataset without prefix preserves original token sequence')
-        check(_ds1[0]['input_ids'].tolist() == [2, 7, 10, 20, 30, 1],
-              'CompDataset with target_prefix prepends marker id right after <bos>')
+        check(_ds1[0]['input_ids'].tolist() == [2, 7, 20, 7, 10, 20, 30, 1],
+              'CompDataset with target_prefix prepends <marker> word <marker> right after <bos>')
         check(_ds0[0]['mod_span_mask'].tolist() == [False, False, True, False, False]
-              and _ds1[0]['mod_span_mask'].tolist() == [False, False, False, True, False, False],
-              'CompDataset target_prefix shifts mod_span_mask exactly by +1')
+              and _ds1[0]['mod_span_mask'].tolist() == [False, False, False, False, False, True, False, False],
+              'CompDataset target_prefix shifts mod_span_mask cleanly past prefix to the context occurrence')
         check(_ds0[0]['head_span_mask'].tolist() == [False, False, False, True, False]
-              and _ds1[0]['head_span_mask'].tolist() == [False, False, False, False, True, False],
-              'CompDataset target_prefix shifts head_span_mask exactly by +1')
+              and _ds1[0]['head_span_mask'].tolist() == [False, False, False, False, False, False, True, False],
+              'CompDataset target_prefix shifts head_span_mask cleanly past prefix to the context occurrence')
     except ImportError:
         print('  [SKIP] torch unavailable; CompDataset prefix check skipped')
+
+    # CompDataset span_markers: border ids spliced around the row's OWN span
+    try:
+        import torch as _torch
+        _rm = dict(_row); _rm['target'] = 'mod'
+        _dm = D.CompDataset([_rm], _MockTok(), span_markers=True)
+        check(_dm[0]['input_ids'].tolist() == [2, 10, 7, 20, 7, 30, 1],
+              'span_markers wraps the mod span with id 7 (open + close)')
+        check(_dm[0]['mod_span_mask'].tolist() == [False, False, False, True, False, False, False]
+              and _dm[0]['head_span_mask'].tolist() == [False, False, False, False, False, True, False],
+              'span_markers shifts both span masks exactly around the spliced ids')
+        _rh = dict(_row); _rh['target'] = 'head'
+        _dh = D.CompDataset([_rh], _MockTok(), span_markers=True)
+        check(_dh[0]['input_ids'].tolist() == [2, 10, 20, 8, 30, 8, 1],
+              'span_markers wraps the head span with id 8')
+        _rp = dict(_row); _rp['target'] = 'pv'
+        _dp = D.CompDataset([_rp], _MockTok(), span_markers=True)
+        check(_dp[0]['input_ids'].tolist() == [2, 10, 9, 20, 30, 9, 1],
+              'span_markers pv wraps the WHOLE compound with id 9')
+    except ImportError:
+        print('  [SKIP] torch unavailable; span_markers check skipped')
+
+    # config: span_markers validation
+    try:
+        Config(span_markers=True, target_prefix=True, targets=['mod'],
+               model_backend='combined').validate()
+        check(False, 'Config rejects span_markers + target_prefix together')
+    except ValueError:
+        check(True, 'Config rejects span_markers + target_prefix together')
+    try:
+        Config(span_markers=True, model_backend='exits', targets=['mod']).validate()
+        check(False, 'Config rejects span_markers on a non-combined backend')
+    except ValueError:
+        check(True, 'Config rejects span_markers on a non-combined backend')
+    try:
+        Config(span_markers=True, targets=[], model_backend='combined').validate()
+        check(False, 'Config rejects span_markers with empty targets')
+    except ValueError:
+        check(True, 'Config rejects span_markers with empty targets')
+
+    # trainer wires span_markers
+    check('span_markers=self.cfg.span_markers' in tr_src,
+          'trainer passes span_markers to CompDataset')
 
     # trainer wires target_prefix
     check('target_prefix=self.cfg.target_prefix' in tr_src,

@@ -152,10 +152,12 @@ class Trainer:
 
         train_ds = CompDataset(
             train_rows, tokenizer, max_len=self.cfg.max_context_length,
-            target_prefix=self.cfg.target_prefix, static_vec=static_vec)
+            target_prefix=self.cfg.target_prefix, static_vec=static_vec,
+            span_markers=self.cfg.span_markers)
         val_ds = CompDataset(
             val_rows, tokenizer, max_len=self.cfg.max_context_length,
-            target_prefix=self.cfg.target_prefix, static_vec=static_vec)
+            target_prefix=self.cfg.target_prefix, static_vec=static_vec,
+            span_markers=self.cfg.span_markers)
         
         # Chỉ bật persistent_workers khi num_workers > 0 để tránh deadlock
         num_workers = max(0, self.cfg.num_workers)

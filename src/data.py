@@ -6,6 +6,12 @@ matched inside the original text by ``marks.find_spans`` and mapped onto
 token spans. No ``<mod>`` / ``<head>`` markers are inserted, so the pretrained
 mmBERT tokenizer/embeddings never see out-of-vocabulary artifacts.
 
+``span_markers=True`` is the marked alternative: the row's own target span is
+wrapped with a single unused id that opens AND closes it (ids 7/8/9 for
+mod/head/pv, spliced post-tokenization at the span's token boundaries) so the
+encoder sees exactly which instance and which role each row answers. Mutual
+with ``target_prefix`` and combined-backend only.
+
 ``CompDataset`` -- one row per labeled / aux sentence, for scoring. Yields
 span masks plus (possibly NaN) soft labels; aux and unaligned rows keep the
 row but mark ``has_label`` / ``has_mod`` / ``has_head`` False so losses can
@@ -264,18 +270,46 @@ def _span_mask(span: Optional[Span], length: int) -> torch.Tensor:
     return mask
 
 
+def _target_span(res: SpanResult, target: str) -> Optional[Span]:
+    """Token span of the target role for ``span_markers`` wrapping.
+
+    mod/head -> their own span; pv -> the whole compound, taken as the union of
+    the mod and head spans (mod here for a fused one-token German compound via
+    the fallback to whichever role aligned). ``None`` when the target could not
+    be aligned, in which case the caller leaves the row unmarked (it is
+    representation-only anyway).
+    """
+    def _ok(s: Optional[Span]) -> bool:
+        return s is not None and s.start is not None
+
+    if target == 'mod':
+        return res.mod if _ok(res.mod) else None
+    if target == 'head':
+        return res.head if _ok(res.head) else None
+    if target == 'pv':
+        m, h = res.mod, res.head
+        if _ok(m) and _ok(h):
+            return Span(min(m.start, h.start), max(m.end, h.end))
+        if _ok(m):
+            return m
+        return h if _ok(h) else None
+    return None
+
+
 class CompDataset(_DatasetBase):
     """One sentence (tokenized verbatim) per row, for scoring."""
 
     def __init__(self, rows: List[Dict], tokenizer, max_len: int = 256,
                  is_test: bool = False, target_prefix: bool = False,
-                 static_vec: Optional[StaticVec] = None):
+                 static_vec: Optional[StaticVec] = None,
+                 span_markers: bool = False):
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.is_test = is_test
         self.target_prefix = target_prefix
         self.static_vec = static_vec
+        self.span_markers = span_markers
         self.items = [self._encode(r) for r in rows]
         self._report()
 
@@ -298,15 +332,55 @@ class CompDataset(_DatasetBase):
         head_span_mask = _span_mask(result.head, length)
 
         if self.target_prefix and r.get('target') is not None and r['target'] in MARKER_CODE:
-            marker_id = MARKER_CODE[r['target']]
-            marker_tok = torch.tensor([marker_id], dtype=input_ids.dtype)
-            marker_attn = torch.tensor([1], dtype=attention_mask.dtype)
-            marker_span = torch.tensor([False], dtype=torch.bool)
+            t = r['target']
+            marker_id = MARKER_CODE[t]
+            if t == 'mod':
+                word = r.get('mod', '')
+            elif t == 'head':
+                word = r.get('head', '')
+            else:
+                word = r.get('compound', '')
 
-            input_ids = torch.cat([input_ids[:1], marker_tok, input_ids[1:]])[:self.max_len]
-            attention_mask = torch.cat([attention_mask[:1], marker_attn, attention_mask[1:]])[:self.max_len]
-            mod_span_mask = torch.cat([mod_span_mask[:1], marker_span, mod_span_mask[1:]])[:self.max_len]
-            head_span_mask = torch.cat([head_span_mask[:1], marker_span, head_span_mask[1:]])[:self.max_len]
+            word_ids = self.tokenizer.encode(word, add_special_tokens=False) if (
+                word and hasattr(self.tokenizer, 'encode')
+            ) else []
+
+            prefix_ids = [marker_id] + list(word_ids) + [marker_id]
+            k = len(prefix_ids)
+            prefix_tok = torch.tensor(prefix_ids, dtype=input_ids.dtype)
+            prefix_attn = torch.ones(k, dtype=attention_mask.dtype)
+            prefix_span = torch.zeros(k, dtype=torch.bool)
+
+            input_ids = torch.cat([input_ids[:1], prefix_tok, input_ids[1:]])[:self.max_len]
+            attention_mask = torch.cat([attention_mask[:1], prefix_attn, attention_mask[1:]])[:self.max_len]
+            mod_span_mask = torch.cat([mod_span_mask[:1], prefix_span, mod_span_mask[1:]])[:self.max_len]
+            head_span_mask = torch.cat([head_span_mask[:1], prefix_span, head_span_mask[1:]])[:self.max_len]
+        elif self.span_markers and r.get('target') is not None and r['target'] in MARKER_CODE:
+            # Border markers (ids spliced, NOT strings): wrap the row's own
+            # target span with a single unused id that both opens and closes --
+            #   mod -> <unused0>..<unused0>, head -> <unused1>..<unused1>,
+            #   pv -> <unused2>..<unused2> around the whole compound (the union
+            #   of the mod/head spans, or just the found role when fused).
+            # The id itself is the role, so target_prefix stays off. mmBERT's
+            # tokenizer cannot produce these ids from '<unusedN>' strings, so
+            # we splice the numeric ids post-tokenization (same mechanism as
+            # the target_prefix insert, generalized to any span boundary).
+            wrap = _target_span(result, r['target'])
+            if wrap is not None and wrap.start is not None:
+                marker_id = MARKER_CODE[r['target']]
+                def _splice(t, pos, fill):
+                    return torch.cat([t[:pos], torch.tensor([fill], dtype=t.dtype), t[pos:]])
+                # close FIRST (higher index), then open, so the open insert
+                # does not move the close boundary
+                for pos in (wrap.end, wrap.start):
+                    input_ids = _splice(input_ids, pos, marker_id)
+                    attention_mask = _splice(attention_mask, pos, 1)
+                    mod_span_mask = _splice(mod_span_mask, pos, False)
+                    head_span_mask = _splice(head_span_mask, pos, False)
+                input_ids = input_ids[:self.max_len]
+                attention_mask = attention_mask[:self.max_len]
+                mod_span_mask = mod_span_mask[:self.max_len]
+                head_span_mask = head_span_mask[:self.max_len]
 
         item = {
             'input_ids': input_ids,
