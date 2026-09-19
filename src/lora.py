@@ -89,7 +89,7 @@ def _derive_attn_targets(model: nn.Module, from_layer: int = 0) -> List[str]:
             # trainable, and expose nn.MultiheadAttention internals
             # (``self.out_proj.weight``) that break when wrapped in an
             # adapter. Skip any subtree whose root is not ``lm``.
-            if full and not full.split('.', 1)[0] == 'lm':
+            if full and full.split('.', 1)[0] not in ('lm', 'model'):
                 continue
             layer = _layer_idx(full)
             if layer is not None and layer < from_layer:

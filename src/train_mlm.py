@@ -85,6 +85,7 @@ def train_mlm_adaptation(
         rank=cfg.lora_rank,
         alpha=cfg.lora_alpha,
         dropout=cfg.lora_dropout,
+        targets=cfg.lora_targets,
         from_layer=cfg.mlm_from_layer,
     )
     logger.info("Attached %d LoRA adapters to attention layers >= %d",

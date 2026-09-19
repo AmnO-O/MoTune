@@ -11,6 +11,7 @@
   "lora_rank": 8,
   "lora_alpha": 16,
   "lora_dropout": 0.1,
+  "lora_targets": ["Wqkv", "Wo"],
   "batch_size": 32,
   "accum_steps": 1,
   "num_workers": 2,
