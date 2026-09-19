@@ -1159,6 +1159,29 @@ def check_mlm_adaptation() -> None:
     mock_m = MockLM()
     adapters = apply_lora(mock_m, targets=['q_proj'], from_layer=18)
     check(len(adapters) == 2, 'LoRA applied to layers >= 18 (2 adapters)')
+
+    # 5b. AutoModelForMaskedLM (ModernBERT) carries the backbone under root
+    #     child 'model', not 'lm' -- apply_lora must still match (Stage 1 MLM).
+    class MockMLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([nn.Module() for _ in range(22)])
+            for layer in self.model.layers:
+                layer.attn = nn.Module()
+                layer.attn.Wqkv = nn.Linear(32, 32)
+                layer.attn.Wo = nn.Linear(32, 32)
+            self.decoder = nn.Linear(32, 100)
+
+    mock_mlm = MockMLM()
+    adapters_mlm = apply_lora(mock_mlm, targets=['Wqkv', 'Wo'], from_layer=18)
+    check(len(adapters_mlm) == 8,
+          'apply_lora matches ModernBERT roots under "model" (Wqkv+Wo x layers>=18)')
+    merge_lora(mock_mlm, adapters_mlm)
+    check(isinstance(mock_mlm.model.layers[18].attn.Wqkv, nn.Linear)
+          and isinstance(mock_mlm.model.layers[18].attn.Wo, nn.Linear),
+          'merge_lora unwraps model-rooted ModernBERT adapters back to nn.Linear')
+
     dummy_x = torch.randn(2, 6, 32)
     dummy_lbl = torch.full((2, 6), -100, dtype=torch.long)
     dummy_lbl[0, 2] = 5

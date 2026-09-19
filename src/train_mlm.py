@@ -73,7 +73,7 @@ def train_mlm_adaptation(
     )
 
     # 3. Model setup with LoRA
-    model = AutoModelForMaskedLM.from_pretrained(cfg.backbone, reference_compile=False)
+    model = AutoModelForMaskedLM.from_pretrained(cfg.backbone)
     model.to(device)
 
     # Alias .model as .lm for apply_lora

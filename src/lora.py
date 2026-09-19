@@ -155,11 +155,13 @@ def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,
         def _walk(module: nn.Module, path: str) -> None:
             for name, child in list(module.named_children()):
                 full = f'{path}.{name}' if path else name
-                # LoRA is for the pretrained backbone (``model.lm``) only; the
-                # scorer-side attention/fusion blocks are random-init and stay
-                # fully trainable (their MHA params are also not attribute-safe
-                # to wrap). See _derive_attn_targets._walk.
-                if full and not full.split('.', 1)[0] == 'lm':
+                # LoRA is for the pretrained backbone only: the scorer-side
+                # attention/fusion blocks are random-init and stay fully
+                # trainable (their MHA params are also not attribute-safe to
+                # wrap). The backbone module root is ``lm`` in the downstream
+                # combined model but ``model`` in an AutoModelForMaskedLM
+                # (ModernBERT); both are pretrained and wrappable.
+                if full and full.split('.', 1)[0] not in ('lm', 'model'):
                     continue
                 layer = _layer_idx(full)
                 if layer is not None and layer < from_layer:
