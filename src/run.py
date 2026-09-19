@@ -185,6 +185,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help='Device: auto, cpu, cuda, cuda:0 (default: auto)')
     ap.add_argument('--smoke', action='store_true',
                     help='Run a quick pipeline sanity check (1 batch, no checkpoint)')
+    ap.add_argument('--mlm-adapt', action='store_true',
+                    help='Run Stage 1 Task-Adaptive Prefix MLM pre-training')
     return ap
 
 
@@ -203,6 +205,13 @@ def main() -> None:
     if args.smoke:
         logger.info('=== SMOKE MODE ===')
         _smoke(logger, device_str)
+        return
+
+    if getattr(args, 'mlm_adapt', False):
+        logger.info('=== STAGE 1 MLM ADAPTATION MODE ===')
+        from src.train_mlm import train_mlm_adaptation
+        save_path = train_mlm_adaptation(cfg, logger, torch.device(device_str), data_dir, output_dir)
+        logger.info('Task adaptation completed. Checkpoint: %s', save_path)
         return
 
     device = torch.device(device_str)

@@ -1050,6 +1050,127 @@ def check_static_ext() -> None:
         tmp.unlink()
 
 
+
+def check_mlm_adaptation() -> None:
+    print('=== 10. TASK-ADAPTIVE PREFIX MLM (Dataset, Masking, Collate, LoRA merge, Untouched model.py) ===')
+    import subprocess
+    import torch
+    import torch.nn as nn
+    from src.config import Config
+    from src.dataset_mlm import PrefixMLMDataset, collate_mlm
+    from src.lora import apply_lora, lora_parameters, merge_lora
+    from src.targets import MARKER_CODE
+
+    # 1. Guarantee src/model.py is 100% UNTOUCHED
+    diff_res = subprocess.run(['git', 'diff', 'src/model.py'], cwd=ROOT, capture_output=True, text=True)
+    check(diff_res.returncode == 0 and not diff_res.stdout.strip(),
+          'src/model.py has ZERO git diff (100% untouched invariant)')
+
+    # 2. Config MLM knobs
+    cfg = Config.defaults()
+    check(hasattr(cfg, 'mlm_epochs') and cfg.mlm_epochs == 3, 'Config has mlm_epochs default')
+    check(hasattr(cfg, 'mlm_lr') and cfg.mlm_lr == 5e-5, 'Config has mlm_lr default')
+    check(hasattr(cfg, 'mlm_mask_prob') and cfg.mlm_mask_prob == 0.8, 'Config has mlm_mask_prob default')
+    check(hasattr(cfg, 'mlm_from_layer') and cfg.mlm_from_layer == 18, 'Config has mlm_from_layer default')
+
+    bad_mlm = [
+        ('mlm_epochs=0', lambda: Config.defaults().update(mlm_epochs=0)),
+        ('mlm_lr=-1', lambda: Config.defaults().update(mlm_lr=-1)),
+        ('mlm_mask_prob=1.5', lambda: Config.defaults().update(mlm_mask_prob=1.5)),
+        ('mlm_from_layer=-1', lambda: Config.defaults().update(mlm_from_layer=-1)),
+    ]
+    for label, fn in bad_mlm:
+        try:
+            fn().validate()
+            check(False, f'[reject] {label}')
+        except ValueError:
+            check(True, f'[reject] {label}')
+
+    # 3. PrefixMLMDataset construction and token alignment
+    class DummyTokenizer:
+        mask_token_id = 4
+        cls_token_id = 0
+        sep_token_id = 2
+        pad_token_id = 1
+        vocab_size = 1000
+        def encode(self, text, add_special_tokens=False):
+            return [len(text) + 10]
+
+    tok = DummyTokenizer()
+    rows = [{'sentence': 'The acid rain fell.', 'mod': 'acid', 'head': 'rain', 'compound': 'acid rain'}]
+    ds = PrefixMLMDataset(rows, tok, targets=['mod', 'head', 'pv'], is_train=False)
+    check(len(ds) == 3, 'PrefixMLMDataset expands 1 row x 3 targets into 3 samples')
+
+    item_mod = ds[0]
+    ids = item_mod['input_ids'].tolist()
+    lbls = item_mod['labels'].tolist()
+    # Structure: [CLS, marker_mod(7), mask(4), marker_mod(7), context_tok(29), SEP(2)]
+    check(ids[0] == 0 and ids[1] == MARKER_CODE['mod'] and ids[3] == MARKER_CODE['mod'],
+          'Prefix prompt structure: [CLS, marker, target_token(s), marker, context...]')
+    check(ids[2] == tok.mask_token_id, 'eval mode always masks target word')
+    check(lbls[2] == 14, 'labels holds the ground-truth token id at the target position')
+    check(lbls[0] == -100 and lbls[1] == -100 and lbls[3] == -100 and lbls[4] == -100 and lbls[5] == -100,
+          'labels contains -100 everywhere else (CLS, markers, context, SEP)')
+
+    # Collation padding
+    batch = collate_mlm([item_mod, ds[1]], pad_id=tok.pad_token_id)
+    check(batch['input_ids'].shape[0] == 2, 'collate_mlm batches samples correctly')
+    check((batch['labels'][0, 2] != -100).item(), 'collate_mlm keeps target label intact')
+
+    # 4. 80/10/10 Stochastic policy
+    ds_train = PrefixMLMDataset(rows * 40, tok, targets=['mod'], is_train=True)
+    mask_count = 0
+    id_count = 0
+    rand_count = 0
+    for s in ds_train:
+        tid = s['input_ids'][2].item()
+        if tid == tok.mask_token_id:
+            mask_count += 1
+        elif tid == 14:
+            id_count += 1
+        else:
+            rand_count += 1
+    check(mask_count > id_count and mask_count > rand_count,
+          f'80/10/10 policy: mask={mask_count}, identity={id_count}, rand={rand_count}')
+
+    # 5. LoRA application, forward, backward and merge_lora round-trip
+    class MockLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm = nn.Module()
+            self.lm.layers = nn.ModuleList([nn.Module() for _ in range(20)])
+            for layer in self.lm.layers:
+                layer.attn = nn.Module()
+                layer.attn.q_proj = nn.Linear(32, 32)
+            self.head = nn.Linear(32, 32)
+            self.decoder = nn.Linear(32, 100)
+
+        def forward(self, x, labels=None):
+            h = x
+            for layer in self.lm.layers:
+                h = layer.attn.q_proj(h)
+            logits = self.decoder(self.head(h))
+            loss = None
+            if labels is not None:
+                mask = labels != -100
+                loss = nn.functional.cross_entropy(logits[mask], labels[mask])
+            return logits, loss
+
+    mock_m = MockLM()
+    adapters = apply_lora(mock_m, targets=['q_proj'], from_layer=18)
+    check(len(adapters) == 2, 'LoRA applied to layers >= 18 (2 adapters)')
+    dummy_x = torch.randn(2, 6, 32)
+    dummy_lbl = torch.full((2, 6), -100, dtype=torch.long)
+    dummy_lbl[0, 2] = 5
+    dummy_lbl[1, 2] = 8
+    _, dummy_loss = mock_m(dummy_x, labels=dummy_lbl)
+    dummy_loss.backward()
+    check(torch.isfinite(dummy_loss), 'Prefix MLM dummy loss forward + backward finite')
+    merge_lora(mock_m, adapters)
+    check(isinstance(mock_m.lm.layers[18].attn.q_proj, nn.Linear),
+          'merge_lora unwraps adapter back to nn.Linear with folded weights')
+
+
 def main() -> int:
     sync_parse()
     check_config()
@@ -1060,6 +1181,7 @@ def main() -> int:
     check_fixes()
     check_targets()
     check_static_ext()
+    check_mlm_adaptation()
 
     print('=' * 50)
     if FAILURES:

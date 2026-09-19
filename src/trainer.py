@@ -498,12 +498,15 @@ class Trainer:
                 if ema is not None:
                     ema.restore(model)
             else:
-                no_improve_epochs += 1
-                if no_improve_epochs >= self.cfg.patience:
-                    self.logger.info(
-                        'Early stop at epoch %d (best epoch %d, Mean ρ %.4f)',
-                        epoch + 1, best_epoch, best_rho)
-                    break
+                # Early stop only in phase 2 (unfrozen LoRA) so the frozen phase
+                # never aborts before the backbone has a chance to adapt
+                if epoch >= self.cfg.freeze_epochs:
+                    no_improve_epochs += 1
+                    if no_improve_epochs >= self.cfg.patience:
+                        self.logger.info(
+                            'Early stop at epoch %d (best epoch %d, Mean ρ %.4f)',
+                            epoch + 1, best_epoch, best_rho)
+                        break
 
         if best is None:
             raise RuntimeError('No improvement over any epoch - check the hyperparameters.')

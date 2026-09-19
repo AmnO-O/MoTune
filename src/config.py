@@ -144,6 +144,13 @@ class Config:
     # top layers carry the compositional semantics.
     lora_from_layer: int = 18
 
+    # === task-adaptive prefix mlm pre-training (stage 1) ===
+    mlm_epochs: int = 3
+    mlm_lr: float = 5e-5
+    mlm_mask_prob: float = 0.8
+    mlm_from_layer: int = 18
+    mlm_output_dir: Optional[str] = None
+
     # === optimization ===
     batch_size: int = 32
     accum_steps: int = 1
@@ -330,6 +337,15 @@ class Config:
             errors.append(f'amp_growth_interval must be >= 1, got {self.amp_growth_interval}')
         if not 0 < self.test_size < 1:
             errors.append(f'test_size must be in (0, 1), got {self.test_size}')
+
+        if self.mlm_epochs < 1:
+            errors.append(f'mlm_epochs must be >= 1, got {self.mlm_epochs}')
+        if self.mlm_lr <= 0:
+            errors.append(f'mlm_lr must be > 0, got {self.mlm_lr}')
+        if not 0 < self.mlm_mask_prob <= 1:
+            errors.append(f'mlm_mask_prob must be in (0, 1], got {self.mlm_mask_prob}')
+        if self.mlm_from_layer < 0:
+            errors.append(f'mlm_from_layer must be >= 0, got {self.mlm_from_layer}')
 
         if errors:
             raise ValueError('Invalid configuration:\n  ' + '\n  '.join(errors))
