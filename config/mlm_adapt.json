@@ -10,7 +10,7 @@
   "mlm_from_layer": 18,
   "mlm_output_dir": "checkpoints/prefix_mlm_adapted",
 
-  "mlm_batch_size": 16,
+  "mlm_batch_size": 32,
 
   "lora_rank": 8,
   "lora_alpha": 16,
