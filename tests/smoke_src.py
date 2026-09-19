@@ -18,6 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -688,8 +689,8 @@ def check_targets() -> None:
     check("self.static_fuse = StaticFusion(" in m_src
           and "FusionBlock(hidden, num_heads, ffn_expansion=2" in m_src,
           'StaticFusion reuses FusionBlock for a single fused (B,H) vector')
-    check("pool = self.static_fuse(pool, pool_span(static, batch, t))" in m_src
-          or "pool = self.static_fuse(pool, pool_active(static, batch, targets))" in m_src,
+    check("pool = self.static_fuse(pool, static_pool)" in m_src
+          and "pool = self.static_fuse(pool, static_v)" in m_src,
           'CombinedBackboneModel fuses ctx+static pools via StaticFusion (no concat)')
     check("torch.cat([pool, pool_span(static, batch, t)], dim=-1)" not in m_src,
           'static_span no longer uses a raw feature concat')
@@ -733,6 +734,181 @@ def check_targets() -> None:
           'trainer._pred_heads folds static_fuse into the head_lr group')
 
 
+def check_static_ext() -> None:
+    print('=== 9. EXTERNAL STATIC EMBEDDINGS (StaticVec + combined fusion) ===')
+    sys.path.insert(0, str(ROOT))
+
+    from src.config import Config
+
+    # 1) validation wiring
+    sv_src = (ROOT / 'src' / 'static_vec.py').read_text(encoding='utf-8')
+    check('class StaticVec' in sv_src and 'def _load' in sv_src and 'def tensor' in sv_src,
+          'src/static_vec.py defines StaticVec with load + OOV tensor lookup')
+
+    # Config accepts external static only on the combined backend + static_span
+    ok = Config(model_backend='combined', static_span=True, targets=['mod'],
+                static_ext_path='x.vec', static_ext_dim=300)
+    ok.validate()
+    check(ok.static_ext_path == 'x.vec' and ok.static_ext_dim == 300,
+          'Config accepts static_ext_path with combined + static_span')
+    for label, bad in [
+        ('backend=exits',
+         Config(model_backend='exits', static_span=True, targets=['mod'], static_ext_path='x.vec')),
+        ('static_span=False',
+         Config(model_backend='combined', static_span=False, targets=['mod'], static_ext_path='x.vec')),
+        ('static_ext_dim=0',
+         Config(model_backend='combined', static_span=True, targets=['mod'],
+                static_ext_path='x.vec', static_ext_dim=0)),
+    ]:
+        try:
+            bad.validate()
+            check(False, f'[reject] static_ext with {label}')
+        except ValueError:
+            check(True, f'[reject] static_ext with {label}')
+
+    # 2) source guards: dataset, model, trainer wiring
+    d_src = (ROOT / 'src' / 'data.py').read_text(encoding='utf-8')
+    m_src = (ROOT / 'src' / 'model_combined.py').read_text(encoding='utf-8')
+    tr_src = (ROOT / 'src' / 'trainer.py').read_text(encoding='utf-8')
+    check("item['head_static'] = head_v" in d_src
+          and "item['pv_static'] = pv_static" in d_src
+          and "self.static_vec.tensor(r.get('compound', ''))" in d_src,
+          'CompDataset encodes per-row mod/head/compound static vectors when static_vec given')
+    check("self.static_proj = nn.Linear(static_ext_dim, hidden_size)" in m_src,
+          'CombinedBackboneModel projects external static vectors to H')
+    check("static_ext=bool(getattr(cfg, 'static_ext_path', None))" in m_src
+          and "static_ext_dim=int(getattr(cfg, 'static_ext_dim', 300))" in m_src,
+          'build_combined_model forwards static_ext knobs from cfg')
+    check("static_ext_path not found (tried:" in tr_src,
+          'trainer raises clear FileNotFoundError when static_ext_path missing')
+    check("static_vec=static_vec" in tr_src,
+          'trainer passes StaticVec to both CompDatasets')
+    check("proj = getattr(model, 'static_proj', None)" in tr_src and "heads.append(proj)" in tr_src,
+          'trainer._pred_heads folds static_proj into the head_lr group')
+
+    # 3) functional: StaticVec parse / normalize / OOV (no torch needed beyond numpy)
+    tmp = Path(tempfile.gettempdir()) / 'src_static_smoke.vec'
+    tmp.write_text(
+        '4 3\n'
+        'acid 1 0 0\n'
+        'solution 0 1 0\n'
+        'crack 0.5 0.5 0\n'
+        'down -0.5 0.5 0\n',
+        encoding='utf-8')
+    try:
+        from src.static_vec import StaticVec
+        sv = StaticVec(tmp, 3, ['acid solution', 'crack down', 'Abitur', 'OOVWORD'])
+        check(len(sv) == 4, 'StaticVec keeps only the wanted words (4/6 coverage)')
+        check(np.isclose(sv.vector('acid'), [1, 0, 0]).all(),
+              'StaticVec returns the exact (unit) vectors')
+        check(np.isclose(sv.vector('crack down'), [0, 1, 0], atol=1e-5).all(),
+              'multi-part surface form is the normalized mean of its parts')
+        check(sv.vector('Abitur') is None and sv.vector('OOVWORD') is None,
+              'OOV words return None (dataset falls back to the zero vector)')
+
+        import torch as _torch
+        check(_torch.equal(sv.tensor('Abitur'), _torch.zeros(3)),
+              'StaticVec.tensor gives a zero vector on OOV')
+
+        # dataset-level pv anchor: whole-compound vector when available,
+        # base+particle mean only when the compound surface form is OOV
+        from src.data import CompDataset as _CD
+
+        class _FakeTok:
+            def __call__(self, text, max_length=256, truncation=True,
+                         return_tensors='pt', return_offsets_mapping=True):
+                return {'input_ids': _torch.tensor([[1, 1, 1, 1, 1]]),
+                        'attention_mask': _torch.tensor([[1, 1, 1, 1, 1]]),
+                        'offset_mapping': _torch.tensor([[[0, 1]] * 5])}
+
+        _rows = [
+            {'context': 'x', 'mod': 'crack', 'head': 'down', 'compound': 'acid',
+             'compound_id': 0, 'has_label': True, 'mod_avg': 1.0, 'head_avg': 1.0,
+             'mod_std': 0.1, 'head_std': 0.1, 'target': 'pv'},
+            {'context': 'x', 'mod': 'acid', 'head': 'solution', 'compound': 'OOVWORD',
+             'compound_id': 1, 'has_label': True, 'mod_avg': 1.0, 'head_avg': 1.0,
+             'mod_std': 0.1, 'head_std': 0.1, 'target': 'pv'},
+        ]
+        _ds = _CD(_rows, _FakeTok(), max_len=8, is_test=True, static_vec=sv)
+        check(_torch.allclose(_ds[0]['pv_static'], _torch.as_tensor([1., 0., 0.])),
+              'pv anchor is the WHOLE compound vector when the surface form exists')
+        check(_torch.allclose(_ds[1]['pv_static'],
+                              _torch.as_tensor([0.7071068, 0.7071068, 0.]), atol=1e-5),
+              'pv anchor falls back to base+particle mean when the compound is OOV')
+
+        # 4) functional: combined model fuses + routes external static
+        from types import SimpleNamespace
+        import torch.nn as _nn
+        import src.model_combined as MC
+
+        class _FakeLM(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._emb = _nn.Embedding(100, 8)
+
+            def get_input_embeddings(self):
+                return self._emb
+
+            def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None,
+                        output_hidden_states=False):
+                if input_ids is not None:
+                    B, L = input_ids.shape
+                else:
+                    B, L = inputs_embeds.shape[:2]
+                return SimpleNamespace(last_hidden_state=_torch.randn(B, L, 8))
+
+        import unittest.mock as _mock
+        with _mock.patch.object(MC.AutoModel, 'from_pretrained', return_value=_FakeLM()):
+            model = MC.CombinedBackboneModel(
+                'fake', hidden_size=8, dropout=0.0, head_hidden=8,
+                static_span=True, static_ext=True, static_ext_dim=3,
+                static_fuse_layers=1, static_fuse_heads=1)
+        check(model.static_proj.weight.shape == (8, 3)
+              and model.static_fuse is not None,
+              'static_ext creates the H x ext Linear + the fusion transformer')
+
+        B, L = 3, 6
+        batch = {
+            'input_ids': _torch.randint(4, 40, (B, L)),
+            'attention_mask': _torch.ones(B, L, dtype=_torch.long),
+            'mod_span_mask': _torch.tensor(
+                [[0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 0, 0], [0, 0, 1, 1, 0, 0]], dtype=_torch.bool),
+            'head_span_mask': _torch.tensor(
+                [[0, 0, 0, 0, 0, 0], [0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 1, 1]], dtype=_torch.bool),
+            'target': _torch.tensor([0, 1, 2], dtype=_torch.long),
+            'mod_static': _torch.randn(B, 3),
+            'head_static': _torch.randn(B, 3),
+            'pv_static': _torch.randn(B, 3),
+        }
+        model.eval()
+        with _torch.no_grad():
+            mod, head, pv, mod_sig, head_sig, pv_sig = model(
+                batch, with_logits=True, with_pv=True)
+        check(mod.shape == (B,) and pv.shape == (B,), 'combined ext-static predict shapes')
+        check(bool(mod_sig[0] > 0) and bool(head_sig[1] > 0) and bool(pv_sig[2] > 0),
+              'sigmas stay positive on routed rows through the ext-static fusion')
+
+        # Routing + gradient in TRAIN mode: the eval-mode score clamp turns any
+        # near-zero mu into exactly SCORE_MIN (0.0), so the "which row fired"
+        # check needs the un-clamped predictions.
+        model.train()
+        mod, head, pv, *_ = model(batch, with_logits=True, with_pv=True)
+        check(float(mod[0]) != 0.0 and float(mod[1]) == 0.0 and float(mod[2]) == 0.0,
+              'mod rows routed: only the mod target row is non-zero')
+        check(float(head[0]) == 0.0 and float(head[1]) != 0.0 and float(head[2]) == 0.0,
+              'head rows routed: only the head target row is non-zero')
+        check(float(pv[0]) == 0.0 and float(pv[1]) == 0.0 and float(pv[2]) != 0.0,
+              'pv rows routed: only the pv target row is non-zero')
+        (mod.sum() + head.sum() + pv.sum()).backward()
+        check(model.static_proj.weight.grad is not None
+              and bool(_torch.isfinite(model.static_proj.weight.grad).all()),
+              'gradient flows into static_proj (fusion is not frozen)')
+    except ImportError:
+        print('  [SKIP] numpy/torch unavailable; StaticVec + fusion functional checks skipped')
+    finally:
+        tmp.unlink()
+
+
 def main() -> int:
     sync_parse()
     check_config()
@@ -742,6 +918,7 @@ def main() -> int:
     check_folds()
     check_fixes()
     check_targets()
+    check_static_ext()
 
     print('=' * 50)
     if FAILURES:

@@ -24,7 +24,9 @@ from src.data import CompDataset, collate_comp, expand_targets
 from src.folds import CompoundGroupSampler
 from src.losses import GaussLoss
 from src.model import apply_lora, build_model, lora_parameters
+from src.static_vec import StaticVec
 from src.train import evaluate, track_optimizer_steps, train_epoch, unfreeze_top_layers
+from src.utils import resolve_paths
 
 
 def _safe_rho(y: np.ndarray, p: np.ndarray) -> float:
@@ -123,12 +125,37 @@ class Trainer:
             self.logger.info('Single-target mode: expanded to %d train / %d val rows (targets=%s)',
                              len(train_rows), len(val_rows), self.cfg.targets)
         self._val_rows = list(val_rows)
+
+        # Optional external static anchors (fastText/word2vec .vec) for the
+        # combined readout: load once up front, share across train/val.
+        static_vec = None
+        sep = (getattr(self.cfg, 'static_ext_path', None) or '').strip()
+        if sep:
+            cand = Path(sep)
+            candidates = [cand]
+            if not cand.is_absolute():
+                base = Path(self.cfg.data_path) if self.cfg.data_path else None
+                if base is not None:
+                    candidates.insert(0, base / sep)
+                candidates.append(Path('dataset') / sep)
+            path = next((p for p in candidates if p.is_file()), None)
+            if path is None:
+                raise FileNotFoundError(
+                    f'static_ext_path not found (tried: {candidates}): {sep}')
+            words = set()
+            for r in list(train_rows) + list(val_rows):
+                for k in ('mod', 'head', 'compound'):
+                    w = r.get(k)
+                    if w:
+                        words.add(w)
+            static_vec = StaticVec(path, self.cfg.static_ext_dim, words)
+
         train_ds = CompDataset(
             train_rows, tokenizer, max_len=self.cfg.max_context_length,
-            target_prefix=self.cfg.target_prefix)
+            target_prefix=self.cfg.target_prefix, static_vec=static_vec)
         val_ds = CompDataset(
             val_rows, tokenizer, max_len=self.cfg.max_context_length,
-            target_prefix=self.cfg.target_prefix)
+            target_prefix=self.cfg.target_prefix, static_vec=static_vec)
         
         # Chỉ bật persistent_workers khi num_workers > 0 để tránh deadlock
         num_workers = max(0, self.cfg.num_workers)
@@ -193,6 +220,9 @@ class Trainer:
         fuse = getattr(model, 'static_fuse', None)
         if fuse is not None:
             heads.append(fuse)
+        proj = getattr(model, 'static_proj', None)
+        if proj is not None:
+            heads.append(proj)
         seen = set()
         uniq: List[nn.Module] = []
         for m in heads:

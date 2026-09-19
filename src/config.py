@@ -104,6 +104,16 @@ class Config:
     static_span: bool = False
     static_fuse_layers: int = 1
     static_fuse_heads: int = 2
+    # Optional EXTERNAL static embeddings for the target constituents. When set
+    # (combined backend + static_span=True), the static pool fused into the
+    # readout comes from this word-vector .vec file (fastText/word2vec,
+    # whitespace "<word> <float> ..." lines) instead of the backbone's embedding
+    # table: the modifier/head surface forms are looked up word-level and
+    # projected to H. A different distribution than mmBERT's BPE table, so it
+    # anchors the readout against top-layer lexical drift AND gives German
+    # subword coverage fastText is known for. See src/static_vec.py.
+    static_ext_path: Optional[str] = None
+    static_ext_dim: int = 300
     # A/B escape hatch: also fully unfreeze top layers from this index (0 = off)
     unfreeze_from_layer: int = 0
     # LoRA adapter used during scoring (fresh rank, trained on the spot)
@@ -237,6 +247,13 @@ class Config:
         if self.static_fuse_layers < 1 or self.static_fuse_heads < 1:
             errors.append(f'static_fuse_layers/static_fuse_heads must be >= 1, got '
                           f'{self.static_fuse_layers}/{self.static_fuse_heads}')
+        if self.static_ext_path and self.model_backend != 'combined':
+            errors.append('static_ext_path requires model_backend="combined"')
+        if self.static_ext_path and not self.static_span:
+            errors.append('static_ext_path requires static_span=True (the external '
+                          'static vector is fused as the static pool)')
+        if self.static_ext_path and self.static_ext_dim < 1:
+            errors.append(f'static_ext_dim must be >= 1, got {self.static_ext_dim}')
 
         if self.batch_size < 1:
             errors.append(f'batch_size must be >= 1, got {self.batch_size}')

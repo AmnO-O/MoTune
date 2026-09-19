@@ -25,6 +25,11 @@ from .marks import Span, SpanResult, find_spans
 from .targets import MARKER_CODE, TARGETS, target_code
 from .utils import get_logger
 
+try:  # pragma: no cover - optional feature, torch is required for datasets anyway
+    from .static_vec import StaticVec
+except ImportError:
+    StaticVec = None
+
 _TARGET_CODE = {t: target_code(t) for t in TARGETS}
 
 logger = get_logger('src.data')
@@ -263,12 +268,14 @@ class CompDataset(_DatasetBase):
     """One sentence (tokenized verbatim) per row, for scoring."""
 
     def __init__(self, rows: List[Dict], tokenizer, max_len: int = 256,
-                 is_test: bool = False, target_prefix: bool = False):
+                 is_test: bool = False, target_prefix: bool = False,
+                 static_vec: Optional[StaticVec] = None):
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.is_test = is_test
         self.target_prefix = target_prefix
+        self.static_vec = static_vec
         self.items = [self._encode(r) for r in rows]
         self._report()
 
@@ -318,6 +325,27 @@ class CompDataset(_DatasetBase):
             'row_id': torch.tensor(int(r.get('row_id', 0)), dtype=torch.long),
             'is_pv': torch.tensor(bool(r.get('is_pv', False)), dtype=torch.bool),
         }
+        if self.static_vec is not None:
+            # External static anchors for the model_combined readout: the
+            # modifier/head/whole-compound SURFACE forms as (dim,) vectors
+            # (zero on OOV). PV rows are anchored on the WHOLE compound's own
+            # vector -- e.g. the fastText subword vector of a fused German
+            # "abgehauen" -- and only fall back to the mean of base+particle
+            # when the compound itself is OOV. (NN rows never route to the pv
+            # target, so their pv_static is inert.)
+            mod_v = self.static_vec.tensor(r.get('mod', ''))
+            head_v = self.static_vec.tensor(r.get('head', ''))
+            item['mod_static'] = mod_v
+            item['head_static'] = head_v
+            compound_v = self.static_vec.tensor(r.get('compound', ''))
+            if compound_v.norm() > 0:
+                pv_static = compound_v
+            else:
+                pv_static = 0.5 * (mod_v + head_v)
+                n = float(pv_static.norm())
+                if n > 0:                  # keep the anchor unit-length
+                    pv_static = pv_static / n
+            item['pv_static'] = pv_static
         if r.get('target') is not None:
             item['target'] = torch.tensor(_TARGET_CODE[r['target']], dtype=torch.long)
         return item

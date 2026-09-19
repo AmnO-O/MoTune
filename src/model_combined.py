@@ -93,12 +93,14 @@ class CombinedBackboneModel(nn.Module):
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
                  head_hidden: int = 128, target_prefix: bool = False,
                  static_span: bool = False,
+                 static_ext: bool = False, static_ext_dim: int = 300,
                  static_fuse_layers: int = 3, static_fuse_heads: int = 2):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
         self.target_prefix = target_prefix
         self.static_span = static_span
+        self.static_ext = static_span and static_ext
 
         self.lm = AutoModel.from_pretrained(backbone)
         # Alias kept for uniform reader code; NOT registered as a child so the
@@ -124,6 +126,13 @@ class CombinedBackboneModel(nn.Module):
             self.static_fuse = StaticFusion(
                 hidden_size, static_fuse_layers, static_fuse_heads, dropout=dropout,
             )
+        # External static anchor: projects each row's word-level static
+        # vectors (fastText/word2vec, from the dataset) to H so StaticFusion
+        # can stack them as type-tagged tokens alongside the contextual pool.
+        # Trains in the head group (head_lr) like the rest of the readout.
+        self.static_proj = None
+        if static_span and static_ext:
+            self.static_proj = nn.Linear(static_ext_dim, hidden_size)
         # ONE shared readout head. Every row answers exactly one target and
         # routing picks its prediction, so three per-target heads would just
         # split the (already small) training signal; a single head sees 3x
@@ -149,9 +158,21 @@ class CombinedBackboneModel(nn.Module):
         identical, and forward cost is ~3x cheaper for the readout. Joint
         mode (no target) still scores every row on every target.
         """
-        static = None
+        static = None        # token-level backbone table (static_span only)
+        ext = None           # {target: (B, H)} external static (static_ext)
         if self.static_span:
-            static = self.lm.get_input_embeddings()(batch['input_ids'])
+            if self.static_ext:
+                # External static: the row's constituent SURFACE forms were
+                # vectorized at dataset build time (fastText/word2vec .vec) and
+                # projected to H here. The pv anchor is the WHOLE compound's
+                # own vector (the dataset falls back to base+particle mean when
+                # the compound surface form is OOV).
+                mod_s = self.static_proj(batch['mod_static'])
+                head_s = self.static_proj(batch['head_static'])
+                ext = {'mod': mod_s, 'head': head_s,
+                       'pv': self.static_proj(batch['pv_static'])}
+            else:
+                static = self.lm.get_input_embeddings()(batch['input_ids'])
 
         targets = row_targets(batch)
         out = {}
@@ -159,11 +180,15 @@ class CombinedBackboneModel(nn.Module):
             for t in TARGETS:
                 pool = pool_span(hidden, batch, t)
                 if self.static_span:
+                    if ext is not None:
+                        static_pool = ext[t]
+                    else:
+                        static_pool = pool_span(static, batch, t)
                     # Transformer fusion of [contextual pool | static pool],
                     # not a raw concat: the two vectors are stacked as tokens
                     # with type embeddings and cross-attended by a learned
                     # query (n FusionBlock layers). Output stays (B, H).
-                    pool = self.static_fuse(pool, pool_span(static, batch, t))
+                    pool = self.static_fuse(pool, static_pool)
                 mu, sigma = self.gauss(pool)
                 out[t] = (mu, sigma)
             return out
@@ -171,7 +196,20 @@ class CombinedBackboneModel(nn.Module):
         # --- single-target fast path: one pool + one head pass per batch ---
         pool = pool_active(hidden, batch, targets)
         if self.static_span:
-            pool = self.static_fuse(pool, pool_active(static, batch, targets))
+            if ext is not None:
+                # Route each row to its OWN target's static anchor: default to
+                # the whole-compound vector, then overwrite mod/head rows.
+                dev = pool.device
+                static_v = ext['pv']
+                sel_mod = target_selector(targets, 'mod')
+                sel_head = target_selector(targets, 'head')
+                if sel_mod is not None:
+                    static_v = torch.where(sel_mod.to(dev).unsqueeze(-1), ext['mod'], static_v)
+                if sel_head is not None:
+                    static_v = torch.where(sel_head.to(dev).unsqueeze(-1), ext['head'], static_v)
+            else:
+                static_v = pool_active(static, batch, targets)
+            pool = self.static_fuse(pool, static_v)
         mu, sigma = self.gauss(pool)                       # (B,) routed already
         dev = mu.device
         zero = torch.zeros_like(mu)
@@ -263,6 +301,8 @@ def build_combined_model(cfg, device, load_from: Optional[str | Path] = None) ->
         head_hidden=cfg.head_hidden,
         target_prefix=bool(getattr(cfg, 'target_prefix', False)),
         static_span=bool(getattr(cfg, 'static_span', False)),
+        static_ext=bool(getattr(cfg, 'static_ext_path', None)),
+        static_ext_dim=int(getattr(cfg, 'static_ext_dim', 300)),
         static_fuse_layers=int(getattr(cfg, 'static_fuse_layers', 1)),
         static_fuse_heads=int(getattr(cfg, 'static_fuse_heads', 2)),
     )
