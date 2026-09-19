@@ -6,7 +6,7 @@
   "mlm_epochs": 5,
   "mlm_lr": 5e-5,
   "mlm_mask_prob": 0.8,
-  "mlm_from_layer": 18,
+  "mlm_from_layer": 17,
   "mlm_output_dir": "checkpoints/prefix_mlm_adapted",
 
   "mlm_batch_size": 64,

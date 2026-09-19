@@ -23,7 +23,7 @@
   "ccc_weight": 0.4,
   "ccc_var_floor": 0.05,
   "bin_sigma": 0.5,
-  "lambda_rank": 0.2,
+  "lambda_rank": 0,
   "rank_margin": 0.5,
   "rank_margin_mode": "clamp",
   "use_label_std": true,
