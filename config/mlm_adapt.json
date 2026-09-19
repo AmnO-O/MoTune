@@ -4,7 +4,7 @@
   "targets": ["mod", "head", "pv"],
   "max_context_length": 256,
 
-  "mlm_epochs": 3,
+  "mlm_epochs": 5,
   "mlm_lr": 5e-5,
   "mlm_mask_prob": 0.8,
   "mlm_from_layer": 18,
