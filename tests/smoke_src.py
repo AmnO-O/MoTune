@@ -554,6 +554,16 @@ def check_targets() -> None:
     check(bool(_torch.allclose(ppv[1], hidden[1, 4:6, :].mean(dim=0))),
           'pool_span(pv) on PV-only row is well-defined')
 
+    # pool_active: single-pass per-row routing == per-target pool_span result
+    import src.targets as TG
+    mixed = TG.pool_active(hidden, batch, [0, 1])          # row0 mod, row1 head
+    check(bool(_torch.allclose(mixed[0], pmod[0]))
+          and bool(_torch.allclose(mixed[1], phead[1])),
+          'pool_active routes each row to its own span in one pass')
+    pv_first = TG.pool_active(hidden, batch, ['pv', 'pv'])
+    check(bool(_torch.allclose(pv_first[0], hidden[0, 0:4, :].mean(dim=0))),
+          'pool_active pv pools the whole compound (mod|head)')
+
     # expand_targets: NN rows -> mod+head; PV rows -> pv; nothing else
     nn = {'is_pv': False, 'mod_avg': 3.5, 'head_avg': 3.8, 'has_label': True,
           'compound': 'flea market', 'mod': 'flea', 'head': 'market'}
@@ -674,12 +684,23 @@ def check_targets() -> None:
           and "object.__setattr__(self, 'pv_gauss', self.gauss)" in m_src,
           'CombinedBackboneModel shares ONE GaussHead across all targets')
 
-    # model: static_span concats the frozen embedding-table pool
-    check("static = self.lm.get_input_embeddings()(batch['input_ids'])" in m_src
-          and "torch.cat([pool, pool_span(static, batch, t)], dim=-1)" in m_src,
-          'CombinedBackboneModel concats static span pool when static_span on')
-    check("self.head_in = hidden_size * (2 if static_span else 1)" in m_src,
-          'CombinedBackboneModel doubles head_in for static_span')
+    # model: static_span fuses ctx+static pools via a transformer (FusionBlock)
+    check("self.static_fuse = StaticFusion(" in m_src
+          and "FusionBlock(hidden, num_heads, ffn_expansion=2" in m_src,
+          'StaticFusion reuses FusionBlock for a single fused (B,H) vector')
+    check("pool = self.static_fuse(pool, pool_span(static, batch, t))" in m_src
+          or "pool = self.static_fuse(pool, pool_active(static, batch, targets))" in m_src,
+          'CombinedBackboneModel fuses ctx+static pools via StaticFusion (no concat)')
+    check("torch.cat([pool, pool_span(static, batch, t)], dim=-1)" not in m_src,
+          'static_span no longer uses a raw feature concat')
+    check("self.head_in = hidden_size" in m_src
+          and "static_fuse_layers=int(getattr(cfg, 'static_fuse_layers', 1))" in m_src,
+          'head_in stays hidden_size; build_combined_model forwards fusion knobs')
+
+    # single-pass routing: one pool + one shared-head call for the whole batch
+    check("pool = pool_active(hidden, batch, targets)" in m_src
+          and "mu, sigma = self.gauss(pool)" in m_src,
+          'fast path pools each row OWN span once and runs the shared head once')
 
     # config: build_combined_model forwards both flags
     check("target_prefix=bool(getattr(cfg, 'target_prefix', False))" in m_src
@@ -695,6 +716,17 @@ def check_targets() -> None:
     cfg_sp = Config(static_span=True, model_backend='combined', targets=['mod'])
     check(cfg_sp.static_span is True,
           'Config accepts static_span=True with model_backend=combined')
+    try:
+        Config(static_span=True, model_backend='combined', targets=['mod'],
+               static_fuse_layers=0).validate()
+        check(False, 'Config rejects static_fuse_layers=0')
+    except ValueError:
+        check(True, 'Config rejects static_fuse_layers=0')
+
+    # static_fuse joins the head group (trained at head_lr in phase 1)
+    check("fuse = getattr(model, 'static_fuse', None)" in tr_src
+          and "heads.append(fuse)" in tr_src,
+          'trainer._pred_heads folds static_fuse into the head_lr group')
 
 
 def main() -> int:

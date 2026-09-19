@@ -136,6 +136,9 @@ class Trainer:
         marker = getattr(model, 'marker_emb', None)
         if marker is not None:
             heads.append(marker)
+        fuse = getattr(model, 'static_fuse', None)
+        if fuse is not None:
+            heads.append(fuse)
         seen = set()
         uniq: List[nn.Module] = []
         for m in heads:

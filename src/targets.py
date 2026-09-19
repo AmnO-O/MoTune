@@ -91,3 +91,27 @@ def pool_span(hidden: torch.Tensor, batch, t: str) -> torch.Tensor:
     mask = mask.float().unsqueeze(-1)
     counts = mask.sum(dim=1).clamp(min=1.0)
     return (hidden * mask).sum(dim=1) / counts
+
+
+def pool_active(hidden: torch.Tensor, batch, targets: Sequence[str]) -> torch.Tensor:
+    """Masked-mean over each row's OWN active-target span, in one pass.
+
+    Rows are heterogeneously routed: a row with target 'mod' pools the
+    modifier span, 'head' pools the head-noun span, 'pv' pools the whole
+    compound (mod | head). Returns one ``(B, H)`` vector per row, so a shared
+    head runs ONCE for the whole batch instead of once per target with the
+    inactive outputs zeroed by ``torch.where`` afterwards.
+    """
+    mod_mask = batch['mod_span_mask']
+    head_mask = batch['head_span_mask']
+    pv_mask = mod_mask | head_mask
+    codes = [target_code(x) for x in targets]
+    choices = torch.stack([mod_mask, head_mask, pv_mask], dim=0)   # (3, B, T)
+    rows = torch.arange(hidden.size(0), device=choices.device)
+    mask = choices[
+        torch.as_tensor(codes, device=choices.device, dtype=torch.long), rows
+    ]    # (B, T): row r gets its own target's span mask
+
+    mask = mask.float().unsqueeze(-1)
+    counts = mask.sum(dim=1).clamp(min=1.0)
+    return (hidden * mask).sum(dim=1) / counts

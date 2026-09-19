@@ -45,7 +45,46 @@ from transformers import AutoModel
 
 from .constants import SCORE_MIN, SCORE_MAX
 from .heads import GaussHead
-from .targets import TARGETS, pool_span, row_targets, target_selector
+from .model import FusionBlock
+from .targets import TARGETS, pool_active, pool_span, row_targets, target_selector
+
+
+class StaticFusion(nn.Module):
+    """Cross-attention fusion of the contextual pool and the static pool.
+
+    Instead of ``torch.cat([ctx, static])`` (which doubles the head input and
+    forces a Linear to re-project on every forward), treat the two ``(B, H)``
+    vectors as a 2-token sequence ``[ctx, static]`` with distinct type
+    embeddings, and let a learned query cross-attend over them through
+    ``FusionBlock`` layers (the same gated cross-attn + FFN transformer used
+    by ``SpanFusion`` in :mod:`src.model`). Output is one ``(B, H)`` vector:
+    the transformer itself learns how to weight the contextual vs. the
+    general meaning, so the head input dim stays ``H``.
+
+    Freshly initialized and trained in the head group (``head_lr``) like the
+    rest of the readout.
+    """
+
+    def __init__(self, hidden: int, num_layers: int = 1, num_heads: int = 2,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            FusionBlock(hidden, num_heads, ffn_expansion=2, dropout=dropout)
+            for _ in range(max(1, num_layers))
+        ])
+        self.type_emb = nn.Parameter(torch.empty(2, hidden))
+        nn.init.normal_(self.type_emb, std=0.02)
+        self.fuse_q = nn.Parameter(torch.empty(1, 1, hidden))
+        nn.init.normal_(self.fuse_q, std=0.02)
+
+    def forward(self, ctx: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        kv = torch.stack([ctx, static], dim=1)              # (B, 2, H)
+        type_ids = torch.tensor([0, 1], device=ctx.device, dtype=torch.long)
+        kv = kv + self.type_emb[type_ids]                   # role-aware tokens
+        q = self.fuse_q.expand(ctx.size(0), -1, -1)         # (B, 1, H)
+        for layer in self.layers:
+            q = layer(q, kv)
+        return q.squeeze(1)
 
 
 class CombinedBackboneModel(nn.Module):
@@ -53,7 +92,8 @@ class CombinedBackboneModel(nn.Module):
 
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
                  head_hidden: int = 128, target_prefix: bool = False,
-                 static_span: bool = False):
+                 static_span: bool = False,
+                 static_fuse_layers: int = 1, static_fuse_heads: int = 2):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
@@ -72,11 +112,18 @@ class CombinedBackboneModel(nn.Module):
         # from layer 0 WITHOUT touching the frozen 256k embedding matrix.
         self.marker_emb = nn.Embedding(3, hidden_size) if target_prefix else None
 
-        # Readout feature: always the final-layer span pool; with static_span
-        # we concat the span's frozen embedding-table mean (the word's general,
-        # context-free meaning) so the head can blend "what it means" +
-        # "what it means here".
-        self.head_in = hidden_size * (2 if static_span else 1)
+        # Readout feature: always the final-layer span pool. With static_span
+        # the pool is fused with the span's frozen embedding-table mean (its
+        # general, context-free meaning) by a tiny cross-attention transformer
+        # (reusing FusionBlock) instead of a raw concat -- the head never sees
+        # a doubled input dim, and the transformer learns how to blend
+        # "what the word means" with "what it means here".
+        self.head_in = hidden_size
+        self.static_fuse = None
+        if static_span:
+            self.static_fuse = StaticFusion(
+                hidden_size, static_fuse_layers, static_fuse_heads, dropout=dropout,
+            )
         # ONE shared readout head. Every row answers exactly one target and
         # routing picks its prediction, so three per-target heads would just
         # split the (already small) training signal; a single head sees 3x
@@ -92,21 +139,50 @@ class CombinedBackboneModel(nn.Module):
 
     # ------------------------------------------------------------------ #
     def _predict(self, hidden: torch.Tensor, batch) -> dict:
-        """Per-target (mu, sigma) on the pooled span of that target."""
+        """Per-target (mu, sigma) on the pooled span of that target.
+
+        Single-target mode (``batch['target']`` present): every row has
+        exactly ONE active target, so we pool each row's OWN span in a single
+        pass (``pool_active``) and run the shared head exactly once for the
+        whole batch -- instead of 3 heads-pass (one per target) followed by
+        ``torch.where`` cleanup. The head sees each row once, gradients are
+        identical, and forward cost is ~3x cheaper for the readout. Joint
+        mode (no target) still scores every row on every target.
+        """
         static = None
         if self.static_span:
             static = self.lm.get_input_embeddings()(batch['input_ids'])
+
+        targets = row_targets(batch)
         out = {}
+        if targets is None:
+            for t in TARGETS:
+                pool = pool_span(hidden, batch, t)
+                if self.static_span:
+                    # Transformer fusion of [contextual pool | static pool],
+                    # not a raw concat: the two vectors are stacked as tokens
+                    # with type embeddings and cross-attended by a learned
+                    # query (n FusionBlock layers). Output stays (B, H).
+                    pool = self.static_fuse(pool, pool_span(static, batch, t))
+                mu, sigma = self.gauss(pool)
+                out[t] = (mu, sigma)
+            return out
+
+        # --- single-target fast path: one pool + one head pass per batch ---
+        pool = pool_active(hidden, batch, targets)
+        if self.static_span:
+            pool = self.static_fuse(pool, pool_active(static, batch, targets))
+        mu, sigma = self.gauss(pool)                       # (B,) routed already
+        dev = mu.device
+        zero = torch.zeros_like(mu)
+        zero_s = torch.zeros_like(sigma)
         for t in TARGETS:
-            pool = pool_span(hidden, batch, t)
-            if self.static_span:
-                pool = torch.cat([pool, pool_span(static, batch, t)], dim=-1)
-            mu, sigma = self._heads()[t](pool)
-            sel = target_selector(row_targets(batch), t)
-            if sel is not None and not sel.any():
-                mu = torch.zeros_like(mu)
-                sigma = torch.zeros_like(sigma)
-            out[t] = (mu, sigma)
+            sel = target_selector(targets, t)
+            if sel is None:
+                out[t] = (mu, sigma)
+            else:
+                sel = sel.to(dev)
+                out[t] = (torch.where(sel, mu, zero), torch.where(sel, sigma, zero_s))
         return out
 
     def _route(self, preds: dict, batch) -> tuple:
@@ -183,6 +259,8 @@ def build_combined_model(cfg, device, load_from: Optional[str | Path] = None) ->
         head_hidden=cfg.head_hidden,
         target_prefix=bool(getattr(cfg, 'target_prefix', False)),
         static_span=bool(getattr(cfg, 'static_span', False)),
+        static_fuse_layers=int(getattr(cfg, 'static_fuse_layers', 1)),
+        static_fuse_heads=int(getattr(cfg, 'static_fuse_heads', 2)),
     )
     if load_from is not None:
         load_from = Path(load_from)

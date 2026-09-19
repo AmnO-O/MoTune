@@ -97,7 +97,13 @@ class Config:
     # Concat the frozen embedding-table mean of the span (word's general,
     # context-free meaning) with the final-layer contextualized pool, so the
     # readout blends "what the word means" and "what it means here".
+    # Fused via a small cross-attention transformer (``FusionBlock`` from
+    # src/model.py), NOT a raw concat: the two pools are stacked as tokens with
+    # type embeddings and refined by a learned query, so the head never sees a
+    # doubled input dim.
     static_span: bool = False
+    static_fuse_layers: int = 1
+    static_fuse_heads: int = 2
     # A/B escape hatch: also fully unfreeze top layers from this index (0 = off)
     unfreeze_from_layer: int = 0
     # LoRA adapter used during scoring (fresh rank, trained on the spot)
@@ -223,6 +229,9 @@ class Config:
             errors.append('target_prefix requires model_backend="combined"')
         if self.static_span and self.model_backend != 'combined':
             errors.append('static_span requires model_backend="combined"')
+        if self.static_fuse_layers < 1 or self.static_fuse_heads < 1:
+            errors.append(f'static_fuse_layers/static_fuse_heads must be >= 1, got '
+                          f'{self.static_fuse_layers}/{self.static_fuse_heads}')
 
         if self.batch_size < 1:
             errors.append(f'batch_size must be >= 1, got {self.batch_size}')
