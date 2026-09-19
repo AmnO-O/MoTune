@@ -93,7 +93,7 @@ class CombinedBackboneModel(nn.Module):
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
                  head_hidden: int = 128, target_prefix: bool = False,
                  static_span: bool = False,
-                 static_fuse_layers: int = 2, static_fuse_heads: int = 2):
+                 static_fuse_layers: int = 3, static_fuse_heads: int = 2):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
