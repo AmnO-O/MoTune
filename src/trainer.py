@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 from scipy.stats import spearmanr
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler
 from transformers import get_constant_schedule, get_linear_schedule_with_warmup
@@ -214,12 +215,13 @@ class Trainer:
 
         groups = []
         if self.cfg.embedding_lr > 0 and emb:
-            groups.append({'params': emb, 'lr': self.cfg.embedding_lr, 'weight_decay': 0.0})
+            groups.append({'params': emb, 'lr': self.cfg.embedding_lr,
+                           'weight_decay': 0.0, 'tag': 'frozen'})
         groups.append({'params': head, 'lr': self.cfg.head_lr,
-                       'weight_decay': self.cfg.weight_decay})
+                       'weight_decay': self.cfg.weight_decay, 'tag': 'head'})
         if others:
             groups.append({'params': others, 'lr': self.cfg.encoder_lr,
-                           'weight_decay': self.cfg.weight_decay})
+                           'weight_decay': self.cfg.weight_decay, 'tag': 'encoder'})
         self.logger.info('Phase %d param groups: %s',
                          phase, [len(g['params']) for g in groups])
         return groups
@@ -251,8 +253,19 @@ class Trainer:
         if phase == 1:
             scheduler = get_constant_schedule(optimizer)
         else:
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer, num_warmup_steps=0, num_training_steps=steps)
+            # Decouple the LR schedules in phase 2: LoRA/encoder anneals to 0
+            # while the heads keep fitting at head_lr. Annealing the head group
+            # too lets the encoder drift the features underneath a head that can
+            # no longer update -- train ρ collapses and the run flat-lines
+            # (underfit / feature drift).
+            n_steps = int(max(1, steps))
+            lr_lambda = [
+                (lambda step: 1.0)
+                if g.get('tag', 'encoder') == 'head'
+                else (lambda step: max(0.0, 1.0 - step / n_steps))
+                for g in groups
+            ]
+            scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return optimizer, scheduler
 
     # ------------------------------------------------------------------ #
