@@ -10,7 +10,7 @@
   "lora_epochs": 15,
   "lora_rank": 8,
   "lora_alpha": 16,
-  "lora_from_layer": 18,
+  "lora_from_layer": 20,
   "lora_dropout": 0.2,
   "batch_size": 64,
   "accum_steps": 1,
