@@ -17,6 +17,7 @@ import logging
 import sys
 import time
 import warnings
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -187,7 +188,50 @@ def _build_parser() -> argparse.ArgumentParser:
                     help='Run a quick pipeline sanity check (1 batch, no checkpoint)')
     ap.add_argument('--mlm-adapt', action='store_true',
                     help='Run Stage 1 Task-Adaptive Prefix MLM pre-training')
+    ap.add_argument('--check-config', action='store_true',
+                    help='Validate the effective config, print it, and exit without training')
     return ap
+
+
+def _print_config(cfg: Config) -> None:
+    """Print the resolved config as JSON (no device, no output dirs touched)."""
+    print('=== EFFECTIVE CONFIG ===')
+    print(json.dumps(asdict(cfg), indent=2, sort_keys=True, ensure_ascii=False))
+    print('=== CONFIG OK ===')
+
+
+def _startup_check(logger, cfg: Config, device_str: str) -> None:
+    """Log every resolved config field + key environment facts before the
+    training phase starts, so a wrong config is visible in the very first logs.
+    """
+    logger.info('=' * 70)
+    logger.info('CONFIG CHECK (start of run, before training phase)')
+    logger.info('=' * 70)
+    for k, v in asdict(cfg).items():
+        logger.info('  cfg.%-22s %s', k, v)
+    logger.info('--- environment ---')
+    logger.info('  %-28s %s', 'python', sys.version.split()[0])
+    try:
+        import torch as _t
+        logger.info('  %-28s %s (cuda_available=%s)', 'torch', _t.__version__, _t.cuda.is_available())
+        if device_str.startswith('cuda') and _t.cuda.is_available():
+            try:
+                _i = 0 if device_str == 'cuda' else int(device_str.split(':')[1])
+                logger.info('  %-28s %s', 'gpu', _t.cuda.get_device_name(_i))
+            except Exception:
+                pass
+            free, total = _t.cuda.mem_get_info(0)
+            logger.info('  %-28s %.2f / %.2f GiB free', 'gpu memory', free / 2**30, total / 2**30)
+    except Exception as exc:
+        logger.info('  %-28s error: %s', 'torch', exc)
+    try:
+        import transformers as _tf
+        logger.info('  %-28s %s', 'transformers', _tf.__version__)
+    except Exception as exc:
+        logger.info('  %-28s error: %s', 'transformers', exc)
+    logger.info('=' * 70)
+    logger.info('CONFIG CHECK OK')
+    logger.info('=' * 70)
 
 
 def main() -> None:
@@ -196,12 +240,16 @@ def main() -> None:
 
     cfg = _build_config(args)
     cfg.validate()
+    if args.check_config:
+        _print_config(cfg)
+        return
     device_str = _lock_device(args.device)
     data_dir, output_dir = resolve_paths(cfg)
 
     logger = get_logger('src', log_dir=str(output_dir), level=logging.INFO)
     logger.info('Config: %s | device=%s', args.config or '(defaults)', device_str)
     cfg.save(output_dir / 'config.json')
+    _startup_check(logger, cfg, device_str)
     if args.smoke:
         logger.info('=== SMOKE MODE ===')
         _smoke(logger, device_str)

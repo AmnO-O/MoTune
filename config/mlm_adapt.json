@@ -1,7 +1,6 @@
 {
   "mode": "train80",
   "backbone": "jhu-clsp/mmBERT-base",
-  "targets": ["mod", "head", "pv"],
   "max_context_length": 256,
 
   "mlm_epochs": 5,

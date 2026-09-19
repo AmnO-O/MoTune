@@ -372,7 +372,7 @@ def coerce_value(name: str, raw: Any, cfg: type = Config) -> Any:
         raw = raw.strip()
         if len(raw) >= 2 and raw[0] in ('[', '(') and raw[-1] in (']', ')'):
             raw = raw[1:-1]
-        return [x.strip() for x in raw.split(',') if x.strip()]
+        return [x.strip().strip('\'"') for x in raw.split(',') if x.strip()]
     if type_ == 'int':
         return int(raw)
     if type_ == 'float':

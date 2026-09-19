@@ -2,7 +2,6 @@
   "mode": "train80",
   "backbone": "jhu-clsp/mmBERT-base",
   "model_backend": "combined",
-  "targets": ["mod", "head", "pv"],
   "target_prefix": true,
   "prefix_readout": "dual",
   "max_context_length": 256,
