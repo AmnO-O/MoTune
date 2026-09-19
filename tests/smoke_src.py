@@ -654,6 +654,48 @@ def check_targets() -> None:
     check('target_prefix=self.cfg.target_prefix' in tr_src,
           'trainer passes target_prefix to CompDataset')
 
+    # model: learned marker embedding folded into the head group
+    check("self.marker_emb = nn.Embedding(3, hidden_size) if target_prefix else None" in m_src,
+          'CombinedBackboneModel creates a learned 3xH marker embedding when target_prefix on')
+    check("hidden_states[:, 1] = marker" in m_src
+          and "inputs_embeds=hidden_states" in m_src,
+          'CombinedBackboneModel overwrites position 1 with the learned marker vector')
+    check("marker = getattr(model, 'marker_emb', None)" in tr_src
+          and "heads.append(marker)" in tr_src,
+          'trainer._pred_heads folds marker_emb into the head_lr group')
+    check("seen = set()" in tr_src
+          and "if id(m) not in seen:" in tr_src,
+          'trainer._pred_heads dedupes shared-head aliases by module identity')
+
+    # model: single shared GaussHead (mod/head/pv_gauss all alias the same module)
+    check("self.gauss = GaussHead(self.head_in, head_hidden, dropout=dropout)" in m_src
+          and "object.__setattr__(self, 'mod_gauss', self.gauss)" in m_src
+          and "object.__setattr__(self, 'head_gauss', self.gauss)" in m_src
+          and "object.__setattr__(self, 'pv_gauss', self.gauss)" in m_src,
+          'CombinedBackboneModel shares ONE GaussHead across all targets')
+
+    # model: static_span concats the frozen embedding-table pool
+    check("static = self.lm.get_input_embeddings()(batch['input_ids'])" in m_src
+          and "torch.cat([pool, pool_span(static, batch, t)], dim=-1)" in m_src,
+          'CombinedBackboneModel concats static span pool when static_span on')
+    check("self.head_in = hidden_size * (2 if static_span else 1)" in m_src,
+          'CombinedBackboneModel doubles head_in for static_span')
+
+    # config: build_combined_model forwards both flags
+    check("target_prefix=bool(getattr(cfg, 'target_prefix', False))" in m_src
+          and "static_span=bool(getattr(cfg, 'static_span', False))" in m_src,
+          'build_combined_model forwards target_prefix/static_span from cfg')
+
+    from src.config import Config
+    try:
+        Config(static_span=True, targets=['mod']).validate()
+        check(False, 'Config rejects static_span=True with backend=exits')
+    except ValueError:
+        check(True, 'Config rejects static_span=True with backend=exits')
+    cfg_sp = Config(static_span=True, model_backend='combined', targets=['mod'])
+    check(cfg_sp.static_span is True,
+          'Config accepts static_span=True with model_backend=combined')
+
 
 def main() -> int:
     sync_parse()

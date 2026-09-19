@@ -94,6 +94,10 @@ class Config:
     # (task conditioning from layer 0). Off = span-pool only. Always requires
     # the combined backend; ignored in joint mode (empty targets).
     target_prefix: bool = False
+    # Concat the frozen embedding-table mean of the span (word's general,
+    # context-free meaning) with the final-layer contextualized pool, so the
+    # readout blends "what the word means" and "what it means here".
+    static_span: bool = False
     # A/B escape hatch: also fully unfreeze top layers from this index (0 = off)
     unfreeze_from_layer: int = 0
     # LoRA adapter used during scoring (fresh rank, trained on the spot)
@@ -215,6 +219,10 @@ class Config:
             )
         if self.target_prefix and not self.targets:
             errors.append('target_prefix requires a non-empty targets list (single-target mode)')
+        if self.target_prefix and self.model_backend != 'combined':
+            errors.append('target_prefix requires model_backend="combined"')
+        if self.static_span and self.model_backend != 'combined':
+            errors.append('static_span requires model_backend="combined"')
 
         if self.batch_size < 1:
             errors.append(f'batch_size must be >= 1, got {self.batch_size}')

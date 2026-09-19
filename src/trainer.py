@@ -122,8 +122,27 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     def _pred_heads(self, model) -> List[nn.Module]:
-        """The NN modifier/head exits and the overall PV composition exit."""
-        return [model.mod_gauss, model.head_gauss, model.pv_gauss]
+        """The NN modifier/head exits and the overall PV composition exit.
+
+        The combined backend shares ONE GaussHead behind the
+        ``mod/head/pv_gauss`` names, so modules are deduped by identity here
+        (otherwise the same parameters would appear 3x in the head group and
+        get triple-updated by the optimizer). A learned per-target marker
+        embedding (combined backend with ``target_prefix``) is also folded in
+        so it trains at ``head_lr`` in phase 1 instead of being starved at
+        ``encoder_lr``.
+        """
+        heads: List[nn.Module] = [model.mod_gauss, model.head_gauss, model.pv_gauss]
+        marker = getattr(model, 'marker_emb', None)
+        if marker is not None:
+            heads.append(marker)
+        seen = set()
+        uniq: List[nn.Module] = []
+        for m in heads:
+            if id(m) not in seen:
+                seen.add(id(m))
+                uniq.append(m)
+        return uniq
 
     # ------------------------------------------------------------------ #
     def _param_groups(self, model, adapters, phase: int):

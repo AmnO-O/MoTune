@@ -52,30 +52,55 @@ class CombinedBackboneModel(nn.Module):
     """One Gaussian per row: final-layer pool of the active target's span."""
 
     def __init__(self, backbone: str, hidden_size: int = 768, dropout: float = 0.2,
-                 head_hidden: int = 128):
+                 head_hidden: int = 128, target_prefix: bool = False,
+                 static_span: bool = False):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
+        self.target_prefix = target_prefix
+        self.static_span = static_span
 
         self.lm = AutoModel.from_pretrained(backbone)
         # Alias kept for uniform reader code; NOT registered as a child so the
         # state_dict keys/parameters are not duplicated (see src/model.py).
         object.__setattr__(self, 'base_model', self.lm)
 
-        self.head_in = hidden_size          # single span pool per target
-        self.mod_gauss = GaussHead(hidden_size, head_hidden, dropout=dropout)
-        self.head_gauss = GaussHead(hidden_size, head_hidden, dropout=dropout)
-        self.pv_gauss = GaussHead(hidden_size, head_hidden, dropout=dropout)
+        # Learned per-target marker (3 vectors: mod/head/pv). The batch's
+        # input_ids carry one of mmBERT's unused vocab ids (7/8/9) right after
+        # <bos>; in forward we OVERWRITE that position's base embedding with
+        # this module's vector, so the backbone sees a learnable task token
+        # from layer 0 WITHOUT touching the frozen 256k embedding matrix.
+        self.marker_emb = nn.Embedding(3, hidden_size) if target_prefix else None
+
+        # Readout feature: always the final-layer span pool; with static_span
+        # we concat the span's frozen embedding-table mean (the word's general,
+        # context-free meaning) so the head can blend "what it means" +
+        # "what it means here".
+        self.head_in = hidden_size * (2 if static_span else 1)
+        # ONE shared readout head. Every row answers exactly one target and
+        # routing picks its prediction, so three per-target heads would just
+        # split the (already small) training signal; a single head sees 3x
+        # more rows per parameter. The names mod/head/pv_gauss are kept as
+        # aliases of the same module so the trainer/run.py wiring is unchanged.
+        self.gauss = GaussHead(self.head_in, head_hidden, dropout=dropout)
+        object.__setattr__(self, 'mod_gauss', self.gauss)
+        object.__setattr__(self, 'head_gauss', self.gauss)
+        object.__setattr__(self, 'pv_gauss', self.gauss)
 
     def _heads(self) -> dict:
-        return {'mod': self.mod_gauss, 'head': self.head_gauss, 'pv': self.pv_gauss}
+        return {'mod': self.gauss, 'head': self.gauss, 'pv': self.gauss}
 
     # ------------------------------------------------------------------ #
     def _predict(self, hidden: torch.Tensor, batch) -> dict:
         """Per-target (mu, sigma) on the pooled span of that target."""
+        static = None
+        if self.static_span:
+            static = self.lm.get_input_embeddings()(batch['input_ids'])
         out = {}
         for t in TARGETS:
             pool = pool_span(hidden, batch, t)
+            if self.static_span:
+                pool = torch.cat([pool, pool_span(static, batch, t)], dim=-1)
             mu, sigma = self._heads()[t](pool)
             sel = target_selector(row_targets(batch), t)
             if sel is not None and not sel.any():
@@ -108,11 +133,24 @@ class CombinedBackboneModel(nn.Module):
                 mod_sigma, head_sigma, pv_sigma)
 
     def _forward_gauss(self, batch, with_logits: bool = False, with_pv: bool = False):
-        outputs = self.lm(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            output_hidden_states=False,
-        )
+        if self.target_prefix:
+            emb = self.lm.get_input_embeddings()
+            hidden_states = emb(batch['input_ids'])
+            hidden_states = hidden_states.clone()
+            codes = batch['target']
+            marker = self.marker_emb(codes.to(hidden_states.device))
+            hidden_states[:, 1] = marker
+            outputs = self.lm(
+                inputs_embeds=hidden_states,
+                attention_mask=batch['attention_mask'],
+                output_hidden_states=False,
+            )
+        else:
+            outputs = self.lm(
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                output_hidden_states=False,
+            )
         preds = self._predict(outputs.last_hidden_state, batch)
         (mod_pred, head_pred, pv_pred,
          mod_sigma, head_sigma, pv_sigma) = self._route(preds, batch)
@@ -143,6 +181,8 @@ def build_combined_model(cfg, device, load_from: Optional[str | Path] = None) ->
     model = CombinedBackboneModel(
         cfg.backbone, hidden_size=cfg.hidden_size, dropout=cfg.dropout,
         head_hidden=cfg.head_hidden,
+        target_prefix=bool(getattr(cfg, 'target_prefix', False)),
+        static_span=bool(getattr(cfg, 'static_span', False)),
     )
     if load_from is not None:
         load_from = Path(load_from)
