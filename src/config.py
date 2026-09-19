@@ -128,6 +128,11 @@ class Config:
     patience: int = 4
     num_workers: int = 2
 
+    # === ema ===
+    # Exponential moving average of trainable weights, swapped in for
+    # validation / checkpointing. 0 = disabled.
+    ema_decay: float = 0.0
+
     # === losses ===
     ccc_weight: float = 0.7
     ccc_var_floor: float = 0.05
@@ -253,6 +258,8 @@ class Config:
 
         if self.patience < 1:
             errors.append(f'patience must be >= 1, got {self.patience}')
+        if not 0 <= self.ema_decay < 1:
+            errors.append(f'ema_decay must be in [0, 1), got {self.ema_decay}')
         if self.head_lr <= 0 or self.encoder_lr <= 0:
             errors.append(
                 f'lrs must be positive, got head_lr={self.head_lr}, encoder_lr={self.encoder_lr}'

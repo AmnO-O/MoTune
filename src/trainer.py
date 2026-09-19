@@ -36,6 +36,59 @@ def _embeddings(model) -> nn.Module:
     return model.lm.get_input_embeddings()
 
 
+class WeightEMA:
+    """Shadow-copy exponential moving average over the trainable parameters.
+
+    ``update`` is called once per real optimizer step; ``apply_to``/``restore``
+    temporarily load the averaged weights into the live module so validation,
+    checkpointing and ``best`` predictions all come from the denoised model.
+    Params that are frozen at any given time (backbone, phase-1 LoRA) are
+    tracked but never blended, and begin averaging from their current value the
+    moment they become trainable (phase-2 unfreeze). Shadows live on CPU so the
+    EMA never consumes the scarce device memory.
+    """
+
+    def __init__(self, decay: float):
+        self.decay = float(decay)
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.raw: Dict[str, torch.Tensor] = {}
+        self._params: List[tuple] = []
+        self._applied = False
+
+    def register(self, model) -> None:
+        self._params = list(model.named_parameters())
+        for name, p in self._params:
+            self.shadow[name] = p.detach().cpu().clone()
+
+    def _active(self) -> List[tuple]:
+        return [(n, p) for n, p in self._params if p.requires_grad]
+
+    def update(self, model) -> None:
+        if not self._params:
+            self.register(model)
+        with torch.no_grad():
+            d = self.decay
+            for name, p in self._active():
+                self.shadow[name].mul_(d).add_(p.detach().cpu(), alpha=1 - d)
+
+    def apply_to(self, model) -> None:
+        if self._applied:
+            return
+        self.raw.clear()
+        for name, p in self._active():
+            self.raw[name] = p.detach().cpu().clone()
+            p.data.copy_(self.shadow[name])
+        self._applied = True
+
+    def restore(self, model) -> None:
+        if not self._applied:
+            return
+        for name, p in self._active():
+            p.data.copy_(self.raw[name])
+        self.raw.clear()
+        self._applied = False
+
+
 @dataclass
 class FoldResult:
     fold: Optional[int]
@@ -211,6 +264,11 @@ class Trainer:
         self.logger.info("Building model architecture (load_from=%s)...", load_from)
         model = build_model(self.cfg, self.device, load_from=load_from)
         adapters = self._apply_lora(model)
+        ema = WeightEMA(self.cfg.ema_decay) if self.cfg.ema_decay > 0 else None
+        if ema is not None:
+            ema.register(model)
+            self.logger.info('EMA on: tracking %d params (decay=%.4f)',
+                             len(ema.shadow), self.cfg.ema_decay)
 
         steps_per_epoch = math.ceil(len(train_loader) / self.cfg.accum_steps)
         if self.cfg.freeze_epochs > 0:
@@ -269,6 +327,7 @@ class Trainer:
                 optimizer, scheduler = self._optimizer(
                     model, adapters, phase=2,
                     steps=steps_per_epoch * self.cfg.lora_epochs)
+                no_improve_epochs = 0   # fresh patience window for the LoRA phase
 
             phase = 'FROZEN' if epoch < self.cfg.freeze_epochs else 'UNFROZEN-TOP'
             diag: Dict[str, float] = {}
@@ -277,6 +336,7 @@ class Trainer:
                 model, train_loader, optimizer, scheduler, criterion, scaler,
                 self.device, grad_clip=self.cfg.grad_clip,
                 accum_steps=self.cfg.accum_steps, report=diag,
+                ema=ema,
             )
 
             # Compute train rho directly from in-epoch predictions
@@ -294,8 +354,14 @@ class Trainer:
             else:
                 tr_rho_m = tr_rho_h = 0.0
 
-            val_mod, val_head, val_pv, val_mod_y, val_head_y, val_mask = evaluate(
-                model, val_loader, self.device, return_all=True, return_pv=True)
+            if ema is not None:
+                ema.apply_to(model)
+            try:
+                val_mod, val_head, val_pv, val_mod_y, val_head_y, val_mask = evaluate(
+                    model, val_loader, self.device, return_all=True, return_pv=True)
+            finally:
+                if ema is not None:
+                    ema.restore(model)
 
             is_pv_mask = np.array([bool(r.get('is_pv', False)) for r in self._val_rows])
             nn_mask = val_mask & (~is_pv_mask)
@@ -378,15 +444,18 @@ class Trainer:
                     'head_y': val_head_y[sel_head].copy() if sel_head.any() else np.array([]),
                     'rho_mod': rho_mod, 'rho_head': rho_head, 'rho_pv': rho_pv,
                 }
+                if ema is not None:
+                    ema.apply_to(model)
                 torch.save(model.state_dict(), ckpt_path)
+                if ema is not None:
+                    ema.restore(model)
             else:
-                if epoch >= self.cfg.freeze_epochs:
-                    no_improve_epochs += 1
-                    if no_improve_epochs >= self.cfg.patience:
-                        self.logger.info(
-                            'Early stop at epoch %d (best epoch %d, Mean ρ %.4f)',
-                            epoch + 1, best_epoch, best_rho)
-                        break
+                no_improve_epochs += 1
+                if no_improve_epochs >= self.cfg.patience:
+                    self.logger.info(
+                        'Early stop at epoch %d (best epoch %d, Mean ρ %.4f)',
+                        epoch + 1, best_epoch, best_rho)
+                    break
 
         if best is None:
             raise RuntimeError('No improvement over any epoch - check the hyperparameters.')

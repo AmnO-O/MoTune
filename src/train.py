@@ -38,7 +38,7 @@ def track_optimizer_steps(optimizer) -> None:
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, device,
-                grad_clip=1.0, accum_steps=1, report=None):
+                grad_clip=1.0, accum_steps=1, report=None, ema=None):
     """One scoring epoch with AMP + gradient accumulation + clipping.
 
     Returns the mean supervised loss of the epoch.
@@ -138,6 +138,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             else:
                 last_grad_norm = 0.0
 
+            did_step = False
             if step_counter is not None:
                 prev = step_counter[0]
                 scaler.step(optimizer)
@@ -146,6 +147,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 if step_counter[0] > prev:
                     scheduler.step()
                     opt_steps += 1
+                    did_step = True
                 else:
                     skipped += 1
             else:
@@ -156,11 +158,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
                 if getattr(optimizer, '_step_count', None) != prev:
                     scheduler.step()
                     opt_steps += 1
+                    did_step = True
                 else:
                     skipped += 1
 
             last_scale = float(scaler.get_scale())
             last_lr = float(scheduler.get_last_lr()[0])
+
+            if did_step and ema is not None:
+                ema.update(model)
 
         v = loss.item() * accum_steps
         total_loss += v if math.isfinite(v) else 0.0
