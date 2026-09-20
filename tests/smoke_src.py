@@ -5,9 +5,9 @@ Run from the repo root:
 
 Covers: syntax of every src/ module, config construction/validation/round-trip
 and ``--set`` coercion, CLI wiring (``python -m src.run``), the offset-based
-span matcher on synthetic token offsets, the real local TSV loaders + folds,
-and -- when torch is available -- numerical checks of the merged gauss losses
-and the GaussHead.
+span matcher on synthetic token offsets, the real local TSV loaders, the
+two-stream prototype stack, and -- when torch is available -- numerical checks
+of the merged gauss losses and the GaussHead.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -43,6 +42,9 @@ def sync_parse() -> None:
             check(False, f'{path.name}: {exc.msg} @ {exc.lineno}')
     check(not (ROOT / 'src' / 'losses_gauss.py').exists(),
           'src/losses_gauss.py removed (merged into src/losses.py)')
+    for gone in ('folds.py', 'static_vec.py', 'dataset_mlm.py', 'train_mlm.py'):
+        check(not (ROOT / 'src' / gone).exists(),
+              f'src/{gone} removed (cleaned out of the two-stream plan)')
 
 
 def check_config() -> None:
@@ -69,9 +71,17 @@ def check_config() -> None:
           and not hasattr(defaults, 'context_layers')
           and not hasattr(defaults, 'aux_data_paths'),
           'legacy model, fallback-pooling, and auxiliary-data knobs are absent')
+    check(not hasattr(defaults, 'lambda_rank') and not hasattr(defaults, 'rank_margin')
+          and not hasattr(defaults, 'rank_margin_mode')
+          and not hasattr(defaults, 'target_prefix') and not hasattr(defaults, 'span_markers')
+          and not hasattr(defaults, 'prefix_readout')
+          and not hasattr(defaults, 'static_span') and not hasattr(defaults, 'static_ext_path')
+          and not hasattr(defaults, 'static_ext_dim') and not hasattr(defaults, 'static_fuse_layers')
+          and not hasattr(defaults, 'mlm_epochs') and not hasattr(defaults, 'mlm_lr')
+          and not hasattr(defaults, 'mlm_mask_prob') and not hasattr(defaults, 'mlm_from_layer'),
+          'rank/prefix-marker/static-ext/MLM knobs are absent (two-stream plan only)')
 
     bad = [
-        ('lambda_rank=-1', lambda: Config.defaults().update(lambda_rank=-1)),
         ('removed head_pool', lambda: Config.defaults().update(head_pool='mean')),
         ('removed lambda_dist', lambda: Config.defaults().update(lambda_dist=1)),
         ('removed lambda_compound', lambda: Config.defaults().update(lambda_compound=1)),
@@ -264,7 +274,6 @@ def check_marks() -> None:
           'German PV strong verb separated past "schloss ... ab" matched')
 
 
-
 def check_data() -> None:
     print('=== 5. DATA LOADERS (real local TSVs, no torch) ===')
     sys.path.insert(0, str(ROOT))
@@ -352,54 +361,8 @@ def check_data() -> None:
           'src/data.py has no MLM warmup dataset/collate/loader')
 
 
-def check_folds() -> None:
-    print('=== 6. FOLDS + GROUP SAMPLER (real TSVs, no torch) ===')
-    sys.path.insert(0, str(ROOT))
-    from src.data import _df_to_rows, read_tsv
-    from src.folds import CompoundGroupSampler, StratifiedKFold, assign_folds
-
-    if StratifiedKFold is None:
-        check(True, 'fold assignment skipped (scikit-learn unavailable)')
-        return
-
-    rows = _df_to_rows(read_tsv('dataset/en-nn-train.tsv'), 'en-nn', 'en')
-    for r in rows:
-        r['compound_id'] = -1
-
-    folded = assign_folds(rows, n_splits=5, seed=42)
-    folds = {r['compound']: r['fold'] for r in folded}
-    check(0 <= min(folds.values()) and max(folds.values()) <= 4, 'fold ids in range')
-    check(len(set(folds.values())) == 5, 'all 5 folds used')
-    per_fold = {}
-    for r in folded:
-        per_fold[r['fold']] = per_fold.get(r['fold'], 0) + 1
-    mx, mn = max(per_fold.values()), min(per_fold.values())
-    check(mx - mn <= len(folded) // 2, f'fold sizes balanced: {per_fold}')
-    again = assign_folds(rows, n_splits=5, seed=42)
-    check([r['fold'] for r in again] == [r['fold'] for r in folded],
-          'deterministic given the same seed')
-    import random as _r
-    rng = _r.Random(3)
-    shuffled = rows[:]
-    rng.shuffle(shuffled)
-    re_shuffled = assign_folds(shuffled, n_splits=5, seed=42)
-    folds2 = {r['compound']: r['fold'] for r in re_shuffled}
-    check(folds == folds2, 'fold assignment invariant to row order')
-
-    n_lab = [i for i, r in enumerate(rows) if r['has_label']]
-    labels_n = {r['compound'] for r in rows if r['has_label']}
-    codes = {c: v for v, c in enumerate(sorted(labels_n))}
-    cids = [codes[r['compound']] if r['has_label'] else -1 for r in rows]
-    samp = CompoundGroupSampler(cids, batch_size=32, seed=7)
-    order = list(samp)
-    check(len(order) == len(rows), 'sampler yields every row once')
-    samp.set_epoch(1)
-    order2 = list(samp)
-    check(order != order2, 'set_epoch changes the shuffle')
-
-
 def check_fixes() -> None:
-    print('=== 7. GAUSS CONTRACTS & BUG-FIX REGRESSION GUARDS ===')
+    print('=== 6. GAUSS CONTRACTS & BUG-FIX REGRESSION GUARDS ===')
     sys.path.insert(0, str(ROOT))
     from src.config import Config
 
@@ -426,9 +389,9 @@ def check_fixes() -> None:
     check('class GaussLoss' in loss_src and 'def gauss_kl' in loss_src
           and 'self.requires_logits = True' in loss_src,
           'src/losses.py defines gauss_kl + GaussLoss (sigma via logits channel)')
-    check('def margin_rank_loss' in loss_src and 'def compound_center_loss' not in loss_src
+    check('def margin_rank_loss' not in loss_src and 'def compound_center_loss' not in loss_src
           and 'def compound_consistency_loss' not in loss_src,
-          'src/losses.py retains ranking only; centre/consistency losses are absent')
+          'src/losses.py has no ranking/centre/consistency terms (ranking lives in prototype_stream)')
     check('def _role_context(' not in model_src and 'def _compose_gauss_feat(' in model_src,
           '_features builds only dedicated per-role feature bundles')
     check('pv_mod_exit_emb, pv_head_exit_emb = mod_exit_emb, head_exit_emb' not in model_src,
@@ -495,23 +458,16 @@ def check_fixes() -> None:
         check(len(grads) > 0 and all(_torch.isfinite(g).all() for g in grads),
               'GaussHead gradients flow and are finite')
 
-        # margin_rank_loss: dynamic vs clamp mode, finite; NaN target excluded
+        # GaussLoss forward: finite; rank/compound_ids args are gone from the API
         pred = _torch.randn(16)
         tgt = _torch.randn(16)
-        c = _torch.tensor([0] * 8 + [1] * 8, dtype=_torch.long)
-        l1 = float(G.margin_rank_loss(pred, tgt, margin=0.5, compound_ids=c, mode='dynamic'))
-        l2 = float(G.margin_rank_loss(pred, tgt, margin=0.5, compound_ids=c, mode='clamp'))
-        check(min(l1, l2) >= 0.0 and max(l1, l2) > 0.0,
-              'margin_rank_loss returns non-negative finite values in either mode')
-
-        # NaN mixing: NaN safe positive gate with std_alpha weighting
         dfl = G.GaussLoss()
-        loss = dfl(pred, tgt, logits=_torch.ones(16), compound_ids=c)
+        loss = dfl(pred, tgt, logits=_torch.ones(16))
         check(bool(_torch.isfinite(loss)), 'GaussLoss forward finite')
 
         # empty-mask: returns 0.0 with grad connected (no NaN, no graph break)
         pg = _torch.randn(16, requires_grad=True)
-        z = dfl(pg, tgt, logits=_torch.ones(16), compound_ids=c,
+        z = dfl(pg, tgt, logits=_torch.ones(16),
                 mask=_torch.zeros(16, dtype=_torch.bool))
         check(bool(z.item() == 0.0) and z.requires_grad,
               'GaussLoss(mask=all-False) returns grad-connected zero')
@@ -520,7 +476,7 @@ def check_fixes() -> None:
 
 
 def check_targets() -> None:
-    print('=== 8. SINGLE-TARGET WIRING (targets module, expansion, routing) ===')
+    print('=== 7. SINGLE-TARGET WIRING (targets module, expansion, routing) ===')
     sys.path.insert(0, str(ROOT))
 
     import src.data as D
@@ -637,166 +593,6 @@ def check_targets() -> None:
     check("'target'" in d_src.replace(' ', '') and 'torch.stack' in d_src,
           'collate_comp stacks scalar keys (incl. target)')
 
-    # target_prefix validation in Config
-    from src.config import Config
-    cfg_ok = Config(target_prefix=True, targets=['mod', 'head'])
-    check(cfg_ok.target_prefix is True, 'Config accepts target_prefix=True with non-empty targets')
-    try:
-        Config(target_prefix=True, targets=[]).validate()
-        check(False, 'Config rejects target_prefix=True with empty targets')
-    except ValueError:
-        check(True, 'Config rejects target_prefix=True with empty targets')
-
-    # MARKER_CODE mapping
-    from src.targets import MARKER_CODE, TARGET_PREFIX_TOKENS
-    check(MARKER_CODE == {'mod': 7, 'head': 8, 'pv': 9},
-          'MARKER_CODE maps mod/head/pv to mmBERT unused token ids 7/8/9')
-    check(TARGET_PREFIX_TOKENS == {'mod': '<unused0>', 'head': '<unused1>', 'pv': '<unused2>'},
-          'TARGET_PREFIX_TOKENS maps targets to unused token names')
-
-    # CompDataset target_prefix token insertion (<marker> word <marker>) and span mask shift
-    try:
-        import torch as _torch
-        class _MockTok:
-            def __call__(self, text, max_length=256, truncation=True, return_tensors='pt', return_offsets_mapping=True):
-                return {
-                    'input_ids': _torch.tensor([[2, 10, 20, 30, 1]]),
-                    'attention_mask': _torch.tensor([[1, 1, 1, 1, 1]]),
-                    'offset_mapping': _torch.tensor([[[0, 0], [0, 3], [4, 8], [9, 15], [0, 0]]])
-                }
-            def encode(self, text, add_special_tokens=False):
-                mapping = {'flea': [20], 'market': [30], 'flea market': [20, 30]}
-                return mapping.get(text, [99])
-
-        _row = {'context': 'our flea market', 'mod': 'flea', 'head': 'market', 'compound': 'flea market',
-                'compound_id': 0, 'has_label': True, 'mod_avg': 3.0, 'head_avg': 4.0, 'mod_std': 0.5,
-                'head_std': 0.5, 'target': 'mod'}
-        _ds0 = D.CompDataset([_row], _MockTok(), target_prefix=False)
-        _ds1 = D.CompDataset([_row], _MockTok(), target_prefix=True)
-        check(_ds0[0]['input_ids'].tolist() == [2, 10, 20, 30, 1],
-              'CompDataset without prefix preserves original token sequence')
-        check(_ds1[0]['input_ids'].tolist() == [2, 7, 20, 7, 10, 20, 30, 1],
-              'CompDataset with target_prefix prepends <marker> word <marker> right after <bos>')
-        check(_ds0[0]['mod_span_mask'].tolist() == [False, False, True, False, False]
-              and _ds1[0]['mod_span_mask'].tolist() == [False, False, False, False, False, True, False, False],
-              'CompDataset target_prefix shifts mod_span_mask cleanly past prefix to the context occurrence')
-        check(_ds0[0]['head_span_mask'].tolist() == [False, False, False, True, False]
-              and _ds1[0]['head_span_mask'].tolist() == [False, False, False, False, False, False, True, False],
-              'CompDataset target_prefix shifts head_span_mask cleanly past prefix to the context occurrence')
-        check(_ds0[0]['prefix_mask'].tolist() == [False, False, False, False, False]
-              and _ds1[0]['prefix_mask'].tolist() == [False, False, True, False, False, False, False, False],
-              'CompDataset prefix_mask marks ONLY the WORD tokens inside the prefix (markers excluded)')
-        check(_ds1[0]['attention_mask'].tolist() == [1, 1, 1, 1, 1, 1, 1, 1],
-              'prefix word tokens are attended')
-    except ImportError:
-        print('  [SKIP] torch unavailable; CompDataset prefix check skipped')
-
-    # CompDataset span_markers: border ids spliced around the row's OWN span
-    try:
-        import torch as _torch
-        _rm = dict(_row); _rm['target'] = 'mod'
-        _dm = D.CompDataset([_rm], _MockTok(), span_markers=True)
-        check(_dm[0]['input_ids'].tolist() == [2, 10, 7, 20, 7, 30, 1],
-              'span_markers wraps the mod span with id 7 (open + close)')
-        check(_dm[0]['mod_span_mask'].tolist() == [False, False, False, True, False, False, False]
-              and _dm[0]['head_span_mask'].tolist() == [False, False, False, False, False, True, False],
-              'span_markers shifts both span masks exactly around the spliced ids')
-        _rh = dict(_row); _rh['target'] = 'head'
-        _dh = D.CompDataset([_rh], _MockTok(), span_markers=True)
-        check(_dh[0]['input_ids'].tolist() == [2, 10, 20, 8, 30, 8, 1],
-              'span_markers wraps the head span with id 8')
-        _rp = dict(_row); _rp['target'] = 'pv'
-        _dp = D.CompDataset([_rp], _MockTok(), span_markers=True)
-        check(_dp[0]['input_ids'].tolist() == [2, 10, 9, 20, 30, 9, 1],
-              'span_markers pv wraps the WHOLE compound with id 9')
-    except ImportError:
-        print('  [SKIP] torch unavailable; span_markers check skipped')
-
-    # config: span_markers validation
-    try:
-        Config(span_markers=True, target_prefix=True, targets=['mod'],
-               model_backend='combined').validate()
-        check(False, 'Config rejects span_markers + target_prefix together')
-    except ValueError:
-        check(True, 'Config rejects span_markers + target_prefix together')
-    try:
-        Config(span_markers=True, model_backend='exits', targets=['mod']).validate()
-        check(False, 'Config rejects span_markers on a non-combined backend')
-    except ValueError:
-        check(True, 'Config rejects span_markers on a non-combined backend')
-    try:
-        Config(span_markers=True, targets=[], model_backend='combined').validate()
-        check(False, 'Config rejects span_markers with empty targets')
-    except ValueError:
-        check(True, 'Config rejects span_markers with empty targets')
-
-    # config: prefix_readout validation ('prefix'/'dual' need target_prefix)
-    from src.config import Config as _C
-    try:
-        _C(prefix_readout='prefix', target_prefix=False, targets=['mod']).validate()
-        check(False, 'Config rejects prefix_readout=prefix without target_prefix')
-    except ValueError:
-        check(True, 'Config rejects prefix_readout=prefix without target_prefix')
-    try:
-        _C(prefix_readout='dual', target_prefix=False, targets=['mod']).validate()
-        check(False, 'Config rejects prefix_readout=dual without target_prefix')
-    except ValueError:
-        check(True, 'Config rejects prefix_readout=dual without target_prefix')
-    try:
-        _C(prefix_readout='nope', target_prefix=True, targets=['mod']).validate()
-        check(False, 'Config rejects an unknown prefix_readout value')
-    except ValueError:
-        check(True, 'Config rejects an unknown prefix_readout value')
-    check(_C(prefix_readout='dual', target_prefix=True, targets=['mod'],
-             model_backend='combined').validate() is None
-          and _C(prefix_readout='prefix', target_prefix=True, targets=['mod'],
-                 model_backend='combined').validate() is None,
-          'Config accepts prefix_readout together with target_prefix')
-
-    # trainer wires span_markers
-    check('span_markers=self.cfg.span_markers' in tr_src,
-          'trainer passes span_markers to CompDataset')
-
-    # trainer wires target_prefix
-    check('target_prefix=self.cfg.target_prefix' in tr_src,
-          'trainer passes target_prefix to CompDataset')
-
-    # model: learned marker embedding folded into the head group
-    check("self.marker_emb = nn.Embedding(3, hidden_size) if target_prefix else None" in m_src,
-          'CombinedBackboneModel creates a learned 3xH marker embedding when target_prefix on')
-    check("hidden_states[:, 1] = marker" in m_src
-          and "inputs_embeds=hidden_states" in m_src,
-          'CombinedBackboneModel overwrites position 1 with the learned marker vector')
-    check("marker = getattr(model, 'marker_emb', None)" in tr_src
-          and "heads.append(marker)" in tr_src,
-          'trainer._pred_heads folds marker_emb into the head_lr group')
-    check("seen = set()" in tr_src
-          and "if id(m) not in seen:" in tr_src,
-          'trainer._pred_heads dedupes shared-head aliases by module identity')
-
-    # model: prefix_readout wiring (context/prefix/dual pooling + head-group gate)
-    check("self.prefix_readout = prefix_readout" in m_src,
-          'CombinedBackboneModel stores prefix_readout from cfg')
-    check("self.prefix_gate = None" in m_src
-          and "if target_prefix and prefix_readout == 'dual':" in m_src
-          and "nn.Parameter(torch.zeros(1))" in m_src,
-          'dual readout gets a trainable 1-param gate (sigmoid 0 -> 50/50 start)')
-    check("from .targets import TARGETS, pool_active, pool_prefix, pool_span, row_targets, target_selector" in m_src,
-          'CombinedBackboneModel imports pool_prefix for the prefix readout')
-    check("pre = pool_prefix(hidden, batch)" in m_src
-          and "pool = pre" in m_src and "'dual'" in m_src,
-          'prefix readout pools the prefix WORD tokens')
-    check("a = torch.sigmoid(self.prefix_gate.to(hidden.device))" in m_src
-          and "pool = a * ctx + (1 - a) * pre" in m_src,
-          'dual readout blends context+prefix pools via a learned gate')
-    check("'prefix_mask' in batch" in m_src,
-          'prefix readout guards on batch prefix_mask presence (joint/predict safe)')
-    check('prefix_readout=str(getattr(cfg, \'prefix_readout\', \'context\'))' in m_src,
-          'build_combined_model forwards prefix_readout from cfg')
-    check("gate = getattr(model, 'prefix_gate', None)" in tr_src
-          and "heads.append(nn.ParameterList([gate]))" in tr_src,
-          'trainer._pred_heads folds prefix_gate into the head_lr group')
-
     # model: single shared GaussHead (mod/head/pv_gauss all alias the same module)
     check("self.gauss = GaussHead(self.head_in, head_hidden, dropout=dropout)" in m_src
           and "object.__setattr__(self, 'mod_gauss', self.gauss)" in m_src
@@ -804,419 +600,32 @@ def check_targets() -> None:
           and "object.__setattr__(self, 'pv_gauss', self.gauss)" in m_src,
           'CombinedBackboneModel shares ONE GaussHead across all targets')
 
-    # model: static_span fuses ctx+static pools via a transformer (FusionBlock)
-    check("self.static_fuse = StaticFusion(" in m_src
-          and "FusionBlock(hidden, num_heads, ffn_expansion=2" in m_src,
-          'StaticFusion reuses FusionBlock for a single fused (B,H) vector')
-    check("pool = self.static_fuse(pool, static_pool)" in m_src
-          and "pool = self.static_fuse(pool, static_v)" in m_src,
-          'CombinedBackboneModel fuses ctx+static pools via StaticFusion (no concat)')
-    check("torch.cat([pool, pool_span(static, batch, t)], dim=-1)" not in m_src,
-          'static_span no longer uses a raw feature concat')
-    check("self.head_in = hidden_size" in m_src
-          and "static_fuse_layers=int(getattr(cfg, 'static_fuse_layers', 1))" in m_src,
-          'head_in stays hidden_size; build_combined_model forwards fusion knobs')
-
     # single-pass routing: one pool + one shared-head call for the whole batch
     check("pool = pool_active(hidden, batch, targets)" in m_src
           and "mu, sigma = self.gauss(pool)" in m_src,
           'fast path pools each row OWN span once and runs the shared head once')
 
-    # target_prefix must not crash on predict/joint batches (no target key)
-    check("if self.target_prefix and 'target' in batch:" in m_src,
-          'marker injection gated on batch[target] so predict/joint mode is safe')
+    # build_combined_model forwards proto_stream; shift_fuse exists only then
+    check("proto_stream=bool(getattr(cfg, 'proto_stream', False))" in m_src,
+          'build_combined_model forwards proto_stream from cfg')
+    check("self.shift_fuse = SemanticShiftFusion(hidden_size, dropout=dropout) if proto_stream else None" in m_src,
+          'CombinedBackboneModel builds SemanticShiftFusion only when proto_stream=True')
+    check("if self.proto_stream and h_proto is not None:" in m_src,
+          'proto_stream fuses the pooled context via shift_fuse before the shared head')
 
-    # config: build_combined_model forwards both flags
-    check("target_prefix=bool(getattr(cfg, 'target_prefix', False))" in m_src
-          and "static_span=bool(getattr(cfg, 'static_span', False))" in m_src,
-          'build_combined_model forwards target_prefix/static_span from cfg')
-
-    from src.config import Config
-    try:
-        Config(static_span=True, targets=['mod']).validate()
-        check(False, 'Config rejects static_span=True with backend=exits')
-    except ValueError:
-        check(True, 'Config rejects static_span=True with backend=exits')
-    cfg_sp = Config(static_span=True, model_backend='combined', targets=['mod'])
-    check(cfg_sp.static_span is True,
-          'Config accepts static_span=True with model_backend=combined')
-    try:
-        Config(static_span=True, model_backend='combined', targets=['mod'],
-               static_fuse_layers=0).validate()
-        check(False, 'Config rejects static_fuse_layers=0')
-    except ValueError:
-        check(True, 'Config rejects static_fuse_layers=0')
-
-    # static_fuse joins the head group (trained at head_lr in phase 1)
-    check("fuse = getattr(model, 'static_fuse', None)" in tr_src
-          and "heads.append(fuse)" in tr_src,
-          'trainer._pred_heads folds static_fuse into the head_lr group')
-
-
-def check_static_ext() -> None:
-    print('=== 9. EXTERNAL STATIC EMBEDDINGS (StaticVec + combined fusion) ===')
-    sys.path.insert(0, str(ROOT))
-
-    from src.config import Config
-
-    # 1) validation wiring
-    sv_src = (ROOT / 'src' / 'static_vec.py').read_text(encoding='utf-8')
-    check('class StaticVec' in sv_src and 'def _load' in sv_src and 'def tensor' in sv_src,
-          'src/static_vec.py defines StaticVec with load + OOV tensor lookup')
-
-    # Config accepts external static only on the combined backend + static_span
-    ok = Config(model_backend='combined', static_span=True, targets=['mod'],
-                static_ext_path='x.vec', static_ext_dim=300)
-    ok.validate()
-    check(ok.static_ext_path == 'x.vec' and ok.static_ext_dim == 300,
-          'Config accepts static_ext_path with combined + static_span')
-    for label, bad in [
-        ('backend=exits',
-         Config(model_backend='exits', static_span=True, targets=['mod'], static_ext_path='x.vec')),
-        ('static_span=False',
-         Config(model_backend='combined', static_span=False, targets=['mod'], static_ext_path='x.vec')),
-        ('static_ext_dim=0',
-         Config(model_backend='combined', static_span=True, targets=['mod'],
-                static_ext_path='x.vec', static_ext_dim=0)),
-    ]:
-        try:
-            bad.validate()
-            check(False, f'[reject] static_ext with {label}')
-        except ValueError:
-            check(True, f'[reject] static_ext with {label}')
-
-    # 2) source guards: dataset, model, trainer wiring
-    d_src = (ROOT / 'src' / 'data.py').read_text(encoding='utf-8')
-    m_src = (ROOT / 'src' / 'model_combined.py').read_text(encoding='utf-8')
-    tr_src = (ROOT / 'src' / 'trainer.py').read_text(encoding='utf-8')
-    check("item['head_static'] = head_v" in d_src
-          and "item['pv_static'] = pv_static" in d_src
-          and "self.static_vec.tensor(r.get('compound', ''))" in d_src,
-          'CompDataset encodes per-row mod/head/compound static vectors when static_vec given')
-    check("self.static_proj = nn.Linear(static_ext_dim, hidden_size)" in m_src,
-          'CombinedBackboneModel projects external static vectors to H')
-    check("static_ext=bool(getattr(cfg, 'static_ext_path', None))" in m_src
-          and "static_ext_dim=int(getattr(cfg, 'static_ext_dim', 300))" in m_src,
-          'build_combined_model forwards static_ext knobs from cfg')
-    check("static_ext_path not found (tried:" in tr_src,
-          'trainer raises clear FileNotFoundError when static_ext_path missing')
-    check("static_vec=static_vec" in tr_src,
-          'trainer passes StaticVec to both CompDatasets')
-    check("proj = getattr(model, 'static_proj', None)" in tr_src and "heads.append(proj)" in tr_src,
-          'trainer._pred_heads folds static_proj into the head_lr group')
-
-    # 3) functional: StaticVec parse / normalize / OOV (no torch needed beyond numpy)
-    tmp = Path(tempfile.gettempdir()) / 'src_static_smoke.vec'
-    tmp.write_text(
-        '4 3\n'
-        'acid 1 0 0\n'
-        'solution 0 1 0\n'
-        'crack 0.5 0.5 0\n'
-        'down -0.5 0.5 0\n',
-        encoding='utf-8')
-    try:
-        from src.static_vec import StaticVec
-        sv = StaticVec(tmp, 3, ['acid solution', 'crack down', 'Abitur', 'OOVWORD'])
-        check(len(sv) == 4, 'StaticVec keeps only the wanted words (4/6 coverage)')
-        check(np.isclose(sv.vector('acid'), [1, 0, 0]).all(),
-              'StaticVec returns the exact (unit) vectors')
-        check(np.isclose(sv.vector('crack down'), [0, 1, 0], atol=1e-5).all(),
-              'multi-part surface form is the normalized mean of its parts')
-        check(sv.vector('Abitur') is None and sv.vector('OOVWORD') is None,
-              'OOV words return None (dataset falls back to the zero vector)')
-
-        import torch as _torch
-        check(_torch.equal(sv.tensor('Abitur'), _torch.zeros(3)),
-              'StaticVec.tensor gives a zero vector on OOV')
-
-        # dataset-level pv anchor: whole-compound vector when available,
-        # base+particle mean only when the compound surface form is OOV
-        from src.data import CompDataset as _CD
-
-        class _FakeTok:
-            def __call__(self, text, max_length=256, truncation=True,
-                         return_tensors='pt', return_offsets_mapping=True):
-                return {'input_ids': _torch.tensor([[1, 1, 1, 1, 1]]),
-                        'attention_mask': _torch.tensor([[1, 1, 1, 1, 1]]),
-                        'offset_mapping': _torch.tensor([[[0, 1]] * 5])}
-
-        _rows = [
-            {'context': 'x', 'mod': 'crack', 'head': 'down', 'compound': 'acid',
-             'compound_id': 0, 'has_label': True, 'mod_avg': 1.0, 'head_avg': 1.0,
-             'mod_std': 0.1, 'head_std': 0.1, 'target': 'pv'},
-            {'context': 'x', 'mod': 'acid', 'head': 'solution', 'compound': 'OOVWORD',
-             'compound_id': 1, 'has_label': True, 'mod_avg': 1.0, 'head_avg': 1.0,
-             'mod_std': 0.1, 'head_std': 0.1, 'target': 'pv'},
-        ]
-        _ds = _CD(_rows, _FakeTok(), max_len=8, is_test=True, static_vec=sv)
-        check(_torch.allclose(_ds[0]['pv_static'], _torch.as_tensor([1., 0., 0.])),
-              'pv anchor is the WHOLE compound vector when the surface form exists')
-        check(_torch.allclose(_ds[1]['pv_static'],
-                              _torch.as_tensor([0.7071068, 0.7071068, 0.]), atol=1e-5),
-              'pv anchor falls back to base+particle mean when the compound is OOV')
-
-        # 4) functional: combined model fuses + routes external static
-        from types import SimpleNamespace
-        import torch.nn as _nn
-        import src.model_combined as MC
-
-        class _FakeLM(_nn.Module):
-            def __init__(self):
-                super().__init__()
-                self._emb = _nn.Embedding(100, 8)
-
-            def get_input_embeddings(self):
-                return self._emb
-
-            def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None,
-                        output_hidden_states=False):
-                if input_ids is not None:
-                    B, L = input_ids.shape
-                else:
-                    B, L = inputs_embeds.shape[:2]
-                return SimpleNamespace(last_hidden_state=_torch.randn(B, L, 8))
-
-        import unittest.mock as _mock
-        with _mock.patch.object(MC.AutoModel, 'from_pretrained', return_value=_FakeLM()):
-            model = MC.CombinedBackboneModel(
-                'fake', hidden_size=8, dropout=0.0, head_hidden=8,
-                static_span=True, static_ext=True, static_ext_dim=3,
-                static_fuse_layers=1, static_fuse_heads=1)
-        check(model.static_proj.weight.shape == (8, 3)
-              and model.static_fuse is not None,
-              'static_ext creates the H x ext Linear + the fusion transformer')
-
-        B, L = 3, 6
-        batch = {
-            'input_ids': _torch.randint(4, 40, (B, L)),
-            'attention_mask': _torch.ones(B, L, dtype=_torch.long),
-            'mod_span_mask': _torch.tensor(
-                [[0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 0, 0], [0, 0, 1, 1, 0, 0]], dtype=_torch.bool),
-            'head_span_mask': _torch.tensor(
-                [[0, 0, 0, 0, 0, 0], [0, 0, 1, 1, 0, 0], [0, 0, 0, 0, 1, 1]], dtype=_torch.bool),
-            'target': _torch.tensor([0, 1, 2], dtype=_torch.long),
-            'mod_static': _torch.randn(B, 3),
-            'head_static': _torch.randn(B, 3),
-            'pv_static': _torch.randn(B, 3),
-        }
-        model.eval()
-        with _torch.no_grad():
-            mod, head, pv, mod_sig, head_sig, pv_sig = model(
-                batch, with_logits=True, with_pv=True)
-        check(mod.shape == (B,) and pv.shape == (B,), 'combined ext-static predict shapes')
-        check(bool(mod_sig[0] > 0) and bool(head_sig[1] > 0) and bool(pv_sig[2] > 0),
-              'sigmas stay positive on routed rows through the ext-static fusion')
-
-        # Routing + gradient in TRAIN mode: the eval-mode score clamp turns any
-        # near-zero mu into exactly SCORE_MIN (0.0), so the "which row fired"
-        # check needs the un-clamped predictions.
-        model.train()
-        mod, head, pv, *_ = model(batch, with_logits=True, with_pv=True)
-        check(float(mod[0]) != 0.0 and float(mod[1]) == 0.0 and float(mod[2]) == 0.0,
-              'mod rows routed: only the mod target row is non-zero')
-        check(float(head[0]) == 0.0 and float(head[1]) != 0.0 and float(head[2]) == 0.0,
-              'head rows routed: only the head target row is non-zero')
-        check(float(pv[0]) == 0.0 and float(pv[1]) == 0.0 and float(pv[2]) != 0.0,
-              'pv rows routed: only the pv target row is non-zero')
-        (mod.sum() + head.sum() + pv.sum()).backward()
-        check(model.static_proj.weight.grad is not None
-              and bool(_torch.isfinite(model.static_proj.weight.grad).all()),
-              'gradient flows into static_proj (fusion is not frozen)')
-
-        # 5) prefix readout: pool_prefix masked-mean + model wiring
-        from src.targets import pool_prefix as _pp
-        _hid = _torch.tensor([[[1., 1., 1.], [2., 2., 2.], [3., 3., 3.], [4., 4., 4.]]])
-        _pm = _torch.tensor([[0, 1, 1, 0]], dtype=_torch.bool)
-        _pooled = _pp(_hid, {'prefix_mask': _pm})
-        check(_torch.allclose(_pooled, _torch.tensor([[2.5, 2.5, 2.5]])),
-              'pool_prefix masked-mean over ONLY the prefix word tokens')
-        _pm_empty = _torch.tensor([[0, 0, 0, 0]], dtype=_torch.bool)
-        check(_torch.allclose(_pp(_hid, {'prefix_mask': _pm_empty}),
-                              _torch.zeros(1, 3)),
-              'pool_prefix on an empty prefix degrades to a zero pool (caller guards)')
-
-        _kept = ('input_ids', 'attention_mask', 'mod_span_mask', 'head_span_mask',
-                 'target', 'mod_static', 'head_static', 'pv_static')
-        _pb = {k: batch[k] for k in _kept}
-        _pb['prefix_mask'] = _torch.tensor(
-            [[0, 0, 1, 0, 0, 0], [0, 0, 1, 0, 0, 0], [0, 0, 1, 0, 0, 0]], dtype=_torch.bool)
-        with _mock.patch.object(MC.AutoModel, 'from_pretrained', return_value=_FakeLM()):
-            _mpref = MC.CombinedBackboneModel(
-                'fake', hidden_size=8, dropout=0.0, head_hidden=8,
-                target_prefix=True, prefix_readout='prefix')
-            _mdual = MC.CombinedBackboneModel(
-                'fake', hidden_size=8, dropout=0.0, head_hidden=8,
-                target_prefix=True, prefix_readout='dual')
-        check(_mpref.prefix_gate is None,
-              'prefix readout uses no gate')
-        check(_mdual.prefix_gate is not None
-              and tuple(_mdual.prefix_gate.shape) == (1,),
-              'dual readout owns a 1-param scalar gate')
-        _mpref.eval(); _mdual.train()
-        with _torch.no_grad():
-            _mpref(batch, with_logits=True, with_pv=True)              # no prefix_mask
-            _out_p = _mpref(_pb, with_logits=True, with_pv=True)       # prefix pool
-        check(all(_torch.isfinite(o).all() for o in _out_p if o is not None),
-              'prefix readout runs on batches with AND without prefix_mask')
-        _dual_out, *_ = _mdual(_pb, with_logits=True, with_pv=True)
-        check(bool(_torch.isfinite(_dual_out).all()),
-              'dual readout blends+gates without NaNs')
-        _dual_out.sum().backward()
-        check(_mdual.prefix_gate.grad is not None
-              and bool(_torch.isfinite(_mdual.prefix_gate.grad).all()),
-              'gradient flows into the dual gate (trains at head_lr)')
-    except ImportError:
-        print('  [SKIP] numpy/torch unavailable; StaticVec + fusion functional checks skipped')
-    finally:
-        tmp.unlink()
-
-
-
-def check_mlm_adaptation() -> None:
-    print('=== 10. TASK-ADAPTIVE PREFIX MLM (Dataset, Masking, Collate, LoRA merge, Untouched model.py) ===')
-    import subprocess
-    import torch
-    import torch.nn as nn
-    from src.config import Config
-    from src.dataset_mlm import PrefixMLMDataset, collate_mlm
-    from src.lora import apply_lora, lora_parameters, merge_lora
-    from src.targets import MARKER_CODE
-
-    # 1. Guarantee src/model.py is 100% UNTOUCHED
-    diff_res = subprocess.run(['git', 'diff', 'src/model.py'], cwd=ROOT, capture_output=True, text=True)
-    check(diff_res.returncode == 0 and not diff_res.stdout.strip(),
-          'src/model.py has ZERO git diff (100% untouched invariant)')
-
-    # 2. Config MLM knobs
-    cfg = Config.defaults()
-    check(hasattr(cfg, 'mlm_epochs') and cfg.mlm_epochs == 3, 'Config has mlm_epochs default')
-    check(hasattr(cfg, 'mlm_lr') and cfg.mlm_lr == 5e-5, 'Config has mlm_lr default')
-    check(hasattr(cfg, 'mlm_mask_prob') and cfg.mlm_mask_prob == 0.8, 'Config has mlm_mask_prob default')
-    check(hasattr(cfg, 'mlm_from_layer') and cfg.mlm_from_layer == 18, 'Config has mlm_from_layer default')
-
-    bad_mlm = [
-        ('mlm_epochs=0', lambda: Config.defaults().update(mlm_epochs=0)),
-        ('mlm_lr=-1', lambda: Config.defaults().update(mlm_lr=-1)),
-        ('mlm_mask_prob=1.5', lambda: Config.defaults().update(mlm_mask_prob=1.5)),
-        ('mlm_from_layer=-1', lambda: Config.defaults().update(mlm_from_layer=-1)),
-    ]
-    for label, fn in bad_mlm:
-        try:
-            fn().validate()
-            check(False, f'[reject] {label}')
-        except ValueError:
-            check(True, f'[reject] {label}')
-
-    # 3. PrefixMLMDataset construction and token alignment
-    class DummyTokenizer:
-        mask_token_id = 4
-        cls_token_id = 0
-        sep_token_id = 2
-        pad_token_id = 1
-        vocab_size = 1000
-        def encode(self, text, add_special_tokens=False):
-            return [len(text) + 10]
-
-    tok = DummyTokenizer()
-    rows = [{'sentence': 'The acid rain fell.', 'mod': 'acid', 'head': 'rain', 'compound': 'acid rain'}]
-    ds = PrefixMLMDataset(rows, tok, targets=['mod', 'head', 'pv'], is_train=False)
-    check(len(ds) == 3, 'PrefixMLMDataset expands 1 row x 3 targets into 3 samples')
-
-    item_mod = ds[0]
-    ids = item_mod['input_ids'].tolist()
-    lbls = item_mod['labels'].tolist()
-    # Structure: [CLS, marker_mod(7), mask(4), marker_mod(7), context_tok(29), SEP(2)]
-    check(ids[0] == 0 and ids[1] == MARKER_CODE['mod'] and ids[3] == MARKER_CODE['mod'],
-          'Prefix prompt structure: [CLS, marker, target_token(s), marker, context...]')
-    check(ids[2] == tok.mask_token_id, 'eval mode always masks target word')
-    check(lbls[2] == 14, 'labels holds the ground-truth token id at the target position')
-    check(lbls[0] == -100 and lbls[1] == -100 and lbls[3] == -100 and lbls[4] == -100 and lbls[5] == -100,
-          'labels contains -100 everywhere else (CLS, markers, context, SEP)')
-
-    # Collation padding
-    batch = collate_mlm([item_mod, ds[1]], pad_id=tok.pad_token_id)
-    check(batch['input_ids'].shape[0] == 2, 'collate_mlm batches samples correctly')
-    check((batch['labels'][0, 2] != -100).item(), 'collate_mlm keeps target label intact')
-
-    # 4. 80/10/10 Stochastic policy
-    ds_train = PrefixMLMDataset(rows * 40, tok, targets=['mod'], is_train=True)
-    mask_count = 0
-    id_count = 0
-    rand_count = 0
-    for s in ds_train:
-        tid = s['input_ids'][2].item()
-        if tid == tok.mask_token_id:
-            mask_count += 1
-        elif tid == 14:
-            id_count += 1
-        else:
-            rand_count += 1
-    check(mask_count > id_count and mask_count > rand_count,
-          f'80/10/10 policy: mask={mask_count}, identity={id_count}, rand={rand_count}')
-
-    # 5. LoRA application, forward, backward and merge_lora round-trip
-    class MockLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lm = nn.Module()
-            self.lm.layers = nn.ModuleList([nn.Module() for _ in range(20)])
-            for layer in self.lm.layers:
-                layer.attn = nn.Module()
-                layer.attn.q_proj = nn.Linear(32, 32)
-            self.head = nn.Linear(32, 32)
-            self.decoder = nn.Linear(32, 100)
-
-        def forward(self, x, labels=None):
-            h = x
-            for layer in self.lm.layers:
-                h = layer.attn.q_proj(h)
-            logits = self.decoder(self.head(h))
-            loss = None
-            if labels is not None:
-                mask = labels != -100
-                loss = nn.functional.cross_entropy(logits[mask], labels[mask])
-            return logits, loss
-
-    mock_m = MockLM()
-    adapters = apply_lora(mock_m, targets=['q_proj'], from_layer=18)
-    check(len(adapters) == 2, 'LoRA applied to layers >= 18 (2 adapters)')
-
-    # 5b. AutoModelForMaskedLM (ModernBERT) carries the backbone under root
-    #     child 'model', not 'lm' -- apply_lora must still match (Stage 1 MLM).
-    class MockMLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = nn.Module()
-            self.model.layers = nn.ModuleList([nn.Module() for _ in range(22)])
-            for layer in self.model.layers:
-                layer.attn = nn.Module()
-                layer.attn.Wqkv = nn.Linear(32, 32)
-                layer.attn.Wo = nn.Linear(32, 32)
-            self.decoder = nn.Linear(32, 100)
-
-    mock_mlm = MockMLM()
-    adapters_mlm = apply_lora(mock_mlm, targets=['Wqkv', 'Wo'], from_layer=18)
-    check(len(adapters_mlm) == 8,
-          'apply_lora matches ModernBERT roots under "model" (Wqkv+Wo x layers>=18)')
-    merge_lora(mock_mlm, adapters_mlm)
-    check(isinstance(mock_mlm.model.layers[18].attn.Wqkv, nn.Linear)
-          and isinstance(mock_mlm.model.layers[18].attn.Wo, nn.Linear),
-          'merge_lora unwraps model-rooted ModernBERT adapters back to nn.Linear')
-
-    dummy_x = torch.randn(2, 6, 32)
-    dummy_lbl = torch.full((2, 6), -100, dtype=torch.long)
-    dummy_lbl[0, 2] = 5
-    dummy_lbl[1, 2] = 8
-    _, dummy_loss = mock_m(dummy_x, labels=dummy_lbl)
-    dummy_loss.backward()
-    check(torch.isfinite(dummy_loss), 'Prefix MLM dummy loss forward + backward finite')
-    merge_lora(mock_m, adapters)
-    check(isinstance(mock_m.lm.layers[18].attn.q_proj, nn.Linear),
-          'merge_lora unwraps adapter back to nn.Linear with folded weights')
+    # trainer wires proto_stream into both datasets + folds shift_fuse into the head group
+    check("proto_stream=self.cfg.proto_stream" in tr_src,
+          'trainer passes proto_stream to both CompDatasets')
+    check("shift = getattr(model, 'shift_fuse', None)" in tr_src
+          and "heads.append(shift)" in tr_src,
+          'trainer._pred_heads folds shift_fuse into the head_lr group')
+    check("seen = set()" in tr_src
+          and "if id(m) not in seen:" in tr_src,
+          'trainer._pred_heads dedupes shared-head aliases by module identity')
 
 
 def check_proto_stream() -> None:
-    print('=== 11. TWO-STREAM PROTOTYPE (Disentangled Lexical vs Contextual) ===')
+    print('=== 8. TWO-STREAM PROTOTYPE (Disentangled Lexical vs Contextual) ===')
     import subprocess
     import torch
     import torch.nn as nn
@@ -1391,11 +800,8 @@ def main() -> int:
     check_cli()
     check_marks()
     check_data()
-    check_folds()
     check_fixes()
     check_targets()
-    check_static_ext()
-    check_mlm_adaptation()
     check_proto_stream()
 
     print('=' * 50)

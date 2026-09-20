@@ -21,10 +21,8 @@ from transformers import get_constant_schedule, get_linear_schedule_with_warmup
 
 from src.config import Config
 from src.data import CompDataset, collate_comp, expand_targets
-from src.folds import CompoundGroupSampler
 from src.losses import GaussLoss
 from src.model import apply_lora, build_model, lora_parameters
-from src.static_vec import StaticVec
 from src.train import evaluate, track_optimizer_steps, train_epoch, unfreeze_top_layers
 from src.utils import resolve_paths
 
@@ -126,39 +124,11 @@ class Trainer:
                              len(train_rows), len(val_rows), self.cfg.targets)
         self._val_rows = list(val_rows)
 
-        # Optional external static anchors (fastText/word2vec .vec) for the
-        # combined readout: load once up front, share across train/val.
-        static_vec = None
-        sep = (getattr(self.cfg, 'static_ext_path', None) or '').strip()
-        if sep:
-            cand = Path(sep)
-            candidates = [cand]
-            if not cand.is_absolute():
-                base = Path(self.cfg.data_path) if self.cfg.data_path else None
-                if base is not None:
-                    candidates.insert(0, base / sep)
-                candidates.append(Path('dataset') / sep)
-            path = next((p for p in candidates if p.is_file()), None)
-            if path is None:
-                raise FileNotFoundError(
-                    f'static_ext_path not found (tried: {candidates}): {sep}')
-            words = set()
-            for r in list(train_rows) + list(val_rows):
-                for k in ('mod', 'head', 'compound'):
-                    w = r.get(k)
-                    if w:
-                        words.add(w)
-            static_vec = StaticVec(path, self.cfg.static_ext_dim, words)
-
         train_ds = CompDataset(
             train_rows, tokenizer, max_len=self.cfg.max_context_length,
-            target_prefix=self.cfg.target_prefix, static_vec=static_vec,
-            span_markers=self.cfg.span_markers,
             proto_stream=self.cfg.proto_stream)
         val_ds = CompDataset(
             val_rows, tokenizer, max_len=self.cfg.max_context_length,
-            target_prefix=self.cfg.target_prefix, static_vec=static_vec,
-            span_markers=self.cfg.span_markers,
             proto_stream=self.cfg.proto_stream)
         
         # Chỉ bật persistent_workers khi num_workers > 0 để tránh deadlock
@@ -166,22 +136,11 @@ class Trainer:
         use_workers = num_workers > 0
         is_cuda = (getattr(self.device, 'type', '') == 'cuda')
         
-        if self.cfg.lambda_rank > 0:
-            cids = [r['compound_id'] for r in train_rows]
-            self._train_sampler = CompoundGroupSampler(
-                cids, batch_size=self.cfg.batch_size, seed=self.cfg.seed)
-            train_loader = DataLoader(
-                train_ds, batch_size=self.cfg.batch_size, shuffle=False,
-                sampler=self._train_sampler, num_workers=num_workers,
-                pin_memory=is_cuda, persistent_workers=use_workers,
-                collate_fn=collate_comp)
-        else:
-            self._train_sampler = None
-            train_loader = DataLoader(
-                train_ds, batch_size=self.cfg.batch_size, shuffle=True,
-                num_workers=num_workers, pin_memory=is_cuda,
-                persistent_workers=use_workers, collate_fn=collate_comp)
-                
+        train_loader = DataLoader(
+            train_ds, batch_size=self.cfg.batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=is_cuda,
+            persistent_workers=use_workers, collate_fn=collate_comp)
+
         val_loader = DataLoader(
             val_ds, batch_size=self.cfg.batch_size * 2, shuffle=False,
             num_workers=num_workers, pin_memory=is_cuda,
@@ -207,29 +166,8 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     def _pred_heads(self, model) -> List[nn.Module]:
-        """The NN modifier/head exits and the overall PV composition exit.
-
-        The combined backend shares ONE GaussHead behind the
-        ``mod/head/pv_gauss`` names, so modules are deduped by identity here
-        (otherwise the same parameters would appear 3x in the head group and
-        get triple-updated by the optimizer). A learned per-target marker
-        embedding (combined backend with ``target_prefix``) is also folded in
-        so it trains at ``head_lr`` in phase 1 instead of being starved at
-        ``encoder_lr``.
-        """
+        """The NN modifier/head exits and the overall PV composition exit."""
         heads: List[nn.Module] = [model.mod_gauss, model.head_gauss, model.pv_gauss]
-        marker = getattr(model, 'marker_emb', None)
-        if marker is not None:
-            heads.append(marker)
-        fuse = getattr(model, 'static_fuse', None)
-        if fuse is not None:
-            heads.append(fuse)
-        proj = getattr(model, 'static_proj', None)
-        if proj is not None:
-            heads.append(proj)
-        gate = getattr(model, 'prefix_gate', None)
-        if gate is not None:
-            heads.append(nn.ParameterList([gate]))
         shift = getattr(model, 'shift_fuse', None)
         if shift is not None:
             heads.append(shift)
@@ -344,9 +282,7 @@ class Trainer:
             growth_interval=self.cfg.amp_growth_interval,
         )
         criterion = GaussLoss(
-            ccc_weight=self.cfg.ccc_weight, lambda_rank=self.cfg.lambda_rank,
-            rank_margin=self.cfg.rank_margin,
-            rank_margin_mode=self.cfg.rank_margin_mode,
+            ccc_weight=self.cfg.ccc_weight,
             ccc_var_floor=self.cfg.ccc_var_floor,
             bin_sigma=self.cfg.bin_sigma, use_label_std=self.cfg.use_label_std,
         ).to(self.device)
@@ -361,9 +297,6 @@ class Trainer:
         self.logger.info("Starting training loop for %d epochs...", self.cfg.total_epochs)
 
         for epoch in range(self.cfg.total_epochs):
-            if self._train_sampler is not None:
-                self._train_sampler.set_epoch(epoch)
-
             if epoch == self.cfg.freeze_epochs and self.cfg.freeze_epochs > 0:
                 self.logger.info(
                     '>>> Entering Phase 2 (unfreezing LoRA%s) at epoch %d <<<',

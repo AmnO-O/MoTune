@@ -71,7 +71,7 @@ class SemanticShiftFusion(nn.Module):
     Residual connection with h_ctx guarantees smooth training stability from step 0.
     """
 
-    def __init__(self, hidden_size: int = 768, num_layers: int = 1,
+    def __init__(self, hidden_size: int = 768, num_layers: int = 2,
                  num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.hidden_size = hidden_size

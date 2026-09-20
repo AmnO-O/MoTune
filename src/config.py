@@ -15,14 +15,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 Mode = Literal['train80']
-RankMarginMode = Literal['clamp', 'dynamic']
 ModelBackend = Literal['exits', 'combined']
-PrefixReadout = Literal['context', 'prefix', 'dual']
 
 _MODES = ('train80',)
-_RANK_MARGIN_MODES = ('clamp', 'dynamic')
 _MODEL_BACKENDS = ('exits', 'combined')
-_PREFIX_READOUTS = ('context', 'prefix', 'dual')
 
 
 @dataclass
@@ -97,48 +93,6 @@ class Config:
     #   ['mod'] -> ModAvg, ['head'] -> HeadAvg, ['pv'] -> Avg (PV rows only).
     # List e.g. ['mod', 'head', 'pv'] for the 3N design.
     targets: List[str] = field(default_factory=lambda: ['mod', 'head', 'pv'])
-    # Prefix prompt: right after <bos> prepend <marker> WORD <marker> where
-    # WORD is the row's own target surface form (mod/head/whole compound,
-    # BPE-tokenized) and the marker is one of mmBERT's unused vocab ids 7/8/9
-    # (mod/head/pv). The id itself is the role signal, so the backbone SEES both
-    # the target role AND the target word from layer 0. Off = span-pool only.
-    # Always requires the combined backend; ignored in joint mode (empty
-    # targets). Mutually exclusive with ``span_markers``.
-    target_prefix: bool = False
-    # Readout pooling when target_prefix is on:
-    # 'context' = pool the target span in the context sentence (2nd occurrence, baseline).
-    # 'prefix'  = pool the target word in the prefix prompt (1st occurrence).
-    # 'dual'    = blend both pools via a learned scalar gate (starts at 50/50 mean).
-    prefix_readout: PrefixReadout = 'context'
-    # Border markers: wrap the row's OWN target span with its unused-id pair
-    # spliced at the span's token boundaries -- mod -> <unused0>..<unused0>,
-    # head -> <unused1>..<unused1>, pv -> <unused2>..<unused2> (ids 7/8/9).
-    # The id itself IS the role signal, so target_prefix is redundant and the
-    # two are mutually exclusive. Requires the combined backend and single
-    # targets. (mmBERT's tokenizer cannot produce these ids from the strings:
-    # '<unused0>' tokenizes to '< unu ##sed ##0 >', verified, so ids are
-    # spliced post-tokenization exactly like the pos-1 marker.)
-    span_markers: bool = False
-    # Concat the frozen embedding-table mean of the span (word's general,
-    # context-free meaning) with the final-layer contextualized pool, so the
-    # readout blends "what the word means" and "what it means here".
-    # Fused via a small cross-attention transformer (``FusionBlock`` from
-    # src/model.py), NOT a raw concat: the two pools are stacked as tokens with
-    # type embeddings and refined by a learned query, so the head never sees a
-    # doubled input dim.
-    static_span: bool = False
-    static_fuse_layers: int = 1
-    static_fuse_heads: int = 2
-    # Optional EXTERNAL static embeddings for the target constituents. When set
-    # (combined backend + static_span=True), the static pool fused into the
-    # readout comes from this word-vector .vec file (fastText/word2vec,
-    # whitespace "<word> <float> ..." lines) instead of the backbone's embedding
-    # table: the modifier/head surface forms are looked up word-level and
-    # projected to H. A different distribution than mmBERT's BPE table, so it
-    # anchors the readout against top-layer lexical drift AND gives German
-    # subword coverage fastText is known for. See src/static_vec.py.
-    static_ext_path: Optional[str] = None
-    static_ext_dim: int = 300
     # A/B escape hatch: also fully unfreeze top layers from this index (0 = off)
     unfreeze_from_layer: int = 0
     # LoRA adapter used during scoring (fresh rank, trained on the spot)
@@ -149,17 +103,6 @@ class Config:
     # Apply LoRA only to layer index >= this (0 = all 22 layers of mmBERT);
     # top layers carry the compositional semantics.
     lora_from_layer: int = 18
-
-    # === task-adaptive prefix mlm pre-training (stage 1) ===
-    mlm_epochs: int = 3
-    mlm_lr: float = 5e-5
-    mlm_mask_prob: float = 0.8
-    mlm_from_layer: int = 18
-    mlm_output_dir: Optional[str] = None
-    # Separate batch size for Stage 1 MLM (smaller to fit 14 GB VRAM with
-    # the full ModernBERT + gradient checkpointing). If 0, falls back to
-    # cfg.batch_size.
-    mlm_batch_size: int = 16
 
     # === two-stream prototype representation (lexical vs contextual) ===
     proto_stream: bool = False
@@ -186,9 +129,6 @@ class Config:
     # === losses ===
     ccc_weight: float = 0.7
     ccc_var_floor: float = 0.05
-    lambda_rank: float = 0.5
-    rank_margin: float = 0.5
-    rank_margin_mode: RankMarginMode = 'dynamic'
     bin_sigma: float = 0.5
     use_label_std: bool = True
 
@@ -266,10 +206,6 @@ class Config:
 
         if self.mode not in _MODES:
             errors.append(f'mode must be one of {_MODES}, got {self.mode!r}')
-        if self.rank_margin_mode not in _RANK_MARGIN_MODES:
-            errors.append(
-                f'rank_margin_mode must be one of {_RANK_MARGIN_MODES}, got {self.rank_margin_mode!r}'
-            )
         if self.model_backend not in _MODEL_BACKENDS:
             errors.append(
                 f'model_backend must be one of {_MODEL_BACKENDS}, got {self.model_backend!r}'
@@ -278,33 +214,6 @@ class Config:
             errors.append(
                 f'targets must be a subset of {{mod, head, pv}}, got {self.targets}'
             )
-        if self.target_prefix and not self.targets:
-            errors.append('target_prefix requires a non-empty targets list (single-target mode)')
-        if self.target_prefix and self.model_backend != 'combined':
-            errors.append('target_prefix requires model_backend="combined"')
-        if self.prefix_readout not in _PREFIX_READOUTS:
-            errors.append(f'prefix_readout must be one of {_PREFIX_READOUTS}, got {self.prefix_readout!r}')
-        if self.prefix_readout in ('prefix', 'dual') and not self.target_prefix:
-            errors.append('prefix_readout="prefix" or "dual" requires target_prefix=True')
-        if self.span_markers and not self.targets:
-            errors.append('span_markers requires a non-empty targets list (single-target mode)')
-        if self.span_markers and self.model_backend != 'combined':
-            errors.append('span_markers requires model_backend="combined"')
-        if self.span_markers and self.target_prefix:
-            errors.append('span_markers is mutually exclusive with target_prefix '
-                          '(the unused-id pair carries the role signal)')
-        if self.static_span and self.model_backend != 'combined':
-            errors.append('static_span requires model_backend="combined"')
-        if self.static_fuse_layers < 1 or self.static_fuse_heads < 1:
-            errors.append(f'static_fuse_layers/static_fuse_heads must be >= 1, got '
-                          f'{self.static_fuse_layers}/{self.static_fuse_heads}')
-        if self.static_ext_path and self.model_backend != 'combined':
-            errors.append('static_ext_path requires model_backend="combined"')
-        if self.static_ext_path and not self.static_span:
-            errors.append('static_ext_path requires static_span=True (the external '
-                          'static vector is fused as the static pool)')
-        if self.static_ext_path and self.static_ext_dim < 1:
-            errors.append(f'static_ext_dim must be >= 1, got {self.static_ext_dim}')
 
         if self.batch_size < 1:
             errors.append(f'batch_size must be >= 1, got {self.batch_size}')
@@ -349,10 +258,6 @@ class Config:
         if not 0 <= self.grad_clip:
             errors.append(f'grad_clip must be >= 0, got {self.grad_clip}')
 
-        if self.lambda_rank < 0:
-            errors.append(f'lambda_rank must be >= 0, got {self.lambda_rank}')
-        if self.rank_margin <= 0:
-            errors.append(f'rank_margin must be > 0, got {self.rank_margin}')
         if self.ccc_var_floor < 0:
             errors.append(f'ccc_var_floor must be >= 0, got {self.ccc_var_floor}')
         if self.bin_sigma <= 0:
@@ -363,15 +268,6 @@ class Config:
             errors.append(f'amp_growth_interval must be >= 1, got {self.amp_growth_interval}')
         if not 0 < self.test_size < 1:
             errors.append(f'test_size must be in (0, 1), got {self.test_size}')
-
-        if self.mlm_epochs < 1:
-            errors.append(f'mlm_epochs must be >= 1, got {self.mlm_epochs}')
-        if self.mlm_lr <= 0:
-            errors.append(f'mlm_lr must be > 0, got {self.mlm_lr}')
-        if not 0 < self.mlm_mask_prob <= 1:
-            errors.append(f'mlm_mask_prob must be in (0, 1], got {self.mlm_mask_prob}')
-        if self.mlm_from_layer < 0:
-            errors.append(f'mlm_from_layer must be >= 0, got {self.mlm_from_layer}')
 
         if self.proto_rank_loss < 0:
             errors.append(f'proto_rank_loss must be >= 0, got {self.proto_rank_loss}')

@@ -97,19 +97,19 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
             # NN loss (mask=allowed on NN rows)
             mod_loss = criterion(
                 mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
-                compound_ids=batch['compound_id'], mask=mod_mask,
+                mask=mod_mask,
             )
             head_loss = criterion(
                 head_pred, batch['head_avg'], head_logits, batch['head_std'],
-                compound_ids=batch['compound_id'], mask=head_mask,
+                mask=head_mask,
             )
 
-# PV has only an overall Avg/Std label.  Its dedicated composition
+            # PV has only an overall Avg/Std label. Its dedicated composition
             # exit consumes both Base and Particle spans; mod/head exits do not
             # receive PV supervision.
             pv_loss = criterion(
                 pv_pred, batch['mod_avg'], pv_logits, batch['mod_std'],
-                compound_ids=batch['compound_id'], mask=pv_mask,
+                mask=pv_mask,
             )
 
             loss = mod_loss + head_loss + pv_loss

@@ -1,9 +1,11 @@
 """Gauss-only loss terms for the compositionality pipeline.
 
 The objective combines an always-on Gaussian distribution loss
-``KL(N(mu_p, sigma_p^2) || N(y, sigma_t^2))``, CCC, and within-compound
-pairwise ranking.  The KL term is not weighted: predicting uncertainty without
-supervising its ``sigma`` output would leave that branch untrained.
+``KL(N(mu_p, sigma_p^2) || N(y, sigma_t^2))`` and CCC.  The KL term is
+not weighted: predicting uncertainty without supervising its ``sigma``
+output would leave that branch untrained.  (The prototype ranking term
+``prototype_rank_loss`` lives in src/prototype_stream and is applied by
+the two-stream trainer, not here.)
 """
 
 from __future__ import annotations
@@ -16,46 +18,6 @@ import torch.nn.functional as F
 
 # floor of predicted sigma in gauss_kl matches the GaussHead floor (heads.py)
 _SIGMA_FLOOR = 0.05
-
-
-# --------------------------------------------------------------------------- #
-# pairwise ranking (within same compound)
-# --------------------------------------------------------------------------- #
-def margin_rank_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    margin: float = 0.5,
-    compound_ids: Optional[torch.Tensor] = None,
-    mode: str = 'dynamic',
-) -> torch.Tensor:
-    """Hinge loss on PAIRS INSIDE the same compound.
-
-    ``mode``: 'dynamic' = relu(target_gap - pred_gap) unbounded margin;
-    'clamp' = cap the margin at ``margin`` (gradient capped on extreme pairs).
-    """
-    if pred.ndim > 1:
-        return torch.stack([
-            margin_rank_loss(pred[:, i], target[:, i], margin, compound_ids, mode)
-            for i in range(pred.shape[1])
-        ]).mean()
-
-    n = pred.shape[0]
-    if n < 2:
-        return pred.sum() * 0.0   # graph-connected zero
-
-    target_diff = target[:, None] - target[None, :]
-    pred_diff = pred[:, None] - pred[None, :]
-
-    mask = target_diff > 0
-    if compound_ids is not None:
-        mask = mask & (compound_ids[:, None] == compound_ids[None, :]) & (compound_ids[:, None] >= 0)
-
-    if not mask.any():
-        return pred.sum() * 0.0   # graph-connected zero
-
-    dynamic_margin = torch.clamp(target_diff[mask], max=margin) if mode == 'clamp' \
-        else target_diff[mask]
-    return F.relu(dynamic_margin - pred_diff[mask]).mean()
 
 
 # --------------------------------------------------------------------------- #
@@ -96,21 +58,17 @@ def ccc_loss(pred: torch.Tensor, target: torch.Tensor,
 
 
 class GaussLoss(nn.Module):
-    """Gaussian KL + CCC + pairwise ranking.
+    """Gaussian KL + CCC.
 
     The predicted ``sigma`` travels through the ``logits`` channel, which is
     why ``requires_logits`` is True.
     """
 
     def __init__(self, ccc_weight: float = 0.7,
-                 lambda_rank: float = 0.5, rank_margin: float = 0.5,
-                 rank_margin_mode: str = 'dynamic', ccc_var_floor: float = 0.05,
+                 ccc_var_floor: float = 0.05,
                  bin_sigma: float = 0.5, use_label_std: bool = True):
         super().__init__()
         self.ccc_weight = ccc_weight
-        self.lambda_rank = lambda_rank
-        self.rank_margin = rank_margin
-        self.rank_margin_mode = rank_margin_mode
         self.ccc_var_floor = ccc_var_floor
         self.bin_sigma = bin_sigma
         self.use_label_std = use_label_std
@@ -119,7 +77,6 @@ class GaussLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor,
                 logits: Optional[torch.Tensor] = None,
                 std: Optional[torch.Tensor] = None,
-                compound_ids: Optional[torch.Tensor] = None,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if mask is not None:
             mask = mask.to(pred.device)
@@ -132,7 +89,6 @@ class GaussLoss(nn.Module):
             target = target[mask]
             logits = logits[mask] if logits is not None else None
             std = std[mask] if std is not None else None
-            compound_ids = compound_ids[mask] if compound_ids is not None else None
 
         mu = pred.float()
         sigma_p = logits.float() if logits is not None else torch.full_like(mu, self.bin_sigma)
@@ -144,8 +100,4 @@ class GaussLoss(nn.Module):
         loss = gauss_kl(mu, sigma_p, target, sigma_t)
         if self.ccc_weight > 0:
             loss = loss + self.ccc_weight * ccc_loss(mu, target, var_floor=self.ccc_var_floor)
-        # if self.lambda_rank > 0:
-        #     loss = loss + self.lambda_rank * margin_rank_loss(
-        #         mu, target, margin=self.rank_margin,
-        #         compound_ids=compound_ids, mode=self.rank_margin_mode)
         return loss

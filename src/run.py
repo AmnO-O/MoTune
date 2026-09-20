@@ -93,7 +93,6 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
 
     from src.config import Config
     from src.data import CompDataset, collate_comp, load_labeled
-    from src.folds import assign_folds
     from src.marks import Span, find_spans
     from src.model import build_model
     from src.train import train_epoch, evaluate
@@ -113,9 +112,8 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
     rows = load_labeled(cfg)[:60]
     tok = cfg.build_tokenizer()
     ds = CompDataset(rows, tok, max_len=64)
-    folds = assign_folds(rows, 3, cfg.seed)
-    assert all('fold' in r for r in folds)
-    logger.info('[smoke] data OK (%d rows, folds ok)', len(rows))
+    assert len(ds) == len(rows)
+    logger.info('[smoke] data OK (%d rows tokenized)', len(rows))
 
     # 3. model
     device = torch.device(device_str)
@@ -139,9 +137,9 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
         allowed = batch['has_label'] & batch['has_mod'] & batch['has_head'] & ~batch['degenerate']
         loss = (
             criterion(mod_pred, batch['mod_avg'], mod_logits, batch['mod_std'],
-                      compound_ids=batch['compound_id'], mask=allowed)
+                      mask=allowed)
             + criterion(head_pred, batch['head_avg'], head_logits, batch['head_std'],
-                        compound_ids=batch['compound_id'], mask=allowed)
+                        mask=allowed)
         )
     scaler.scale(loss).backward()
     logger.info('[smoke] gauss forward + backward OK (loss %.4f)', loss.item())
@@ -168,8 +166,8 @@ def _smoke(logger: logging.Logger, device_str: str) -> None:
     model.eval()
     with torch.no_grad():
         mod_pred2, head_pred2 = model(batch)
-    assert tuple(mod_pred2.shape) == (batch['input_ids'].shape[0], 1)
-    assert tuple(head_pred2.shape) == (batch['input_ids'].shape[0], 1)
+    assert tuple(mod_pred2.shape) == (batch['input_ids'].shape[0],)
+    assert tuple(head_pred2.shape) == (batch['input_ids'].shape[0],)
     assert torch.isfinite(mod_pred2).all() and torch.isfinite(head_pred2).all()
     logger.info('[smoke] eval-mode clamp OK (mod_pred=%s, head_pred=%s)',
                 tuple(mod_pred2.shape), tuple(head_pred2.shape))
@@ -186,8 +184,6 @@ def _build_parser() -> argparse.ArgumentParser:
                     help='Device: auto, cpu, cuda, cuda:0 (default: auto)')
     ap.add_argument('--smoke', action='store_true',
                     help='Run a quick pipeline sanity check (1 batch, no checkpoint)')
-    ap.add_argument('--mlm-adapt', action='store_true',
-                    help='Run Stage 1 Task-Adaptive Prefix MLM pre-training')
     ap.add_argument('--check-config', action='store_true',
                     help='Validate the effective config, print it, and exit without training')
     return ap
@@ -253,13 +249,6 @@ def main() -> None:
     if args.smoke:
         logger.info('=== SMOKE MODE ===')
         _smoke(logger, device_str)
-        return
-
-    if getattr(args, 'mlm_adapt', False):
-        logger.info('=== STAGE 1 MLM ADAPTATION MODE ===')
-        from src.train_mlm import train_mlm_adaptation
-        save_path = train_mlm_adaptation(cfg, logger, torch.device(device_str), data_dir, output_dir)
-        logger.info('Task adaptation completed. Checkpoint: %s', save_path)
         return
 
     device = torch.device(device_str)

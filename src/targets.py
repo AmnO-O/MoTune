@@ -5,9 +5,8 @@ this row graded on the modifier, the head noun, or the whole compound?
 Everything that follows from the choice -- which span(s) to pool, which
 label to supervise, which head to route -- derives from the target name.
 
-``pool_span`` is pure geometry over the final-layer hidden states: masked
-mean over the modifier span, the head span, or the whole compound
-(mod | head), depending on the active target.
+``pool_span`` and ``pool_active`` perform masked-mean over the final-layer
+hidden states corresponding to the active target's span in the sentence.
 """
 
 from __future__ import annotations
@@ -20,13 +19,6 @@ except ImportError:
     torch = None
 
 TARGETS = ('mod', 'head', 'pv')
-
-# One of mmBERT's reserved-but-unused vocab ids, reused as a learned task
-# marker (verified: id 7/8/9 = '<unused0>'/'<unused1>'/'<unused2>'). No embed
-# resize needed; the marker embedding is a tiny separate module that trains at
-# head_lr. (jhu-clsp/mmBERT-base, Gemma-2-style 256k vocab.)
-MARKER_CODE = {'mod': 7, 'head': 8, 'pv': 9}
-TARGET_PREFIX_TOKENS = {'mod': '<unused0>', 'head': '<unused1>', 'pv': '<unused2>'}
 
 
 def target_code(t):
@@ -113,21 +105,5 @@ def pool_active(hidden: torch.Tensor, batch, targets: Sequence[str]) -> torch.Te
     ]    # (B, T): row r gets its own target's span mask
 
     mask = mask.float().unsqueeze(-1)
-    counts = mask.sum(dim=1).clamp(min=1.0)
-    return (hidden * mask).sum(dim=1) / counts
-
-
-def pool_prefix(hidden: torch.Tensor, batch) -> torch.Tensor:
-    """Masked-mean over the row's OWN prefix WORD tokens (``prefix_mask``).
-
-    ``target_prefix=True`` prepends ``<marker> WORD <marker>`` right after
-    <bos>; this pools ONLY the WORD tokens inside that prefix -- after the
-    22 bidirectional layers they are fully contextualized by the whole
-    sentence, so the readout reads "the word as mentioned in this sentence"
-    from a dedicated answer slot rather than from the literal span copy.
-    Rows with no word tokens (empty prefix) pool over nothing -> zero vector;
-    the caller decides when a ``prefix_mask`` is present at all.
-    """
-    mask = batch['prefix_mask'].float().unsqueeze(-1)
     counts = mask.sum(dim=1).clamp(min=1.0)
     return (hidden * mask).sum(dim=1) / counts
