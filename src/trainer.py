@@ -326,19 +326,31 @@ class Trainer:
             )
 
             # Compute train rho directly from in-epoch predictions
-            single_target = 'train_preds' in diag and len(diag.get('train_preds', ())) == 6
+            single_target = 'train_preds' in diag and len(diag.get('train_preds', ())) == 9
             if 'train_preds' in diag:
                 if single_target:
-                    tr_m, tr_h, tr_my, tr_hy, tr_al, tr_tgt = diag['train_preds']
+                    tr_m, tr_h, tr_p, tr_my, tr_hy, tr_py, tr_al, tr_is_pv, tr_tgt = diag['train_preds']
                     tr_al_m = tr_al & (tr_tgt == 0)
                     tr_al_h = tr_al & (tr_tgt == 1)
+                    tr_al_p = tr_al & (tr_tgt == 2)
                 else:
-                    tr_m, tr_h, tr_my, tr_hy, tr_al = diag['train_preds']
-                    tr_al_m = tr_al_h = tr_al
+                    tr_m, tr_h, tr_p, tr_my, tr_hy, tr_py, tr_al, tr_is_pv = diag['train_preds']
+                    tr_is_pv = tr_is_pv.astype(bool)
+                    tr_al_m = tr_al_h = tr_al & (~tr_is_pv)
+                    tr_al_p = tr_al & tr_is_pv
                 tr_rho_m = _safe_rho(tr_my[tr_al_m], tr_m[tr_al_m]) if tr_al_m.any() else 0.0
                 tr_rho_h = _safe_rho(tr_hy[tr_al_h], tr_h[tr_al_h]) if tr_al_h.any() else 0.0
+                tr_rho_pv = _safe_rho(tr_py[tr_al_p], tr_p[tr_al_p]) if tr_al_p.any() else 0.0
             else:
-                tr_rho_m = tr_rho_h = 0.0
+                tr_rho_m = tr_rho_h = tr_rho_pv = 0.0
+            tr_nn_any = tr_al_m.any() or tr_al_h.any()
+            tr_pv_any = tr_al_p.any()
+            if tr_pv_any and tr_nn_any:
+                train_rho_mean = (tr_rho_m + tr_rho_h + tr_rho_pv) / 3.0
+            elif tr_pv_any:
+                train_rho_mean = tr_rho_pv
+            else:
+                train_rho_mean = (tr_rho_m + tr_rho_h) / 2.0
 
             if ema is not None:
                 ema.apply_to(model)
@@ -380,23 +392,27 @@ class Trainer:
             ovf_str = ''
             if pv_mask.any():
                 self.logger.info(
-                    'Epoch %d/%d [%s] | Loss %.4f (nn_m %.4f / nn_h %.4f / pv %.4f) | Train ρ %.4f | '
+                    'Epoch %d/%d [%s] | Loss %.4f (nn_m %.4f / nn_h %.4f / pv %.4f) | '
+                    'Train Mod ρ %.4f | Train Head ρ %.4f | Train PV ρ %.4f | Train Mean ρ %.4f | '
                     'Val Mod ρ %.4f | Val Head ρ %.4f | Val PV ρ %.4f | Val Mean ρ %.4f | '
                     'steps %d (skip %d) | scale %.1f | lr %.2e',
                     epoch + 1, self.cfg.total_epochs, phase, train_loss,
                     diag.get('nn_mod_loss', diag['mod_loss']),
                     diag.get('nn_head_loss', diag['head_loss']),
                     diag.get('pv_loss', 0.0),
-                    (tr_rho_m + tr_rho_h) / 2, rho_mod, rho_head, rho_pv, rho_mean,
+                    tr_rho_m, tr_rho_h, tr_rho_pv, train_rho_mean,
+                    rho_mod, rho_head, rho_pv, rho_mean,
                     diag['opt_steps'], diag['skipped'], diag['scale'], diag['lr'])
             else:
                 self.logger.info(
-                    'Epoch %d/%d [%s] | Loss %.4f (mod %.4f / head %.4f) | Train ρ %.4f | '
+                    'Epoch %d/%d [%s] | Loss %.4f (mod %.4f / head %.4f) | '
+                    'Train Mod ρ %.4f | Train Head ρ %.4f | Train Mean ρ %.4f | '
                     'Val Mod ρ %.4f | Val Head ρ %.4f | Val Mean ρ %.4f | '
                     'steps %d (skip %d) | scale %.1f | lr %.2e',
                     epoch + 1, self.cfg.total_epochs, phase, train_loss,
                     diag['mod_loss'], diag['head_loss'],
-                    (tr_rho_m + tr_rho_h) / 2, rho_mod, rho_head, rho_mean,
+                    tr_rho_m, tr_rho_h, train_rho_mean,
+                    rho_mod, rho_head, rho_mean,
                     diag['opt_steps'], diag['skipped'], diag['scale'], diag['lr'])
 
             history.append({
@@ -405,7 +421,10 @@ class Trainer:
                 'loss_mod': round(float(diag.get('nn_mod_loss', diag['mod_loss'])), 5),
                 'loss_head': round(float(diag.get('nn_head_loss', diag['head_loss'])), 5),
                 'loss_pv': round(float(diag.get('pv_loss', 0.0)), 5),
-                'train_rho_mean': round((tr_rho_m + tr_rho_h) / 2, 5),
+                'train_rho_mod': round(tr_rho_m, 5),
+                'train_rho_head': round(tr_rho_h, 5),
+                'train_rho_pv': round(tr_rho_pv, 5),
+                'train_rho_mean': round(train_rho_mean, 5),
                 'rho_mod': round(rho_mod, 5), 'rho_head': round(rho_head, 5),
                 'rho_pv': round(rho_pv, 5),
                 'rho_mean': round(rho_mean, 5),

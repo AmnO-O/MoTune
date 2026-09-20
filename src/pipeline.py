@@ -52,11 +52,18 @@ def run_train80(cfg: Config, logger: logging.Logger, device,
     gss = GroupShuffleSplit(n_splits=1, test_size=cfg.test_size, random_state=cfg.seed)
     compounds = [r['compound'] for r in core_rows]
     tr, va = next(gss.split(core_rows, groups=compounds))
-    train_rows = [core_rows[i] for i in tr] + aux_rows
     val_rows = [core_rows[i] for i in va]
+    # Data-leakage guard: aux rows whose compound ALSO lands in the val split must
+    # not join the training set (GroupShuffleSplit only guarantees separation of
+    # core rows, never of aux rows).
+    val_compounds = {r['compound'].strip().lower() for r in val_rows}
+    clean_aux = [r for r in aux_rows
+                 if (r.get('compound') or '').strip().lower() not in val_compounds]
+    dropped_aux = len(aux_rows) - len(clean_aux)
+    train_rows = [core_rows[i] for i in tr] + clean_aux
     overlap = set(r['compound'] for r in train_rows) & set(r['compound'] for r in val_rows)
-    logger.info('Train %d rows | Val %d rows | compound overlap %d',
-                len(train_rows), len(val_rows), len(overlap))
+    logger.info('Train %d rows | Val %d rows | compound overlap %d | aux dropped %d',
+                len(train_rows), len(val_rows), len(overlap), dropped_aux)
 
     tokenizer = _tokenizer(cfg, logger)
     from src.trainer import Trainer

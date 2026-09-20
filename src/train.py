@@ -57,9 +57,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
     last_grad_norm = last_scale = last_lr = float('nan')
     n_micro = len(dataloader)
 
-    tr_mod_preds, tr_head_preds = [], []
-    tr_mod_targets, tr_head_targets = [], []
-    tr_allowed = []
+    tr_mod_preds, tr_head_preds, tr_pv_preds = [], [], []
+    tr_mod_targets, tr_head_targets, tr_pv_label = [], [], []
+    tr_allowed, tr_is_pv = [], []
     tr_targets = []
 
     for step_idx, batch in enumerate(dataloader, 1):
@@ -124,9 +124,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         # Collect train predictions directly to avoid re-evaluating on train_loader
         tr_mod_preds.append(mod_pred.detach().cpu())
         tr_head_preds.append(head_pred.detach().cpu())
+        tr_pv_preds.append(pv_pred.detach().cpu())
         tr_mod_targets.append(batch['mod_avg'].cpu())
         tr_head_targets.append(batch['head_avg'].cpu())
+        tr_pv_label.append(batch['mod_avg'].cpu())   # PV reports on the compound Avg
         tr_allowed.append(allowed.cpu())
+        tr_is_pv.append(is_pv.cpu())
         if 'target' in batch:
             tr_targets.append(batch['target'].cpu())
 
@@ -191,14 +194,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, devi
         if tr_mod_preds:
             m_p = torch.cat(tr_mod_preds).numpy()
             h_p = torch.cat(tr_head_preds).numpy()
+            p_p = torch.cat(tr_pv_preds).numpy()
             m_y = torch.cat(tr_mod_targets).numpy()
             h_y = torch.cat(tr_head_targets).numpy()
+            py = torch.cat(tr_pv_label).numpy()
             al = torch.cat(tr_allowed).numpy()
+            ip = torch.cat(tr_is_pv).numpy()
             if tr_targets:
                 t_t = torch.cat(tr_targets).numpy()
-                report['train_preds'] = (m_p, h_p, m_y, h_y, al, t_t)
+                report['train_preds'] = (m_p, h_p, p_p, m_y, h_y, py, al, ip, t_t)
             else:
-                report['train_preds'] = (m_p, h_p, m_y, h_y, al)
+                report['train_preds'] = (m_p, h_p, p_p, m_y, h_y, py, al, ip)
     return total_loss / n_micro
 
 
