@@ -153,11 +153,13 @@ class Trainer:
         train_ds = CompDataset(
             train_rows, tokenizer, max_len=self.cfg.max_context_length,
             target_prefix=self.cfg.target_prefix, static_vec=static_vec,
-            span_markers=self.cfg.span_markers)
+            span_markers=self.cfg.span_markers,
+            proto_stream=self.cfg.proto_stream)
         val_ds = CompDataset(
             val_rows, tokenizer, max_len=self.cfg.max_context_length,
             target_prefix=self.cfg.target_prefix, static_vec=static_vec,
-            span_markers=self.cfg.span_markers)
+            span_markers=self.cfg.span_markers,
+            proto_stream=self.cfg.proto_stream)
         
         # Chỉ bật persistent_workers khi num_workers > 0 để tránh deadlock
         num_workers = max(0, self.cfg.num_workers)
@@ -228,6 +230,9 @@ class Trainer:
         gate = getattr(model, 'prefix_gate', None)
         if gate is not None:
             heads.append(nn.ParameterList([gate]))
+        shift = getattr(model, 'shift_fuse', None)
+        if shift is not None:
+            heads.append(shift)
         seen = set()
         uniq: List[nn.Module] = []
         for m in heads:

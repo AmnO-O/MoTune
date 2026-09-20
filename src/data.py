@@ -353,7 +353,8 @@ class CompDataset(_DatasetBase):
     def __init__(self, rows: List[Dict], tokenizer, max_len: int = 256,
                  is_test: bool = False, target_prefix: bool = False,
                  static_vec: Optional[StaticVec] = None,
-                 span_markers: bool = False):
+                 span_markers: bool = False,
+                 proto_stream: bool = False):
         self.rows = rows
         self.tokenizer = tokenizer
         self.max_len = max_len
@@ -361,6 +362,7 @@ class CompDataset(_DatasetBase):
         self.target_prefix = target_prefix
         self.static_vec = static_vec
         self.span_markers = span_markers
+        self.proto_stream = proto_stream
         self.items = [self._encode(r) for r in rows]
         self._report()
 
@@ -479,6 +481,26 @@ class CompDataset(_DatasetBase):
                 if n > 0:                  # keep the anchor unit-length
                     pv_static = pv_static / n
             item['pv_static'] = pv_static
+        if self.proto_stream:
+            # Stream 1: Tokenize the isolated target word for dynamic prototype representation
+            t = r.get('target')
+            if t == 'mod':
+                word = r.get('mod', '')
+            elif t == 'head':
+                word = r.get('head', '')
+            elif t == 'pv':
+                word = r.get('compound', '')
+            else:
+                word = r.get('mod', '') or r.get('compound', '')
+            p_enc = self.tokenizer(
+                word, max_length=16, truncation=True, return_tensors='pt'
+            ) if (word and hasattr(self.tokenizer, '__call__')) else None
+            if p_enc is not None:
+                item['proto_ids'] = p_enc['input_ids'].squeeze(0)
+                item['proto_mask'] = p_enc['attention_mask'].squeeze(0)
+            else:
+                item['proto_ids'] = torch.zeros(1, dtype=input_ids.dtype)
+                item['proto_mask'] = torch.zeros(1, dtype=attention_mask.dtype)
         if r.get('target') is not None:
             item['target'] = torch.tensor(_TARGET_CODE[r['target']], dtype=torch.long)
         return item
@@ -508,11 +530,11 @@ class CompDataset(_DatasetBase):
 def collate_comp(batch: List[Dict], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     seq_keys = ('input_ids', 'attention_mask', 'mod_span_mask', 'head_span_mask',
-                'prefix_mask')
+                'prefix_mask', 'proto_ids', 'proto_mask')
     for key in batch[0]:
         if key in seq_keys:
             length = max(int(b[key].size(0)) for b in batch)
-            fill = pad_token_id if key == 'input_ids' else 0
+            fill = pad_token_id if key in ('input_ids', 'proto_ids') else 0
             out[key] = torch.full((len(batch), length), fill_value=fill,
                                   dtype=batch[0][key].dtype)
             for i, b in enumerate(batch):

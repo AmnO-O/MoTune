@@ -46,6 +46,7 @@ from transformers import AutoModel
 from .constants import SCORE_MIN, SCORE_MAX
 from .heads import GaussHead
 from .model import FusionBlock
+from .prototype_stream import SemanticShiftFusion, pool_prototype
 from .targets import TARGETS, pool_active, pool_prefix, pool_span, row_targets, target_selector
 
 
@@ -95,7 +96,8 @@ class CombinedBackboneModel(nn.Module):
                  prefix_readout: str = 'context',
                  static_span: bool = False,
                  static_ext: bool = False, static_ext_dim: int = 300,
-                 static_fuse_layers: int = 3, static_fuse_heads: int = 2):
+                 static_fuse_layers: int = 3, static_fuse_heads: int = 2,
+                 proto_stream: bool = False):
         super().__init__()
         self.backbone = backbone
         self.hidden_size = hidden_size
@@ -103,6 +105,8 @@ class CombinedBackboneModel(nn.Module):
         self.prefix_readout = prefix_readout
         self.static_span = static_span
         self.static_ext = static_span and static_ext
+        self.proto_stream = proto_stream
+        self.shift_fuse = SemanticShiftFusion(hidden_size, dropout=dropout) if proto_stream else None
 
         self.lm = AutoModel.from_pretrained(backbone)
         # Alias kept for uniform reader code; NOT registered as a child so the
@@ -159,7 +163,7 @@ class CombinedBackboneModel(nn.Module):
         return {'mod': self.gauss, 'head': self.gauss, 'pv': self.gauss}
 
     # ------------------------------------------------------------------ #
-    def _predict(self, hidden: torch.Tensor, batch) -> dict:
+    def _predict(self, hidden: torch.Tensor, batch, h_proto: Optional[torch.Tensor] = None) -> dict:
         """Per-target (mu, sigma) on the pooled span of that target.
 
         Single-target mode (``batch['target']`` present): every row has
@@ -191,6 +195,8 @@ class CombinedBackboneModel(nn.Module):
         if targets is None:
             for t in TARGETS:
                 pool = pool_span(hidden, batch, t)
+                if self.proto_stream and h_proto is not None:
+                    pool = self.shift_fuse(pool, h_proto)
                 if self.static_span:
                     if ext is not None:
                         static_pool = ext[t]
@@ -218,6 +224,8 @@ class CombinedBackboneModel(nn.Module):
                 pool = a * ctx + (1 - a) * pre
         if pool is None:
             pool = pool_active(hidden, batch, targets)
+        if self.proto_stream and h_proto is not None:
+            pool = self.shift_fuse(pool, h_proto)
         if self.static_span:
             if ext is not None:
                 # Route each row to its OWN target's static anchor: default to
@@ -270,6 +278,16 @@ class CombinedBackboneModel(nn.Module):
                 mod_sigma, head_sigma, pv_sigma)
 
     def _forward_gauss(self, batch, with_logits: bool = False, with_pv: bool = False):
+        h_proto = None
+        if self.proto_stream and 'proto_ids' in batch and 'proto_mask' in batch:
+            # Stream 1: Forward prototype batch (isolated target word, very short sequence L <= 16)
+            proto_out = self.lm(
+                input_ids=batch['proto_ids'],
+                attention_mask=batch['proto_mask'],
+                output_hidden_states=False,
+            )
+            h_proto = pool_prototype(proto_out.last_hidden_state, batch['proto_mask'])
+
         # Marker injection requires per-row targets in the batch. Predict/joint
         # batches (no ``target`` key) fall back to the plain token path even
         # when ``target_prefix`` is on -- the per-target marker is only ever
@@ -292,7 +310,7 @@ class CombinedBackboneModel(nn.Module):
                 attention_mask=batch['attention_mask'],
                 output_hidden_states=False,
             )
-        preds = self._predict(outputs.last_hidden_state, batch)
+        preds = self._predict(outputs.last_hidden_state, batch, h_proto=h_proto)
         (mod_pred, head_pred, pv_pred,
          mod_sigma, head_sigma, pv_sigma) = self._route(preds, batch)
 
@@ -329,6 +347,7 @@ def build_combined_model(cfg, device, load_from: Optional[str | Path] = None) ->
         static_ext_dim=int(getattr(cfg, 'static_ext_dim', 300)),
         static_fuse_layers=int(getattr(cfg, 'static_fuse_layers', 1)),
         static_fuse_heads=int(getattr(cfg, 'static_fuse_heads', 2)),
+        proto_stream=bool(getattr(cfg, 'proto_stream', False)),
     )
     if load_from is not None:
         load_from = Path(load_from)

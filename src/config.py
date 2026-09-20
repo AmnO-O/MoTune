@@ -161,6 +161,10 @@ class Config:
     # cfg.batch_size.
     mlm_batch_size: int = 16
 
+    # === two-stream prototype representation (lexical vs contextual) ===
+    proto_stream: bool = False
+    proto_rank_loss: float = 0.0
+
     # === optimization ===
     batch_size: int = 32
     accum_steps: int = 1
@@ -356,6 +360,11 @@ class Config:
             errors.append(f'mlm_mask_prob must be in (0, 1], got {self.mlm_mask_prob}')
         if self.mlm_from_layer < 0:
             errors.append(f'mlm_from_layer must be >= 0, got {self.mlm_from_layer}')
+
+        if self.proto_rank_loss < 0:
+            errors.append(f'proto_rank_loss must be >= 0, got {self.proto_rank_loss}')
+        if self.proto_stream and self.model_backend != 'combined':
+            errors.append(f'proto_stream requires model_backend="combined", got "{self.model_backend}"')
 
         if errors:
             raise ValueError('Invalid configuration:\n  ' + '\n  '.join(errors))

@@ -1200,6 +1200,176 @@ def check_mlm_adaptation() -> None:
           'merge_lora unwraps adapter back to nn.Linear with folded weights')
 
 
+def check_proto_stream() -> None:
+    print('=== 11. TWO-STREAM PROTOTYPE (Disentangled Lexical vs Contextual) ===')
+    import subprocess
+    import torch
+    import torch.nn as nn
+    from src.config import Config
+    from src.data import CompDataset, collate_comp
+    from src.prototype_stream import SemanticShiftFusion, pool_prototype, prototype_rank_loss
+
+    # 1. src/model.py must remain 100% untouched
+    res = subprocess.run(['git', 'diff', 'src/model.py'], capture_output=True, text=True)
+    check(res.stdout.strip() == '', 'src/model.py has ZERO git diff (100% untouched invariant)')
+
+    # 2. Config knobs and validation
+    cfg = Config()
+    check(cfg.proto_stream is False, 'Config has proto_stream default (False)')
+    check(cfg.proto_rank_loss == 0.0, 'Config has proto_rank_loss default (0.0)')
+
+    # Rejection of invalid configs
+    try:
+        Config(proto_rank_loss=-0.1).validate()
+        check(False, '[reject] proto_rank_loss < 0')
+    except ValueError:
+        check(True, '[reject] proto_rank_loss < 0')
+
+    try:
+        Config(proto_stream=True, model_backend='exits').validate()
+        check(False, '[reject] proto_stream with backend=exits')
+    except ValueError:
+        check(True, '[reject] proto_stream with backend=exits')
+
+    cfg_ok = Config(proto_stream=True, model_backend='combined')
+    cfg_ok.validate()
+    check(True, 'Config accepts proto_stream=True with model_backend=combined')
+
+    # 3. CompDataset tokenization of prototype
+    class MockTokenizer:
+        pad_token_id = 0
+        def __call__(self, text, **kwargs):
+            # Return [0, 10, 11, 2] (length 4: CLS, 2 subwords, SEP)
+            return {
+                'input_ids': torch.tensor([[0, 10, 11, 2]]),
+                'attention_mask': torch.tensor([[1, 1, 1, 1]]),
+                'offset_mapping': torch.tensor([[[0, 0], [0, 2], [2, 4], [0, 0]]]),
+            }
+        def encode(self, text, add_special_tokens=False):
+            return [10, 11]
+
+    mock_tok = MockTokenizer()
+    rows = [{'context': 'acid rain falls', 'mod': 'acid', 'head': 'rain', 'compound': 'acid rain',
+             'target': 'mod', 'has_label': True, 'mod_avg': 4.5, 'head_avg': 4.0, 'mod_std': 0.5, 'head_std': 0.5,
+             'is_pv': False, 'row_id': 1, 'compound_id': 1}]
+
+    ds_off = CompDataset(rows, mock_tok, proto_stream=False)
+    check('proto_ids' not in ds_off[0], 'CompDataset without proto_stream omits proto_ids')
+
+    ds_on = CompDataset(rows, mock_tok, proto_stream=True)
+    item = ds_on[0]
+    check('proto_ids' in item and 'proto_mask' in item, 'CompDataset with proto_stream creates proto_ids and proto_mask')
+    check(item['proto_ids'].shape == (4,) and item['proto_mask'].shape == (4,), 'proto_ids shape matches tokenizer output')
+
+    # Collation
+    batch = collate_comp([item, item], pad_token_id=0)
+    check(batch['proto_ids'].shape == (2, 4), 'collate_comp stacks and pads proto_ids')
+    check(batch['proto_mask'].shape == (2, 4), 'collate_comp stacks and pads proto_mask')
+
+    # 4. pool_prototype excludes CLS and SEP on sequences >= 3
+    # Hidden state shape: (B=2, L=4, H=8)
+    hidden_proto = torch.zeros(2, 4, 8)
+    hidden_proto[:, 0, :] = 100.0   # CLS
+    hidden_proto[:, 1, :] = 2.0     # subword 1
+    hidden_proto[:, 2, :] = 4.0     # subword 2
+    hidden_proto[:, 3, :] = 200.0   # SEP
+    mask_proto = torch.ones(2, 4, dtype=torch.long)
+
+    pooled_proto = pool_prototype(hidden_proto, mask_proto)
+    check(pooled_proto.shape == (2, 8), 'pool_prototype output shape is (B, H)')
+    # Expected mean of subword 1 (2.0) and subword 2 (4.0) is 3.0
+    check(torch.allclose(pooled_proto, torch.full((2, 8), 3.0)),
+          'pool_prototype correctly isolates subwords excluding [CLS] and [SEP]')
+
+    # Degrade test on sequence of length 2
+    hidden_short = torch.full((1, 2, 8), 5.0)
+    mask_short = torch.ones(1, 2, dtype=torch.long)
+    pooled_short = pool_prototype(hidden_short, mask_short)
+    check(torch.allclose(pooled_short, torch.full((1, 8), 5.0)),
+          'pool_prototype degrades safely on short sequence length < 3')
+
+    # 5. SemanticShiftFusion
+    H = 16
+    fuse = SemanticShiftFusion(hidden_size=H, dropout=0.0)
+    h_ctx = torch.randn(2, H, requires_grad=True)
+    h_proto = torch.randn(2, H, requires_grad=True)
+    out_fuse = fuse(h_ctx, h_proto)
+
+    check(out_fuse.shape == (2, H), 'SemanticShiftFusion output shape is (B, H)')
+    check(torch.isfinite(out_fuse).all(), 'SemanticShiftFusion outputs all finite values')
+    check(fuse.last_cos is not None and fuse.last_cos.shape == (2,),
+          'SemanticShiftFusion records last cosine similarities')
+
+    loss = out_fuse.sum()
+    loss.backward()
+    check(h_ctx.grad is not None and h_proto.grad is not None,
+          'gradients flow smoothly through SemanticShiftFusion to inputs')
+
+    # 6. prototype_rank_loss
+    cos_sim = torch.tensor([0.9, 0.2, 0.8])
+    ratings = torch.tensor([5.0, 1.0, 4.0])
+    rank_loss = prototype_rank_loss(cos_sim, ratings, margin=0.2)
+    check(torch.isfinite(rank_loss) and rank_loss >= 0.0,
+          'prototype_rank_loss computes valid finite ranking loss')
+
+    # 7. Mock CombinedBackboneModel forward with proto_stream
+    from src.model_combined import CombinedBackboneModel
+    class DummyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = nn.Embedding(50, 16)
+        def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
+            B, L = input_ids.shape
+            h = self.emb(input_ids)
+            class Out:
+                pass
+            o = Out()
+            o.last_hidden_state = h
+            return o
+        def get_input_embeddings(self):
+            return self.emb
+
+    # Monkey-patch AutoModel.from_pretrained to avoid downloading weights
+    import transformers
+    orig_from_pretrained = transformers.AutoModel.from_pretrained
+    transformers.AutoModel.from_pretrained = lambda *args, **kwargs: DummyLM()
+    try:
+        model = CombinedBackboneModel(
+            backbone='dummy', hidden_size=16, proto_stream=True
+        )
+        check(model.shift_fuse is not None, 'CombinedBackboneModel initializes shift_fuse when proto_stream=True')
+
+        # Run forward
+        batch_mock = {
+            'input_ids': torch.randint(0, 40, (2, 8)),
+            'attention_mask': torch.ones(2, 8, dtype=torch.long),
+            'proto_ids': torch.tensor([[0, 10, 11, 2], [0, 12, 13, 2]]),
+            'proto_mask': torch.ones(2, 4, dtype=torch.long),
+            'mod_span_mask': torch.zeros(2, 8, dtype=torch.bool),
+            'head_span_mask': torch.zeros(2, 8, dtype=torch.bool),
+            'target': torch.tensor([0, 1]),
+            'is_pv': torch.tensor([False, False]),
+            'has_mod': torch.tensor([True, True]),
+            'has_head': torch.tensor([True, True]),
+            'degenerate': torch.tensor([False, False]),
+            'has_label': torch.tensor([True, True]),
+        }
+        batch_mock['mod_span_mask'][:, 2:4] = True
+        batch_mock['head_span_mask'][:, 4:6] = True
+
+        preds = model(batch_mock, with_logits=True, with_pv=True)
+        mod_p, head_p, pv_p, mod_s, head_s, pv_s = preds
+        check(mod_p.shape == (2,) and mod_s.shape == (2,), 'CombinedBackboneModel proto_stream forward shapes valid')
+        check(torch.isfinite(mod_p).all() and torch.isfinite(mod_s).all(), 'Forward outputs are finite')
+
+        dummy_loss = mod_p.sum() + mod_s.sum()
+        dummy_loss.backward()
+        p_has_grad = any(p.grad is not None for p in model.shift_fuse.parameters())
+        check(p_has_grad, 'gradients flow backward into shift_fuse parameters')
+    finally:
+        transformers.AutoModel.from_pretrained = orig_from_pretrained
+
+
 def main() -> int:
     sync_parse()
     check_config()
@@ -1211,6 +1381,7 @@ def main() -> int:
     check_targets()
     check_static_ext()
     check_mlm_adaptation()
+    check_proto_stream()
 
     print('=' * 50)
     if FAILURES:
