@@ -324,6 +324,12 @@ def check_data() -> None:
     check(de_pv_ok / de_pv_n > 0.9,
           f'de-pv trennbare Verben alignment {de_pv_ok}/{de_pv_n} ({100*de_pv_ok/de_pv_n:.0f}%)')
 
+    rows_nctti = _df_to_rows(read_tsv('dataset/nctti_en_scored.tsv'), 'nctti_en_scored', 'en')
+    check(len(rows_nctti) == 539 and rows_nctti[0]['is_pv'] and rows_nctti[0]['has_label'],
+          f'nctti scored: {len(rows_nctti)} PV-schema labeled rows')
+    check(0.0 <= rows_nctti[0]['mod_avg'] <= 5.0 and rows_nctti[0]['mod_std'] > 0,
+          'nctti scored Avg in [0,5] with finite Std')
+
     # MLM warmup data pieces must be gone
     data_src = (ROOT / 'src' / 'data.py').read_text(encoding='utf-8')
     check('def MlmDataset' not in data_src and 'def collate_mlm' not in data_src

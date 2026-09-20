@@ -44,11 +44,16 @@ def run_train80(cfg: Config, logger: logging.Logger, device,
                 data_dir: Path, output_dir: Path) -> Dict[str, float]:
     logger.info('=== MODE: train80 (compound-level 80/20 split) ===')
     rows = _load_all(cfg, logger)
+    aux_rows = [r for r in rows if r.get('is_aux')]
+    core_rows = [r for r in rows if not r.get('is_aux')]
+    if aux_rows:
+        logger.info('%d auxiliary rows are train-only (excluded from the holdout)',
+                    len(aux_rows))
     gss = GroupShuffleSplit(n_splits=1, test_size=cfg.test_size, random_state=cfg.seed)
-    compounds = [r['compound'] for r in rows]
-    tr, va = next(gss.split(rows, groups=compounds))
-    train_rows = [rows[i] for i in tr]
-    val_rows = [rows[i] for i in va]
+    compounds = [r['compound'] for r in core_rows]
+    tr, va = next(gss.split(core_rows, groups=compounds))
+    train_rows = [core_rows[i] for i in tr] + aux_rows
+    val_rows = [core_rows[i] for i in va]
     overlap = set(r['compound'] for r in train_rows) & set(r['compound'] for r in val_rows)
     logger.info('Train %d rows | Val %d rows | compound overlap %d',
                 len(train_rows), len(val_rows), len(overlap))

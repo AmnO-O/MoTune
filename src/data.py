@@ -162,9 +162,38 @@ def _load_files(cfg, file_attrs: List[str]) -> List[Dict]:
 
 
 def load_labeled(cfg) -> List[Dict]:
-    """Load all configured NN and PV training datasets."""
+    """Load all configured NN and PV training datasets (+ train_aux extras)."""
     train_attrs = ['en_nn_train', 'de_nn_train', 'en_pv_train', 'de_pv_train']
-    return _load_files(cfg, train_attrs)
+    all_rows = _load_files(cfg, train_attrs)
+    aux_names = [a.strip() for a in (getattr(cfg, 'train_aux', None) or [])
+                 if a and a.strip()] or []
+    if aux_names:
+        data_dir, _ = _resolve(cfg)
+        n_aux = 0
+        for fname in aux_names:
+            path = data_dir / fname
+            if not path.exists():
+                logger.warning('Aux dataset file missing, skipping: %s', path)
+                continue
+            df = read_tsv(path)
+            rows = _df_to_rows(df, fname, _auto_lang(fname))
+            for r in rows:
+                r['is_aux'] = True
+            all_rows.extend(rows)
+            n_aux += len(rows)
+            logger.info('%s: %d aux rows', fname, len(rows))
+        # aux rows are new compounds: key them in a dedicated id range ABOVE all
+        # core ids so the batch/ranking compound grouping can never mix aux and
+        # core compounds together under one compound_id.
+        core_ids = [r['compound_id'] for r in all_rows[: len(all_rows) - n_aux]]
+        base = (max(core_ids) + 1) if core_ids else 0
+        aux_keys = [f"{r['lang']}_{r['compound']}" for r in all_rows[len(all_rows) - n_aux:]]
+        aux_codes, _ = pd.factorize(pd.Series(aux_keys))
+        for r, c in zip(all_rows[len(all_rows) - n_aux:], aux_codes):
+            r['compound_id'] = base + int(c)
+        logger.info('Loaded %d rows (incl %d aux) across %d core + %d aux compounds',
+                    len(all_rows), n_aux, max(core_ids) + 1, int(aux_codes.max()) + 1)
+    return all_rows
 
 
 def _find_trial_path(fname: str, data_dir: Path) -> Optional[Path]:

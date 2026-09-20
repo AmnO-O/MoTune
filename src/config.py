@@ -76,6 +76,12 @@ class Config:
     #                                losses, the fused one-token rows ("abgehauen") stay masked
     #                                (representation-only). Turn off with --set de_pv_train=.
 
+    # Extra train-only TSVs (e.g. NCTTI) loaded alongside the train files. Rows
+    # get is_aux=True so the compound-level 80/20 split never selects them for
+    # the holdout. Must satisfy _is_nn (Compound/Mod/Head) or _is_pv
+    # (ParticleVerb/Base/Particle) schema; label columns optional.
+    train_aux: List[str] = field(default_factory=list)
+
     # Multi-task Trial Datasets (EN / DE)
     en_nn_trial: str = 'en-nn-trial.tsv'
     de_nn_trial: str = 'de-nn-trial.tsv'

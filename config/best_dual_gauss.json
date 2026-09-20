@@ -3,6 +3,7 @@
   "backbone": "jhu-clsp/mmBERT-base",
   "model_backend": "combined",
   "target_prefix": true,
+  "train_aux": ["nctti_en_scored.tsv"],
   "prefix_readout": "prefix",
   "max_context_length": 256,
   "dropout": 0.2,

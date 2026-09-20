@@ -10,7 +10,9 @@ venv/
 
 # Data (mounted separately on Kaggle via the Compartment dataset input)
 dataset/*
-!dataset/nctti_en.tsv   # built NCTTI aux-consistency rows (committed on purpose)
+# built NCTTI aux + scored rows (committed on purpose)
+!dataset/nctti_en.tsv
+!dataset/nctti_en_scored.tsv
 trial/
 
 # Upstream NCTTI repo clone (ukWaC-derived sentences; do not redistribute).
