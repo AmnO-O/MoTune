@@ -22,6 +22,8 @@ class LoRAAdapter(nn.Module):
 
     def __init__(self, linear: nn.Linear, r: int, alpha: int, dropout: float):
         super().__init__()
+        if r < 1:
+            raise ValueError(f'LoRA rank must be >= 1, got {r}')
         self.linear = linear
         # Hard invariant: the base weight is NEVER trainable once wrapped
         # (docstring: "Freeze-base"). Some callers (e.g. unfreeze_top_layers)
@@ -147,6 +149,13 @@ def apply_lora(model: nn.Module, rank: int = 8, alpha: int = 16,
     targets = [str(t).strip() for t in targets]
     adapters: List[LoRAAdapter] = []
     paths: List[str] = []
+    if rank < 1:
+        # LoRA disabled (e.g. rank==0 in a pure-frozen config): leave the model
+        # pristine. A checkpoint trained without adapters then loads cleanly and
+        # this also skips the alpha/r division-by-zero below.
+        setattr(model, '_lora_paths', [])
+        setattr(model, '_lora_targets_used', None)
+        return []
 
     def _run(tgt: List[str]) -> None:
         def _matches(full: str) -> bool:
