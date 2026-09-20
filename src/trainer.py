@@ -504,8 +504,10 @@ class Trainer:
                     ema.restore(model)
             else:
                 # Early stop only in phase 2 (unfrozen LoRA) so the frozen phase
-                # never aborts before the backbone has a chance to adapt
-                if epoch >= self.cfg.freeze_epochs:
+                # never aborts before the backbone has a chance to adapt;
+                # in pure-frozen mode (lora_epochs == 0 or empty lora_targets),
+                # early stop is active throughout.
+                if epoch >= self.cfg.freeze_epochs or self.cfg.lora_epochs == 0 or not self.cfg.lora_targets:
                     no_improve_epochs += 1
                     if no_improve_epochs >= self.cfg.patience:
                         self.logger.info(
