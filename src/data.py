@@ -171,9 +171,9 @@ def load_labeled(cfg) -> List[Dict]:
         data_dir, _ = _resolve(cfg)
         n_aux = 0
         for fname in aux_names:
-            path = data_dir / fname
-            if not path.exists():
-                logger.warning('Aux dataset file missing, skipping: %s', path)
+            path = _resolve_aux_path(fname, data_dir)
+            if path is None:
+                logger.warning('Aux dataset file not found (data_dir + repo dataset/): %s', fname)
                 continue
             df = read_tsv(path)
             rows = _df_to_rows(df, fname, _auto_lang(fname))
@@ -182,18 +182,40 @@ def load_labeled(cfg) -> List[Dict]:
             all_rows.extend(rows)
             n_aux += len(rows)
             logger.info('%s: %d aux rows', fname, len(rows))
-        # aux rows are new compounds: key them in a dedicated id range ABOVE all
-        # core ids so the batch/ranking compound grouping can never mix aux and
-        # core compounds together under one compound_id.
-        core_ids = [r['compound_id'] for r in all_rows[: len(all_rows) - n_aux]]
-        base = (max(core_ids) + 1) if core_ids else 0
-        aux_keys = [f"{r['lang']}_{r['compound']}" for r in all_rows[len(all_rows) - n_aux:]]
-        aux_codes, _ = pd.factorize(pd.Series(aux_keys))
-        for r, c in zip(all_rows[len(all_rows) - n_aux:], aux_codes):
-            r['compound_id'] = base + int(c)
-        logger.info('Loaded %d rows (incl %d aux) across %d core + %d aux compounds',
-                    len(all_rows), n_aux, max(core_ids) + 1, int(aux_codes.max()) + 1)
+        if n_aux > 0:
+            # aux rows are new compounds: key them in a dedicated id range ABOVE all
+            # core ids so the batch/ranking compound grouping can never mix aux and
+            # core compounds together under one compound_id.
+            core_ids = [r['compound_id'] for r in all_rows[: len(all_rows) - n_aux]]
+            base = (max(core_ids) + 1) if core_ids else 0
+            aux_keys = [f"{r['lang']}_{r['compound']}" for r in all_rows[len(all_rows) - n_aux:]]
+            aux_codes, _ = pd.factorize(pd.Series(aux_keys))
+            for r, c in zip(all_rows[len(all_rows) - n_aux:], aux_codes):
+                r['compound_id'] = base + int(c)
+            logger.info('Loaded %d rows (incl %d aux) across %d core + %d aux compounds',
+                        len(all_rows), n_aux, len(core_ids), int(aux_codes.max()) + 1)
+        else:
+            logger.warning('train_aux configured but NO aux rows loaded (%s); continuing core-only',
+                           ', '.join(aux_names))
     return all_rows
+
+
+def _resolve_aux_path(fname: str, data_dir: Path) -> Optional[Path]:
+    """Locate a train_aux file: data_dir first, then the repo/working dataset/ dir.
+
+    On Kaggle the core TSVs are mounted under the dataset input, while built aux
+    files live in the repo clone, so a plain ``data_dir / fname`` misses them.
+    """
+    candidates = [
+        data_dir / fname,
+        data_dir / 'dataset' / fname,
+        data_dir.parent / 'dataset' / fname,
+        Path('dataset') / fname,
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
 
 
 def _find_trial_path(fname: str, data_dir: Path) -> Optional[Path]:
