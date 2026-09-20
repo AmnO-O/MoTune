@@ -93,6 +93,21 @@ def check_config() -> None:
     check(ok.freeze_epochs == 2 and ok.total_epochs == ok.freeze_epochs + ok.lora_epochs,
           'valid gauss config accepted, total_epochs derived')
 
+    # Pure-frozen probe mode: no LoRA adapters, no encoder LR (two-stream freeze).
+    frozen = Config.defaults().update(
+        proto_stream=True, model_backend='combined', freeze_epochs=30,
+        lora_targets=[], lora_epochs=0, lora_rank=0, lora_alpha=0, encoder_lr=0.0)
+    frozen.validate()
+    check(frozen.total_epochs == 30 and frozen.lora_epochs == 0,
+          'pure-frozen config accepted (empty lora_targets, encoder_lr=0)')
+
+    # encoder_lr=0 must still be rejected when LoRA training is configured.
+    try:
+        Config.defaults().update(lora_epochs=5, encoder_lr=0.0).validate()
+        check(False, '[reject] encoder_lr=0 with LoRA epochs')
+    except ValueError:
+        check(True, '[reject] encoder_lr=0 with LoRA epochs')
+
     # JSON round-trip
     tmp = Path(tempfile.gettempdir()) / 'src_cfg_smoke.json'
     defaults.save(tmp)
