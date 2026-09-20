@@ -314,13 +314,23 @@ class Config:
             errors.append(f'num_workers must be >= 0, got {self.num_workers}')
         if not 0 <= self.freeze_epochs:
             errors.append(f'freeze_epochs must be >= 0, got {self.freeze_epochs}')
-        if self.lora_epochs < 1:
-            errors.append(f'lora_epochs must be >= 1, got {self.lora_epochs}')
+        if self.lora_epochs < 0:
+            errors.append(f'lora_epochs must be >= 0, got {self.lora_epochs}')
+        if self.lora_targets and self.lora_epochs < 1:
+            errors.append(f'lora_epochs must be >= 1 when lora_targets is set, got {self.lora_epochs}')
+        if self.total_epochs < 1:
+            errors.append('total_epochs must be >= 1')
 
-        if self.lora_rank < 1:
-            errors.append('lora_rank must be >= 1')
-        if self.lora_alpha < 1:
-            errors.append('lora_alpha must be >= 1')
+        if self.lora_targets and self.lora_epochs > 0:
+            if self.lora_rank < 1:
+                errors.append('lora_rank must be >= 1')
+            if self.lora_alpha < 1:
+                errors.append('lora_alpha must be >= 1')
+        else:
+            if self.lora_rank < 0:
+                errors.append('lora_rank must be >= 0')
+            if self.lora_alpha < 0:
+                errors.append('lora_alpha must be >= 0')
         if self.unfreeze_from_layer < 0:
             errors.append(f'unfreeze_from_layer must be >= 0, got {self.unfreeze_from_layer}')
 
@@ -328,10 +338,12 @@ class Config:
             errors.append(f'patience must be >= 1, got {self.patience}')
         if not 0 <= self.ema_decay < 1:
             errors.append(f'ema_decay must be in [0, 1), got {self.ema_decay}')
-        if self.head_lr <= 0 or self.encoder_lr <= 0:
-            errors.append(
-                f'lrs must be positive, got head_lr={self.head_lr}, encoder_lr={self.encoder_lr}'
-            )
+        if self.head_lr <= 0:
+            errors.append(f'head_lr must be positive, got {self.head_lr}')
+        if self.lora_targets and self.lora_epochs > 0 and self.encoder_lr <= 0:
+            errors.append(f'encoder_lr must be positive when training LoRA, got {self.encoder_lr}')
+        elif self.encoder_lr < 0:
+            errors.append(f'encoder_lr must be >= 0, got {self.encoder_lr}')
         if self.embedding_lr < 0:
             errors.append(f'embedding_lr must be >= 0, got {self.embedding_lr}')
         if not 0 <= self.grad_clip:
