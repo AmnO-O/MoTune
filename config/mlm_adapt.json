@@ -4,10 +4,10 @@
   "max_context_length": 256,
   "train_aux": ["nctti_en_scored.tsv"],
 
-  "mlm_epochs": 5,
+  "mlm_epochs": 4,
   "mlm_lr": 5e-5,
   "mlm_mask_prob": 0.8,
-  "mlm_from_layer": 17,
+  "mlm_from_layer": 20,
   "mlm_output_dir": "checkpoints/prefix_mlm_adapted",
 
   "mlm_batch_size": 64,
